@@ -1,1 +1,50 @@
 ARS.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data files
+*.npz
+*.pt
+*.pth
+*.joblib
+*.pkl
+*.csv
+data/
+saved/
+runs/
+outputs/
+
+# Logs
+*.log
+logs/
+tensorboard/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp

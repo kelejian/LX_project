@@ -1,0 +1,36 @@
+# LX_project Unified Requirements
+# =================================
+# This file contains all dependencies for the unified LX_project architecture
+# including PulsePredict, InjuryPredict, and ARS_optim sub-projects.
+
+# --- Core Deep Learning Framework ---
+torch>=1.10.0
+torchvision>=0.11.0
+
+# --- Scientific Computing & Data ---
+numpy>=1.20.0
+pandas>=1.3.0
+scikit-learn>=0.24.0
+scipy>=1.7.0
+
+# --- Data Handling & Serialization ---
+joblib>=1.0.0
+
+# --- Visualization & Logging ---
+matplotlib>=3.3.0
+tensorboard>=2.6.0
+tqdm>=4.60.0
+
+# --- Configuration Management ---
+PyYAML>=6.0
+
+# --- Imbalanced Learning ---
+imbalanced-learn>=0.8.0
+
+# --- Model Inspection ---
+torchinfo>=1.5.0
+
+# --- Project Structure ---
+# Each sub-project (PulsePredict, InjuryPredict, ARS_optim) 
+# can still have its own requirements.txt for specific needs,
+# but all common dependencies are listed here.
