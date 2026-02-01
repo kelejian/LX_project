@@ -46,7 +46,11 @@ LX_project/
 │   └── run_train_strategy.py
 │
 ├── requirements.txt        # 统一依赖 (Unified dependencies)
-└── README.md              # 本文件 (This file)
+├── README.md              # 本文件 (This file)
+├── MIGRATION_GUIDE.md     # 迁移指南 (Migration guide)
+├── API_REFERENCE.md       # API文档 (API reference)
+├── examples_data_module.py # 数据模块示例 (Data module examples)
+└── examples_utils_module.py # 工具模块示例 (Utils module examples)
 ```
 
 ## 核心特性 (Key Features)
@@ -174,6 +178,14 @@ neck_ais = AIS_cal_neck(Nij=0.5)
 - SciPy >= 1.7.0
 
 详细依赖列表请参考 [requirements.txt](requirements.txt)
+
+## 文档 (Documentation)
+
+- **[README.md](README.md)** - 项目概览和快速开始 (Project overview and quick start)
+- **[MIGRATION_GUIDE.md](MIGRATION_GUIDE.md)** - 迁移到新架构的指南 (Guide for migrating to new architecture)
+- **[API_REFERENCE.md](API_REFERENCE.md)** - 共享模块API文档 (Shared modules API reference)
+- **[examples_data_module.py](examples_data_module.py)** - 数据模块使用示例 (Data module usage examples)
+- **[examples_utils_module.py](examples_utils_module.py)** - 工具模块使用示例 (Utils module usage examples)
 
 ## 开发指南 (Development Guide)
 
