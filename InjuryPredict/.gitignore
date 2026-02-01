@@ -1,0 +1,44 @@
+tst.py
+# Python 缓存文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 深度学习项目生成目录 (非常重要!)
+runs/
+ckpt_base/
+results_base/
+onnx_models/
+logs/
+#data/  # 如果数据集很大或不希望上传
+
+# ONNX 模型文件
+*.onnx
+
+# IDE 和操作系统生成的文件
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# 办公文档、报告和压缩文件
+*.pptx
+*.docx
+*.pdf
+*.xlsx
+*.zip
+
+# 图片文件
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# 其他临时文件
+model_computation_graph
+test.py
+# data文件夹
+data/
