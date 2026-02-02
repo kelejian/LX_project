@@ -1,0 +1,17 @@
+{
+  "rule": "inherit_injury_driver + add_pulse_only_driver_by_ratio",
+  "pulse_only_driver_total": 5849,
+  "pulse_train": 4679,
+  "pulse_val": 585,
+  "pulse_test": 585,
+  "ratios": {
+    "train": 0.8,
+    "val": 0.1,
+    "test": 0.1
+  },
+  "counts_added": {
+    "train": 4679,
+    "val": 585,
+    "test": 585
+  }
+}

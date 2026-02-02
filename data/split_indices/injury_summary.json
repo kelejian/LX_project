@@ -1,0 +1,15 @@
+{
+  "total": 5626,
+  "train": 4500,
+  "val": 563,
+  "test": 563,
+  "excluded": 0,
+  "forced": {
+    "train": 0,
+    "valid": 0,
+    "test": 0,
+    "exclude": 0
+  },
+  "rule": "injury_ok_only_stratify_by_MAIS",
+  "injury_total": 5626
+}

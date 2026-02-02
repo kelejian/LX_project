@@ -12,9 +12,6 @@ from utils import models
 from utils.dataset_prepare import CrashDataset
 
 from utils.set_random_seed import set_random_seed
-set_random_seed()
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def test_inference_time(model, loader):
     """
@@ -56,6 +53,8 @@ def test_inference_time(model, loader):
     print(f"Average inference time per batch: {avg_time:.6f} seconds")
 
 if __name__ == "__main__":
+    set_random_seed()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # import argparse
     # parser = argparse.ArgumentParser(description="Test Model Inference Time")
     # parser.add_argument("--run_dir", '-r', type=str, required=True, help="Directory of the training run.")

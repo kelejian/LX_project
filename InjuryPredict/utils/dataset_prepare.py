@@ -22,8 +22,6 @@ try:
 except ImportError:
     from set_random_seed import GLOBAL_SEED, set_random_seed   # 直接运行时使用
 
-set_random_seed()
-
 class CrashDataset(Dataset):
     """
     数据集类，负责加载和存储原始及处理后的碰撞数据。
@@ -356,6 +354,8 @@ def split_data(dataset, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1, special_
     return final_train_indices, final_val_indices, final_test_indices, split_summary
 
 if __name__ == '__main__':
+    set_random_seed()
+    
     start_time = time.time()
     
     dataset = CrashDataset(input_file='./data/data_input.npz', label_file='./data/data_labels.npz')

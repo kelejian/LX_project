@@ -33,7 +33,6 @@ from utils.set_random_seed import GLOBAL_SEED, set_random_seed # 导入 GLOBAL_S
 from utils.optimizer_utils import get_parameter_groups
 
 from config import training_params, loss_params, model_params, kfold_params
-set_random_seed() # 设置全局随机种子
 
 def get_compare_func(func_indicator):
     """根据配置中的指示器返回比较函数和初始值"""
@@ -364,7 +363,7 @@ def convert_numpy_types(obj):
         return obj
 
 if __name__ == "__main__":
-    
+    set_random_seed() # 设置全局随机种子
     ############################################################################################
     ############################################################################################
     # ---- 从导入的配置中加载超参数 ----

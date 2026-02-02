@@ -23,7 +23,6 @@ from utils.optimizer_utils import get_parameter_groups
 
 # --- 从 config.py 导入超参数 ---
 from config import training_params, loss_params, model_params
-set_random_seed()
 
 # --- 合并 train 和 valid 为一个函数 ---
 def run_one_epoch(model, loader, criterion, device, optimizer=None):
@@ -133,6 +132,7 @@ def convert_numpy_types(obj):
             return obj
         
 if __name__ == "__main__":
+    set_random_seed()
     ''' 训练损伤预测模型 (TCN-based) 以进行多任务损伤预测 '''
     from torch.utils.tensorboard import SummaryWriter
 

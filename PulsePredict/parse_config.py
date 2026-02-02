@@ -4,7 +4,7 @@ from pathlib import Path
 from functools import reduce, partial
 from operator import getitem
 from datetime import datetime
-from logger import setup_logging
+from common.utils.logger import setup_logger
 from utils import read_json, write_json
 
 
@@ -78,7 +78,7 @@ class ConfigParser:
             write_json(self.config, self.save_dir / 'config.json')
 
         # 统一的日志模块配置，指向最终确定的log_dir
-        setup_logging(self.log_dir)
+        setup_logger(save_dir=self.log_dir, log_config='logger/logger_config.json')
         self.log_levels = {
             0: logging.WARNING,
             1: logging.INFO,

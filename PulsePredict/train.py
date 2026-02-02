@@ -13,14 +13,7 @@ import model.model as module_arch
 from parse_config import ConfigParser
 from trainer import Trainer
 from utils import prepare_device, get_parameter_groups
-
-
-# fix random seeds for reproducibility
-SEED = 123
-torch.manual_seed(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-np.random.seed(SEED)
+from common.utils.seeding import set_random_seed
 
 def main(config):
     logger = config.get_logger('train')
@@ -69,6 +62,8 @@ def main(config):
 
 
 if __name__ == '__main__':
+    # fix random seeds for reproducibility
+    set_random_seed(123)
     args = argparse.ArgumentParser(description='LX-CrashPulsePredictionModel Training')
     args.add_argument('-c', '--config', default=None, type=str,
                       help='config file path (default: None)')

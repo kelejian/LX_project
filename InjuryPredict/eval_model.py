@@ -26,9 +26,6 @@ from utils.dataset_prepare import CrashDataset
 from utils.AIS_cal import AIS_cal_head, AIS_cal_chest, AIS_cal_neck 
 
 from utils.set_random_seed import set_random_seed
-set_random_seed()
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def test(model, loader):
     """
@@ -172,6 +169,10 @@ def generate_report_section(title, reg_metrics, cls_metrics_6c):
     return section
 
 if __name__ == "__main__":
+
+    set_random_seed()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') 
+ 
     # parser = argparse.ArgumentParser(description="Evaluate a trained injury prediction model")
     # parser.add_argument("--run_dir", '-r', type=str, required=True, help="Directory of the training run to evaluate.")
     # parser.add_argument("--weight_file", '-w', type=str, default="best_mais_accu.pth", help="Name of the model weight file.")

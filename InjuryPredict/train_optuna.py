@@ -19,8 +19,6 @@ from utils.weighted_loss import weighted_loss
 from utils.set_random_seed import set_random_seed
 from utils.optimizer_utils import get_parameter_groups
 
-set_random_seed()
-
 # 沿用 train.py 中标准化的单轮训练/验证函数
 def run_one_epoch(model, loader, criterion, device, optimizer=None):
     """
@@ -188,7 +186,7 @@ def objective(trial):
     return avg_mais_acc, avg_head_acc, avg_chest_acc, avg_neck_acc
 
 if __name__ == "__main__":
-
+    set_random_seed()
     study_file = "./runs/optuna_study_multiobj_acc.pkl"
     study_name = "multiobj_acc_optimization"
     db_path = "sqlite:///./runs/optuna_study.db"

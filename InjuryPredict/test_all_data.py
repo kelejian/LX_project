@@ -24,8 +24,6 @@ from utils.dataset_prepare import CrashDataset
 from utils.AIS_cal import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from utils.set_random_seed import set_random_seed
 
-set_random_seed()
-
 # --- 1. 配置区：请在此处设置您的路径 ---
 
 # 1.1) 要评估的模型所在的运行目录
@@ -319,6 +317,7 @@ def print_metrics_summary(df):
     print("="*60)
 
 if __name__ == "__main__":
+    set_random_seed()
     
     # 1. 加载原始13个标量特征
     original_features_df = load_original_features(DISTRIBUTION_FILE)
