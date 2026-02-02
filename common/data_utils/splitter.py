@@ -176,12 +176,12 @@ def stratified_split(
         raise ValueError("划分中检测到重叠索引!")
         
     summary = {
-        "total": len(case_ids),
-        "train": len(final_train),
-        "val": len(final_val),
-        "test": len(final_test),
-        "excluded": len(exclude_set),
-        "forced": counts
+        "total_final": len(case_ids) - len(exclude_set),
+        "train_final": len(final_train),
+        "val_final": len(final_val),
+        "test_final": len(final_test),
+        "forced": counts,
+        "total_ori": len(case_ids)
     }
     
     return final_train, final_val, final_test, summary

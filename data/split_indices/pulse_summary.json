@@ -1,17 +1,13 @@
 {
   "rule": "inherit_injury_driver + add_pulse_only_driver_by_ratio",
-  "pulse_only_driver_total": 5849,
-  "pulse_train": 4679,
-  "pulse_val": 585,
-  "pulse_test": 585,
-  "ratios": {
-    "train": 0.8,
-    "val": 0.1,
-    "test": 0.1
+  "total_final": 5849,
+  "train_final": 4679,
+  "val_final": 585,
+  "test_final": 585,
+  "inherited_from_injury_driver": {
+    "train": 0,
+    "val": 0,
+    "test": 0
   },
-  "counts_added": {
-    "train": 4679,
-    "val": 585,
-    "test": 585
-  }
+  "date": "2026-02-02 12:52:03"
 }

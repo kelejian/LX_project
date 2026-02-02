@@ -1,15 +1,15 @@
 {
-  "total": 5626,
-  "train": 4500,
-  "val": 563,
-  "test": 563,
-  "excluded": 0,
+  "total_final": 5626,
+  "train_final": 4500,
+  "val_final": 563,
+  "test_final": 563,
   "forced": {
     "train": 0,
     "valid": 0,
     "test": 0,
     "exclude": 0
   },
+  "total_ori": 5626,
   "rule": "injury_ok_only_stratify_by_MAIS",
-  "injury_total": 5626
+  "date": "2026-02-02 12:52:03"
 }

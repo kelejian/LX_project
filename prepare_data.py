@@ -191,8 +191,8 @@ def package_raw_packed(
     # ---------------------------
     case_ids_all = pulse_df["case_id"].astype(int).to_numpy(dtype=np.int64)
     x_att_raw_all = pulse_df[FEATURE_ORDER].to_numpy(dtype=np.float32) # (N,11), 无列名，纯数值, 因此后续如果需要知道每一列的含义必须依赖 FEATURE_ORDER 的顺序！
-    is_pulse_ok_all = pulse_df["is_pulse_ok"].fillna(False).astype(bool).to_numpy(dtype=bool)
-    is_injury_ok_all = pulse_df["is_injury_ok"].fillna(False).astype(bool).to_numpy(dtype=bool)
+    is_pulse_ok_all = pulse_df["is_pulse_ok"].fillna(False).astype(bool).to_numpy(dtype=bool) # 原始 distribution 中的缺失值会变成 False；以及 能被解释为 False 的值（例如 False、0、空字符串）会变成 False
+    is_injury_ok_all = pulse_df["is_injury_ok"].fillna(False).astype(bool).to_numpy(dtype=bool) # 原始 distribution 中的缺失值会变成 False；以及 能被解释为 False 的值（例如 False、0、空字符串）会变成 False
 
     hic15_all = pulse_df["HIC15"].to_numpy(dtype=np.float32)
     dmax_all = pulse_df["Dmax"].to_numpy(dtype=np.float32)
@@ -319,7 +319,7 @@ def generate_splits(
     data = np.load(raw_npz_path)
     case_ids_all = data["case_ids"].astype(np.int64) # (N,), 全量 pulse_ok==True 的 case_ids
     x_att_raw = data["x_att_raw"].astype(np.float32)  # (N,13)
-    is_injury_ok = data["is_injury_ok"].astype(bool)
+    is_injury_ok = data["is_injury_ok"].astype(bool) # (N,), 打包时取值已统一布尔化，此处取值仅有 True/False
     mais = data["mais"].astype(np.int64)
 
     is_driver_side = x_att_raw[:, 11].astype(int)
@@ -341,7 +341,7 @@ def generate_splits(
 
     summary_inj.update({
         "rule": "injury_ok_only_stratify_by_MAIS",
-        "injury_total": int(injury_case_ids.shape[0])
+        "date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
     })
 
     # 此处的 case_ids_all 是全量 pulse_ok==True 的 case_ids; train_inj/val_inj/test_inj 为划分后的 case_ids 列表
@@ -350,34 +350,41 @@ def generate_splits(
     # 2) pulse split：主驾侧(is_driver_side==1)
     driver_mask = (is_driver_side == 1) # 仅主驾侧
 
-    injury_driver_set = set(injury_case_ids[driver_mask[injury_mask]].tolist())  # injury_ok & driver
+    injury_driver_set = set(injury_case_ids[driver_mask[injury_mask]].tolist())  # injury_ok==True 且为主驾侧的 case_ids
 
     train_inj_set = set(train_inj.tolist())  # 继承 injury split 的训练集（仅取主驾侧）的 case_ids
     val_inj_set = set(val_inj.tolist())      # 继承 injury split 的验证集（仅取主驾侧）的 case_ids
     test_inj_set = set(test_inj.tolist())    # 继承 injury split 的测试集（仅取主驾侧）的 case_ids
 
-    # 继承 injury split（仅取主驾侧）的 case_ids
+    # 损伤预测数据集中的主驾侧 case_ids（is_injury_ok==True 且 is_driver_side==1）, 直接继承到波形预测数据集中
     pulse_train = [cid for cid in train_inj_set if cid in injury_driver_set]
     pulse_val = [cid for cid in val_inj_set if cid in injury_driver_set]
     pulse_test = [cid for cid in test_inj_set if cid in injury_driver_set]
 
-    # pulse-only：pulse_ok==True 已经是全量raw，取 driver_side 且 injury_ok!=True 的 case_ids
-    pulse_only_mask = driver_mask & (~is_injury_ok)
-    pulse_only_case_ids = case_ids_all[pulse_only_mask]
+    inherit_counts = {
+        "train": len(pulse_train),
+        "val": len(pulse_val),
+        "test": len(pulse_test)
+    }
+
+    # 将pulse-only的case_ids，按比例随机分配到 train/val/test 中
+    # pulse-only：pulse_ok==True(已经是全量raw) 其 is_driver_side==1 且 is_injury_ok!=True
+    pulse_only_mask = driver_mask & (~is_injury_ok) # 为主驾侧 且 injury_ok!=True
+    pulse_only_case_ids = case_ids_all[pulse_only_mask] # case_ids_all 是所有 pulse_ok==True 的 case_ids
 
     rng = np.random.default_rng(seed)
-    shuffled = pulse_only_case_ids.copy()
+    shuffled = pulse_only_case_ids.copy() # 注意：这里必须 copy 一份，避免修改原始数组
     rng.shuffle(shuffled)
 
     n_total = int(shuffled.shape[0])
     n_train = int(round(n_total * train_ratio))
     n_val = int(round(n_total * val_ratio))
-    n_test = n_total - n_train - n_val
 
     extra_train = shuffled[:n_train]
     extra_val = shuffled[n_train:n_train + n_val]
     extra_test = shuffled[n_train + n_val:]
 
+    # 合并继承的 injury_driver case_ids 和 新分配的 pulse-only case_ids, 作为最终的 pulse split 结果
     pulse_train = np.asarray(sorted(set(pulse_train) | set(extra_train.tolist())), dtype=np.int64)
     pulse_val = np.asarray(sorted(set(pulse_val) | set(extra_val.tolist())), dtype=np.int64)
     pulse_test = np.asarray(sorted(set(pulse_test) | set(extra_test.tolist())), dtype=np.int64)
@@ -390,12 +397,12 @@ def generate_splits(
 
     summary_pulse = {
         "rule": "inherit_injury_driver + add_pulse_only_driver_by_ratio",
-        "pulse_only_driver_total": int(pulse_only_case_ids.shape[0]),
-        "pulse_train": int(pulse_train.shape[0]),
-        "pulse_val": int(pulse_val.shape[0]),
-        "pulse_test": int(pulse_test.shape[0]),
-        "ratios": {"train": train_ratio, "val": val_ratio, "test": test_ratio},
-        "counts_added": {"train": int(extra_train.shape[0]), "val": int(extra_val.shape[0]), "test": int(extra_test.shape[0])}
+        "total_final": int(pulse_only_case_ids.shape[0] + len(injury_driver_set)), # pulse_ok==True且为主驾侧的case总数, 即为 pulse split 的总数
+        "train_final": int(pulse_train.shape[0]),
+        "val_final": int(pulse_val.shape[0]),
+        "test_final": int(pulse_test.shape[0]),
+        "inherited_from_injury_driver": inherit_counts,
+        "date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 
     # case_ids_all 仍为全量 pulse_ok==True 的 case_ids; pulse_train/val/test 为划分后的 case_ids 列表
@@ -433,14 +440,16 @@ def main():
     print(f"⭐ distribution_path: {distribution_path}")
     print(f"⭐ pulse_dir: {pulse_dir}\n")
 
-    raw_path = package_raw_packed(
-        distribution_path=distribution_path,
-        pulse_dir=pulse_dir,
-        output_npz=out_raw,
-        case_id_offset=args.case_id_offset,
-        strict=(not args.non_strict)
-    )
-
+    # raw_path = package_raw_packed(
+    #     distribution_path=distribution_path,
+    #     pulse_dir=pulse_dir,
+    #     output_npz=out_raw,
+    #     case_id_offset=args.case_id_offset,
+    #     strict=(not args.non_strict)
+    # )
+    ####---------------------------
+    raw_path = out_raw
+    ####---------------------------
     generate_splits(
         raw_npz_path=raw_path,
         out_dir=out_splits,
