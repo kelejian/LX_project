@@ -1,0 +1,139 @@
+{
+    "meta": {
+        "dataset_id": "raw_data_packed.npz",
+        "fitted_on_split": "injury_train_indices.npy",
+        "updated_at": "2026-02-03T16:32:24.397667",
+        "source": "UnifiedDataProcessor.fit() 基于训练集统计"
+    },
+    "feature_order": [
+        "impact_velocity",
+        "impact_angle",
+        "overlap",
+        "LL1",
+        "LL2",
+        "BTF",
+        "LLATTF",
+        "AFT",
+        "SP",
+        "SH",
+        "RA",
+        "is_driver_side",
+        "OT"
+    ],
+    "continuous": {
+        "feature_order": [
+            "impact_velocity",
+            "impact_angle",
+            "overlap",
+            "LL1",
+            "LL2",
+            "BTF",
+            "LLATTF",
+            "AFT",
+            "SP",
+            "SH",
+            "RA"
+        ],
+        "minmax": {
+            "indices_in_continuous": [
+                0,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10
+            ],
+            "stats": {
+                "impact_velocity": {
+                    "min": 23.5,
+                    "max": 65.0
+                },
+                "LL1": {
+                    "min": 1.0,
+                    "max": 7.0
+                },
+                "LL2": {
+                    "min": 0.5,
+                    "max": 4.5
+                },
+                "BTF": {
+                    "min": 10.0,
+                    "max": 100.0
+                },
+                "LLATTF": {
+                    "min": 10.0,
+                    "max": 150.0
+                },
+                "AFT": {
+                    "min": 10.0,
+                    "max": 100.0
+                },
+                "SP": {
+                    "min": -110.0,
+                    "max": 110.0
+                },
+                "SH": {
+                    "min": 0.0,
+                    "max": 0.0
+                },
+                "RA": {
+                    "min": 15.0,
+                    "max": 40.0
+                }
+            }
+        },
+        "maxabs": {
+            "indices_in_continuous": [
+                1,
+                2
+            ],
+            "stats": {
+                "impact_angle": {
+                    "abs_max": 45.0
+                },
+                "overlap": {
+                    "abs_max": 1.0
+                }
+            }
+        }
+    },
+    "discrete": {
+        "feature_order": [
+            "is_driver_side",
+            "OT"
+        ],
+        "is_driver_side": {
+            "idx_in_att": 11,
+            "mapping": {
+                "value_to_index": {
+                    "0": 0,
+                    "1": 1
+                }
+            },
+            "stats": {
+                "num_classes": 2
+            }
+        },
+        "OT": {
+            "idx_in_att": 12,
+            "mapping": {
+                "value_to_index": {
+                    "1": 0,
+                    "2": 1,
+                    "3": 2
+                }
+            },
+            "stats": {
+                "num_classes": 3
+            }
+        }
+    },
+    "waveform": {
+        "method": "topk_abs_mean",
+        "top_k": 50,
+        "scale_factor": 530.0
+    }
+}

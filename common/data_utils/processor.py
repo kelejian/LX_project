@@ -5,27 +5,37 @@ from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
 
 from common.settings import NORMALIZATION_CONFIG_PATH
-from common.settings import FEATURE_ORDER, CONTINUOUS_INDICES, DISCRETE_INDICES, DISCRETE_VALUE_TO_INDEX, MAXABS_INDICES_IN_CONTINUOUS, MINMAX_INDICES_IN_CONTINUOUS
+from common.settings import (
+    FEATURE_ORDER, CONTINUOUS_INDICES, DISCRETE_INDICES,
+    DISCRETE_VALUE_TO_INDEX, MAXABS_INDICES_IN_CONTINUOUS, MINMAX_INDICES_IN_CONTINUOUS,
+)
 
 class UnifiedDataProcessor:
-    """
-    统一数据归一化处理器。
-    支持:
-    - 连续特征 (MinMax, MaxAbs)
-    - 离散特征 (通过手动映射进行标签编码)
-    - 波形缩放 (全局缩放因子)
+    """统一数据归一化处理器，支持连续/离散特征归一化及波形缩放。
     
-    读写 JSON 文件以实现“白盒化”配置能力。
+    离散特征元信息从 settings.py 的 FEATURE_ORDER, DISCRETE_INDICES, 
+    DISCRETE_VALUE_TO_INDEX 动态推导。
     """
     def __init__(self, config_path=NORMALIZATION_CONFIG_PATH):
         self.config_path = Path(config_path)
         self.config = {}
-        self.stats = {
-            "meta": {},
-            "features": {},
-            "waveform": {},
-            "discrete": {}
+        
+        # 特征数量
+        self.n_features = len(FEATURE_ORDER)
+        self.n_continuous = len(CONTINUOUS_INDICES)
+        self.n_discrete = len(DISCRETE_INDICES)
+        
+        # 离散特征元信息
+        self.discrete_feature_names = [FEATURE_ORDER[i] for i in DISCRETE_INDICES]
+        self.discrete_allowed_values = {
+            name: {int(k) for k in DISCRETE_VALUE_TO_INDEX[name].keys()}
+            for name in self.discrete_feature_names
         }
+        self.discrete_num_classes = {
+            name: len(DISCRETE_VALUE_TO_INDEX[name])
+            for name in self.discrete_feature_names
+        }
+
         
     def load_config(self):
         """从 JSON 加载归一化配置。"""
@@ -39,15 +49,21 @@ class UnifiedDataProcessor:
                 return False
         return False
 
-    def save_config(self):
+    def save_config(self, force_overwrite: bool = False) -> bool:
+        """保存配置到 JSON 文件。若文件已存在且 force_overwrite=False，则拒绝保存。"""
+        if self.config_path.exists() and not force_overwrite:
+            print(f"[Processor] 配置文件已存在，跳过: {self.config_path}")
+            return False
+        
         self.config.setdefault('meta', {})
         self.config['meta'].update({
             "updated_at": datetime.now().isoformat(),
-            "source": self.config['meta'].get("source", "UnifiedDataProcessor auto-stat")
+            "source": self.config['meta'].get("source", "UnifiedDataProcessor.fit() 基于训练集统计")
         })
         with open(self.config_path, 'w', encoding='utf-8') as f:
             json.dump(self.config, f, indent=4, ensure_ascii=False)
-        print(f"[Processor] 配置已保存至 {self.config_path}")
+        print(f"[Processor] ✅ 配置已保存至 {self.config_path}")
+        return True
 
     def validate_config(self, raise_on_error: bool = True) -> bool:
         """校验配置结构是否完整。"""
@@ -66,15 +82,24 @@ class UnifiedDataProcessor:
     def fit(
         self,
         dataset_dict: Dict[str, Any],
-        feature_names=None,
         top_k_waveform: int = 50,
         dataset_id: Optional[str] = None,
         fit_split: Optional[str] = None,
         force_update: bool = False
-    ):
-        """
-        根据数据计算统计信息并更新配置（仅拟合，不自动保存）。
-        仅应传入训练集数据以避免泄漏。
+    ) -> None:
+        """根据训练集计算归一化统计量，更新内存配置（不自动保存）。
+        
+        Args:
+            dataset_dict: 数据字典
+                - 'x_att_raw': ndarray (N, n_features) - 连续 + 离散特征
+                - 'x_acc_xy' / 'x_acc': ndarray (N, C, T) [可选]
+            top_k_waveform: 波形 scale_factor 计算的 top-K 值数量
+            dataset_id: 数据集标识，记录到 meta
+            fit_split: 数据划分标识，记录到 meta
+            force_update: 是否强制覆盖已有统计量
+        
+        Raises:
+            ValueError: x_att_raw 形状错误或离散特征取值非法
         """
         self.load_config()
         self.config.setdefault('meta', {})
@@ -88,11 +113,9 @@ class UnifiedDataProcessor:
             "fitted_on_split": fit_split
         })
 
-        # 固化feature_order（全局共用，禁止漂移）
         self.config['feature_order'] = FEATURE_ORDER
 
-        # 1. 波形统计信息（按现状：topK 绝对值均值）
-        # 约定：可传入 x_acc_xy 或 x_acc（通道在前）
+        # 1. 波形统计
         wave_key = None
         if 'x_acc_xy' in dataset_dict:
             wave_key = 'x_acc_xy'
@@ -117,26 +140,21 @@ class UnifiedDataProcessor:
                     "top_k": int(top_k_waveform),
                     "scale_factor": scale_factor
                 }
-                print(f"[Processor] 计算得到的波形缩放因子: {scale_factor:.4f}")
-            else:
-                print(f"[Processor] 使用现有的波形缩放因子: {existing_factor:.4f} (计算值为 {scale_factor:.4f})")
-
-        # 2. 连续特征（严格按CrashDataset：x_att_raw[:,0:11]）
+        # 2. 连续特征
         if 'x_att_raw' in dataset_dict:
             x_att_raw = np.asarray(dataset_dict['x_att_raw'])
-            if x_att_raw.ndim != 2 or x_att_raw.shape[1] != 13:
-                raise ValueError("x_att_raw 必须是形状 (N,13) 的数组")
+            if x_att_raw.ndim != 2 or x_att_raw.shape[1] != self.n_features:
+                raise ValueError(f"x_att_raw 必须是形状 (N, {self.n_features}) 的数组")
 
             cont_raw = x_att_raw[:, CONTINUOUS_INDICES].astype(float)
 
             cont_cfg = self.config.get('continuous', {})
-            cont_cfg.setdefault('feature_order_11', FEATURE_ORDER[:11])
+            cont_cfg.setdefault('feature_order', [FEATURE_ORDER[i] for i in CONTINUOUS_INDICES])
             cont_cfg.setdefault('minmax', {})
             cont_cfg.setdefault('maxabs', {})
             cont_cfg['minmax']['indices_in_continuous'] = MINMAX_INDICES_IN_CONTINUOUS
             cont_cfg['maxabs']['indices_in_continuous'] = MAXABS_INDICES_IN_CONTINUOUS
 
-            # minmax 统计量
             for j in MINMAX_INDICES_IN_CONTINUOUS:
                 name = FEATURE_ORDER[j]
                 col = cont_raw[:, j]
@@ -145,7 +163,6 @@ class UnifiedDataProcessor:
                     "max": float(np.max(col))
                 }
 
-            # maxabs 统计量
             for j in MAXABS_INDICES_IN_CONTINUOUS:
                 name = FEATURE_ORDER[j]
                 col = cont_raw[:, j]
@@ -155,236 +172,160 @@ class UnifiedDataProcessor:
 
             self.config['continuous'] = cont_cfg
 
-        # 3. 离散特征（严格按CrashDataset：x_att_raw[:,11:13]）
+        # 3. 离散特征
         if 'x_att_raw' in dataset_dict:
             x_att_raw = np.asarray(dataset_dict['x_att_raw'])
             disc_raw = x_att_raw[:, DISCRETE_INDICES].astype(int)
-            # 仅用于校验取值范围（映射固定，避免训练集缺类导致不可复现）
-            is_driver_vals = set(np.unique(disc_raw[:, 0]).tolist())
-            ot_vals = set(np.unique(disc_raw[:, 1]).tolist())
-            allowed_driver = {0, 1}
-            allowed_ot = {1, 2, 3}
-            if not is_driver_vals.issubset(allowed_driver):
-                raise ValueError(f"is_driver_side 存在非法取值: {sorted(is_driver_vals - allowed_driver)}")
-            if not ot_vals.issubset(allowed_ot):
-                raise ValueError(f"OT 存在非法取值: {sorted(ot_vals - allowed_ot)}")
-
-            self.config['discrete'] = {
-                "feature_order_2": ["is_driver_side", "OT"],
-                "is_driver_side": {
-                    "idx_in_att": 11,
-                    "mapping": {
-                        "value_to_index": DISCRETE_VALUE_TO_INDEX["is_driver_side"],
-                        "unknown_policy": "error",
-                        "unknown_index": -1
-                    },
-                    "stats": {"num_classes": 2}
-                },
-                "OT": {
-                    "idx_in_att": 12,
-                    "mapping": {
-                        "value_to_index": DISCRETE_VALUE_TO_INDEX["OT"],
-                        "unknown_policy": "error",
-                        "unknown_index": -1
-                    },
-                    "stats": {"num_classes": 3}
-                }
+            
+            # 校验fit所用数据源(一般是训练集)中是否出现了settings.py中预定义映射关系之外的离散取值, 如果有则报错
+            for local_idx, name in enumerate(self.discrete_feature_names):
+                vals_in_data = set(np.unique(disc_raw[:, local_idx]).tolist()) # 提取数据中实际出现的所有唯一值
+                allowed_vals = self.discrete_allowed_values[name] # 获取允许的值（来自 settings.py）
+                if not vals_in_data.issubset(allowed_vals): # 检查数据中的值是否都在允许范围内
+                    raise ValueError(f"{name} 存在非法取值: {sorted(vals_in_data - allowed_vals)}")
+                
+            # 将 settings.py 中的固定映射复制到配置文件中
+            discrete_cfg = {
+                "feature_order": self.discrete_feature_names,
             }
+            for local_idx, name in enumerate(self.discrete_feature_names):
+                discrete_cfg[name] = {
+                    "idx_in_att": DISCRETE_INDICES[local_idx],
+                    "mapping": {"value_to_index": DISCRETE_VALUE_TO_INDEX[name]},
+                    "stats": {"num_classes": self.discrete_num_classes[name]}
+                }
+            self.config['discrete'] = discrete_cfg
 
-    def fit_transform(self, dataset_dict, feature_names=None, top_k_waveform=50, dataset_id=None,
-                      fit_split=None, force_update=False):
-        """先拟合再转换，返回转换后的数据字典。"""
-        self.fit(dataset_dict, feature_names, top_k_waveform, dataset_id, fit_split, force_update)
-        return self.transform(dataset_dict, feature_names)
+    def fit_transform(
+        self,
+        dataset_dict: Dict[str, Any],
+        top_k_waveform: int = 50,
+        dataset_id: Optional[str] = None,
+        fit_split: Optional[str] = None,
+        force_update: bool = False
+    ) -> Dict[str, Any]:
+        """先 fit 后 transform，返回转换后的数据字典。"""
+        self.fit(
+            dataset_dict=dataset_dict,
+            top_k_waveform=top_k_waveform,
+            dataset_id=dataset_id,
+            fit_split=fit_split,
+            force_update=force_update
+        )
+        return self.transform(dataset_dict)
 
-    def fit_and_update_config(self, dataset_dict, feature_names=None, top_k_waveform=50, save=True, force_update=False):
-        """兼容旧接口：拟合并按需保存。"""
-        self.fit(dataset_dict, feature_names, top_k_waveform, dataset_id=None, fit_split=None, force_update=force_update)
-        if save:
-            self.save_config()
-
-    def fit_and_update_config(self, dataset_dict, feature_names=None, top_k_waveform=50, save=True, force_update=False):
-        """
-        根据数据计算统计信息并更新配置。
-        除非 force_update=True 或配置缺失，否则不会覆盖现有配置。
+    def generate_config_if_absent(
+        self,
+        dataset_dict: Dict[str, Any],
+        top_k_waveform: int = 50,
+        dataset_id: Optional[str] = None,
+        fit_split: Optional[str] = "train"
+    ) -> bool:
+        """若配置文件不存在，则基于训练集生成并保存。
         
         Args:
-            dataset_dict: 包含 'x_att_continuous', 'x_att_discrete', 'x_acc_raw' (波形) 的字典。
-                          预期形状: (N, D_cont), (N, D_disc), (N, C, T) 或 (N, T)。
-            feature_names: 字典或列表，提供特征名称。
-                           格式: {index: "name", ...} 或 ["name1", "name2", ...]
-            top_k_waveform: 用于波形缩放计算的顶部绝对值的数量。
-            save: 是否立即保存到磁盘。
-            force_update: 如果为 True，覆盖现有配置值。
+            dataset_dict: 训练集数据字典 {'x_att_raw': (N, n_features), ...}
+            top_k_waveform: 波形 scale_factor 计算参数
+            dataset_id: 数据集标识
+            fit_split: 数据划分标识
+            
+        Returns:
+            bool: True=成功生成, False=文件已存在跳过
         """
-        self.load_config()
+        if self.config_path.exists():
+            print(f"[Processor] 配置文件已存在: {self.config_path}")
+            print(f"[Processor] 跳过生成，如需重新生成请手动删除该文件")
+            return False
         
-        # 1. 波形统计信息
-        if 'x_acc' in dataset_dict:
-            waveforms = dataset_dict['x_acc'] # Shape (N, ...)
+        # 执行 fit 计算统计量
+        self.fit(
+            dataset_dict=dataset_dict,
+            top_k_waveform=top_k_waveform,
+            dataset_id=dataset_id,
+            fit_split=fit_split,
+            force_update=True  # 内存中强制更新
+        )
+        
+        # 保存到文件（此时文件不存在，save_config 会成功）
+        return self.save_config(force_overwrite=False)
+
+    def print_computed_stats(
+        self,
+        dataset_dict: Dict[str, Any],
+        top_k_waveform: int = 50
+    ) -> None:
+        """计算当前数据的统计量并打印（不保存），用于配置验证和调试。
+        
+        Args:
+            dataset_dict: {'x_att_raw': (N, n_features), ...}
+            top_k_waveform: 波形统计时取 top-K 绝对值均值
+        """
+        print("\n" + "="*60)
+        print("[Processor] 当前数据的统计量（仅供参考，不会保存）:")
+        print("="*60)
+        
+        # 波形统计
+        wave_key = 'x_acc_xy' if 'x_acc_xy' in dataset_dict else ('x_acc' if 'x_acc' in dataset_dict else None)
+        if wave_key is not None:
+            waveforms = dataset_dict[wave_key]
             flat_abs = np.abs(waveforms).flatten()
-            top_k_vals = np.sort(flat_abs)[-top_k_waveform:]
-            scale_factor = float(np.mean(top_k_vals))
-            if scale_factor < 1e-6: scale_factor = 1.0
-            
-            # 检查现有配置
-            existing_factor = self.config.get('waveform', {}).get('scale_factor')
-            
-            if existing_factor is None or force_update:
-                self.config.setdefault('waveform', {})['scale_factor'] = scale_factor
-                print(f"[Processor] 计算得到的波形缩放因子: {scale_factor:.4f}")
-            else:
-                print(f"[Processor] 使用现有的波形缩放因子: {existing_factor:.4f} (计算值为 {scale_factor:.4f})")
-
-        # 2. 连续特征
-        if 'x_att_continuous' in dataset_dict:
-            cont_data = dataset_dict['x_att_continuous']
-            # 假设 2D: (N, D)
-            num_features = cont_data.shape[1]
-            
-            self.config.setdefault('features', {})
-            
-            for i in range(num_features):
-                # 识别特征名称
-                f_name = f"feat_{i}"
-                if feature_names and isinstance(feature_names, dict):
-                    f_name = feature_names.get(i, f_name)
-                elif feature_names and isinstance(feature_names, list) and i < len(feature_names):
-                    f_name = feature_names[i]
-                
-                # 计算统计量
-                f_min = float(np.min(cont_data[:, i]))
-                f_max = float(np.max(cont_data[:, i]))
-                f_abs_max = float(np.max(np.abs(cont_data[:, i])))
-                
-                # 确定策略 (默认 MinMax 0-1, 如果需要可为 Angle/Overlap 覆盖为 MaxAbs)
-                # 这里只存储统计量。策略由用户需求（配置）定义。
-                # 为了方便起见，如果缺失我们可以初始化一个默认策略。
-                
-                feat_conf = self.config['features'].get(f_name)
-                
-                if feat_conf is None or force_update:
-                    # 启发式规则: 如果 min < 0, 也许使用 MaxAbs? 或者坚持使用 MinMax [0,1]。
-                    # PulsePredict 逻辑: Velocity -> MinMax, Angle/Overlap -> MaxAbs.
-                    # 我们将存储原始统计量，用户可以验证方法。
-                    new_conf = {
-                        "idx": i, # 存储索引仅供参考，但依赖用户映射名称
-                        "stats": {
-                            "min": f_min,
-                            "max": f_max,
-                            "abs_max": f_abs_max
-                        },
-                        "method": "minmax" # 默认值
-                    }
-                    if "angle" in f_name.lower() or "overlap" in f_name.lower():
-                        new_conf["method"] = "maxabs"
-                    
-                    self.config['features'][f_name] = new_conf
-                    print(f"[Processor] 已初始化 {f_name} 的配置: {new_conf['stats']}")
-                else:
-                     # 仅更新统计量检查（可选日志记录）
-                     pass
-
-        # 3. 离散特征
-        if 'x_att_discrete' in dataset_dict:
-            disc_data = dataset_dict['x_att_discrete']
-            num_features = disc_data.shape[1]
-            
-            # 对于离散特征，我们需要映射关系。
-            # 假设输入已经被某种程度编码或是原始整数？
-            # 如果是原始整数，LabelEncoding 本质上是恒等映射，除非非连续。
-            # 为了安全起见，我们构建映射。
-            
-            for i in range(num_features):
-                f_name = f"disc_{i}"
-                if feature_names: # 如果需要处理离散名称逻辑
-                     # 如果 feature_names 先包含连续特征，需要偏移量
-                     pass 
-                
-                # 我们假设调用者分别处理离散名称，或者我们仅使用索引
-                unique_vals = np.unique(disc_data[:, i])
-                mapping = {str(val): int(idx) for idx, val in enumerate(unique_vals)}
-                
-                # 仅保存记录，尽管 transform 通常接受原始输入。
-                # 如果原始输入是字符串，我们需要映射。如果是整数，我们映射 int->int (0..N)。
-                # 这里我们假设我们仅记录唯一值计数。
-                pass 
-
-        # 保存
-        if save:
-            self.save_config()
-
-    def transform_continuous(self, data, feature_names_list):
-        """
-        基于配置转换连续特征。
-        Args:
-            data: (N, D) 数组
-            feature_names_list: 对应列 [0..D-1] 的名称列表
-        """
-        if not self.config: self.load_config()
-        self.validate_config(raise_on_error=False)
+            if flat_abs.size > 0:
+                top_k_vals = np.sort(flat_abs)[-top_k_waveform:]
+                scale_factor = float(np.mean(top_k_vals))
+                print(f"  波形 scale_factor (top-{top_k_waveform} abs mean): {scale_factor:.4f}")
         
-        result = data.copy()
-        
-        for i, name in enumerate(feature_names_list):
-            if name not in self.config.get('features', {}):
-                continue
+        # 连续特征统计
+        if 'x_att_raw' in dataset_dict:
+            x_att_raw = np.asarray(dataset_dict['x_att_raw'])
+            if x_att_raw.ndim == 2 and x_att_raw.shape[1] == self.n_features:
+                cont_raw = x_att_raw[:, CONTINUOUS_INDICES].astype(float)
                 
-            conf = self.config['features'][name]
-            method = conf.get('method', 'minmax')
-            stats = conf.get('stats', {})
-            
-            if method == 'minmax':
-                d_min = stats.get('min')
-                d_max = stats.get('max')
-                if d_min is not None and d_max is not None and (d_max - d_min) > 1e-9:
-                    result[:, i] = (result[:, i] - d_min) / (d_max - d_min)
-            elif method == 'maxabs':
-                d_abs = stats.get('abs_max')
-                if d_abs is not None and d_abs > 1e-9:
-                    result[:, i] = result[:, i] / d_abs
-            elif method == 'fixed_scale':
-                scale = conf.get('params', {}).get('scale')
-                if scale:
-                    result[:, i] = result[:, i] / scale
-                    
-        return result
+                print("  连续特征 (MinMax):")
+                for j in MINMAX_INDICES_IN_CONTINUOUS:
+                    name = FEATURE_ORDER[j]
+                    col = cont_raw[:, j]
+                    print(f"    {name}: min={np.min(col):.4f}, max={np.max(col):.4f}")
+                
+                print("  连续特征 (MaxAbs):")
+                for j in MAXABS_INDICES_IN_CONTINUOUS:
+                    name = FEATURE_ORDER[j]
+                    col = cont_raw[:, j]
+                    print(f"    {name}: abs_max={np.max(np.abs(col)):.4f}")
+        # 离散特征统计
+        if 'x_att_raw' in dataset_dict:
+            x_att_raw = np.asarray(dataset_dict['x_att_raw'])
+            if x_att_raw.ndim == 2 and x_att_raw.shape[1] == self.n_features:
+                disc_raw = x_att_raw[:, DISCRETE_INDICES].astype(int)
+                
+                print("  离散特征 取值分布:")
+                for local_idx, name in enumerate(self.discrete_feature_names):
+                    col = disc_raw[:, local_idx]
+                    unique, counts = np.unique(col, return_counts=True)
+                    value_counts = dict(zip(unique.tolist(), counts.tolist()))
+                    print(f"    {name}: {value_counts}")
+        
+        print("="*60)
 
-    def transform_discrete(self, data, feature_names_list):
-        """
-        基于配置转换离散特征。
+    def transform(
+        self,
+        dataset_dict: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """使用已加载的配置转换数据（推理阶段使用）。
+        
         Args:
-            data: (N, D) 数组
-            feature_names_list: 对应列 [0..D-1] 的名称列表
+            dataset_dict: 输入数据字典
+                - 'x_att_raw': ndarray (N, n_features) - 连续 + 离散特征的二维数组
+                - 'x_acc_xy' / 'x_acc_xyz' / 'x_acc': ndarray (N, C, T) [可选]
+        
+        Returns:
+            Dict[str, Any]: 转换后的数据字典
+                - 'x_att_continuous': ndarray (N, n_continuous), float32
+                - 'x_att_discrete': ndarray (N, n_discrete), int64
+                - 波形键原样保留，值为归一化后的结果
+        
+        Raises:
+            ValueError: 配置未加载或结构不完整
         """
-        if not self.config: self.load_config()
-        result = data.copy()
-
-        for i, name in enumerate(feature_names_list):
-            conf = self.config.get('discrete', {}).get(name)
-            if not conf:
-                continue
-
-            mapping = conf.get('mapping', {})
-            value_to_index = mapping.get('value_to_index', {})
-            unknown_policy = mapping.get('unknown_policy', 'error')
-            unknown_index = mapping.get('unknown_index', -1)
-
-            def _map_value(v):
-                key = str(v)
-                if key in value_to_index:
-                    return value_to_index[key]
-                if unknown_policy == 'keep':
-                    return v
-                if unknown_policy == 'unk':
-                    return unknown_index
-                raise ValueError(f"离散特征 {name} 出现未见值: {v}")
-
-            result[:, i] = np.vectorize(_map_value)(result[:, i])
-        return result
-
-    def transform(self, dataset_dict, feature_names=None):
-        """统一转换入口，返回新的数据字典。"""
         if not self.config:
             self.load_config()
         self.validate_config(raise_on_error=True)
@@ -393,8 +334,9 @@ class UnifiedDataProcessor:
         # 以 CrashDataset 的输入为主：x_att_raw -> (x_att_continuous, x_att_discrete)
         if 'x_att_raw' in dataset_dict:
             x_att_raw = np.asarray(dataset_dict['x_att_raw'])
-            if x_att_raw.ndim != 2 or x_att_raw.shape[1] != 13:
-                raise ValueError("x_att_raw 必须是形状 (N,13) 的数组")
+            # 这里的2代表数组是二维，n_features代表列数
+            if x_att_raw.ndim != 2 or x_att_raw.shape[1] != self.n_features:
+                raise ValueError(f"x_att_raw 必须是形状 (N, {self.n_features}) 的数组")
 
             cont_raw = x_att_raw[:, CONTINUOUS_INDICES].astype(float)
             disc_raw = x_att_raw[:, DISCRETE_INDICES].astype(int)
@@ -412,33 +354,47 @@ class UnifiedDataProcessor:
 
         return output
 
-    def transform_waveform(self, waveforms):
-        """使用全局缩放因子转换波形。"""
+    def transform_waveform(self, waveforms: np.ndarray) -> np.ndarray:
+        """对波形进行全局缩放: normalized = waveforms / scale_factor。
+        
+        Args:
+            waveforms: ndarray (N, C, T) - N样本, C通道, T时间步
+        Returns:
+            ndarray (N, C, T), float32
+        """
         if not self.config: self.load_config()
         scale_factor = self.config.get('waveform', {}).get('scale_factor', 1.0)
         return waveforms / scale_factor
 
-    def get_discrete_info(self):
-        """返回嵌入层所需的离散信息等。"""
+    def get_discrete_info(self) -> Dict[str, Dict[str, Any]]:
+        """提取离散特征元信息，供 Embedding 层使用。
+        
+        Returns:
+            Dict[str, Dict]: {特征名: {num_classes}}
+        """
         if not self.config: self.load_config()
         discrete = self.config.get('discrete', {})
-        return {
-            "is_driver_side": {
-                "num_classes": discrete.get('is_driver_side', {}).get('stats', {}).get('num_classes', 2),
-                "unknown_policy": discrete.get('is_driver_side', {}).get('mapping', {}).get('unknown_policy', 'error'),
-                "unknown_index": discrete.get('is_driver_side', {}).get('mapping', {}).get('unknown_index', -1)
-            },
-            "OT": {
-                "num_classes": discrete.get('OT', {}).get('stats', {}).get('num_classes', 3),
-                "unknown_policy": discrete.get('OT', {}).get('mapping', {}).get('unknown_policy', 'error'),
-                "unknown_index": discrete.get('OT', {}).get('mapping', {}).get('unknown_index', -1)
+        
+        result = {}
+        for name in self.discrete_feature_names:
+            feat_cfg = discrete.get(name, {})
+            result[name] = {
+                "num_classes": feat_cfg.get('stats', {}).get(
+                    'num_classes', self.discrete_num_classes[name]
+                )
             }
-        }
+        return result
 
-    def transform_continuous_crashdataset(self, cont_raw_11: np.ndarray) -> np.ndarray:
-        """CrashDataset 连续特征转换：11维输入 -> 11维输出。"""
+    def transform_continuous_crashdataset(self, cont_raw: np.ndarray) -> np.ndarray:
+        """对连续特征进行归一化 (MinMax + MaxAbs 混合策略)。
+        
+        Args:
+            cont_raw: ndarray (N, n_continuous) - 原始连续特征
+        Returns:
+            ndarray (N, n_continuous), float32 - MinMax特征→[0,1], MaxAbs特征→[-1,1]
+        """
         cfg = self.config.get('continuous', {})
-        out = cont_raw_11.astype(np.float32).copy()
+        out = cont_raw.astype(np.float32).copy()
 
         # MinMaxScaler: (x - min) / (max - min)
         for j in cfg.get('minmax', {}).get('indices_in_continuous', MINMAX_INDICES_IN_CONTINUOUS):
@@ -468,23 +424,43 @@ class UnifiedDataProcessor:
 
         return out
 
-    def transform_discrete_crashdataset(self, disc_raw_2: np.ndarray) -> np.ndarray:
-        """CrashDataset 离散特征转换：2维输入 -> 2维输出（LabelEncoder等价编码）。"""
+    def transform_discrete_crashdataset(self, disc_raw: np.ndarray) -> np.ndarray:
+        """对离散特征进行整数编码 (LabelEncoder)。
+        
+        映射规则固定在 settings.py 的 DISCRETE_VALUE_TO_INDEX。
+        
+        Args:
+            disc_raw: ndarray (N, num_discrete_features) - 原始离散特征
+        Returns:
+            ndarray (N, num_discrete_features), int64 - 编码后的离散特征
+        Raises:
+            ValueError: 出现非法取值时
+        """
         disc_cfg = self.config.get('discrete', {})
-
-        # is_driver_side
-        m_driver = disc_cfg.get('is_driver_side', {}).get('mapping', {}).get('value_to_index', DISCRETE_VALUE_TO_INDEX['is_driver_side'])
-        m_ot = disc_cfg.get('OT', {}).get('mapping', {}).get('value_to_index', DISCRETE_VALUE_TO_INDEX['OT'])
-
-        def _map(col: np.ndarray, mapping: Dict[str, int], name: str) -> np.ndarray:
-            out = np.empty_like(col, dtype=np.int64)
-            for i, v in enumerate(col.tolist()):
-                key = str(int(v))
-                if key not in mapping:
-                    raise ValueError(f"离散特征 {name} 出现未见值: {v}")
-                out[i] = int(mapping[key])
-            return out
-
-        driver_enc = _map(disc_raw_2[:, 0], m_driver, 'is_driver_side')
-        ot_enc = _map(disc_raw_2[:, 1], m_ot, 'OT')
-        return np.stack([driver_enc, ot_enc], axis=1).astype(np.int64)
+        
+        def _map_vectorized(col: np.ndarray, mapping: Dict[str, int], name: str) -> np.ndarray:
+            """Vectorized mapping via lookup table."""
+            col_int = col.astype(np.int64)
+            keys = np.array([int(k) for k in mapping.keys()], dtype=np.int64)
+            vals = np.array([mapping[str(k)] for k in keys], dtype=np.int64)
+            
+            # 检查是否有未知值
+            unique_in_col = np.unique(col_int)
+            unknown = set(unique_in_col.tolist()) - set(keys.tolist())
+            if unknown:
+                raise ValueError(f"离散特征 {name} 出现未见值: {sorted(unknown)}")
+            
+            max_key = int(keys.max()) + 1
+            lut = np.full(max_key, -1, dtype=np.int64)
+            lut[keys] = vals
+            return lut[col_int]
+        
+        encoded_cols = []
+        for local_idx, name in enumerate(self.discrete_feature_names):
+            mapping = disc_cfg.get(name, {}).get('mapping', {}).get(
+                'value_to_index', DISCRETE_VALUE_TO_INDEX[name]
+            )
+            enc = _map_vectorized(disc_raw[:, local_idx], mapping, name)
+            encoded_cols.append(enc)
+        
+        return np.stack(encoded_cols, axis=1).astype(np.int64)

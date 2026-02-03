@@ -65,8 +65,8 @@ if __name__ == '__main__':
     # fix random seeds for reproducibility
     set_random_seed(123)
     args = argparse.ArgumentParser(description='LX-CrashPulsePredictionModel Training')
-    args.add_argument('-c', '--config', default=None, type=str,
-                      help='config file path (default: None)')
+    args.add_argument('-c', '--config', default='PulsePredict/config.json', type=str,
+                      help='config file path (default: PulsePredict/config.json)')
     args.add_argument('-r', '--resume', default=None, type=str,
                       help='path to latest checkpoint (default: None)')
     args.add_argument('-d', '--device', default=None, type=str,

@@ -12,11 +12,11 @@ FEATURE_ORDER = [
 
 CONTINUOUS_INDICES = list(range(11)) # 在特征向量中的索引（对应前11个连续特征）
 
-DISCRETE_INDICES = [11, 12] # 在特征向量中的索引（对应 is_driver_side, OT）
-
 MAXABS_INDICES_IN_CONTINUOUS = [1, 2] # 在连续子向量(11维)中的索引（对应 impact_angle, overlap）
 
 MINMAX_INDICES_IN_CONTINUOUS = [0, 3, 4, 5, 6, 7, 8, 9, 10] # 在连续子向量(11维)中的索引（对应 impact_velocity + 其余8个连续特征）
+
+DISCRETE_INDICES = [11, 12] # 在特征向量中的索引（对应 is_driver_side, OT）
 
 DISCRETE_VALUE_TO_INDEX = {
     "is_driver_side": {"0": 0, "1": 1},
@@ -27,6 +27,11 @@ REQUIRED_COLUMNS_FOR_PACKING = set(FEATURE_ORDER + [
     "case_id", "is_pulse_ok", "is_injury_ok",
     "HIC15", "Dmax", "Nij"
 ])
+
+# 波形相关常量
+WAVEFORM_LENGTH = 150  # 降采样后波形长度
+WAVEFORM_CHANNELS_XY = 2  # XY 双轴
+WAVEFORM_CHANNELS_XYZ = 3  # XYZ 三轴
 
 # ================================================================
 ''' 设置项目中的关键路径 '''
@@ -43,7 +48,12 @@ RAW_DATA_DIR = DATA_DIR / "raw_packed"
 SPLIT_INDICES_DIR = DATA_DIR / "split_indices"
 
 # 配置文件（全局共用）
-NORMALIZATION_CONFIG_PATH = DATA_DIR / "normalization.json"
+NORMALIZATION_CONFIG_PATH = DATA_DIR / "normalization_config.json"
+
+# 子项目目录
+PULSE_PREDICT_DIR = ROOT_DIR / "PulsePredict"
+INJURY_PREDICT_DIR = ROOT_DIR / "InjuryPredict"
+ARS_OPTIM_DIR = ROOT_DIR / "ARS_optim"
 
 def get_paths():
     """获取路径字典（不产生副作用）。"""
@@ -52,7 +62,10 @@ def get_paths():
         "data": DATA_DIR,
         "raw_packed": RAW_DATA_DIR,
         "split_indices": SPLIT_INDICES_DIR,
-        "normalization_config": NORMALIZATION_CONFIG_PATH
+        "normalization_config": NORMALIZATION_CONFIG_PATH,
+        "pulse_predict": PULSE_PREDICT_DIR,
+        "injury_predict": INJURY_PREDICT_DIR,
+        "ars_optim": ARS_OPTIM_DIR
     }
 
 def ensure_dirs(paths=None):
