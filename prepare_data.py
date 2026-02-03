@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from common.utils.seeding import GLOBAL_SEED
+from common.settings import CASE_ID_OFFSET_DEFAULT, REQUIRED_COLUMNS_FOR_PACKING, FEATURE_ORDER
 from common.settings import RAW_DATA_DIR, SPLIT_INDICES_DIR, ensure_dirs
 from common.data_utils.splitter import stratified_split_case_ids, case_ids_to_indices
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
@@ -17,18 +18,6 @@ from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from tqdm import tqdm
 
 
-CASE_ID_OFFSET_DEFAULT = 50000
-
-FEATURE_ORDER = [
-    "impact_velocity", "impact_angle", "overlap",
-    "LL1", "LL2", "BTF", "LLATTF", "AFT", "SP", "SH", "RA",
-    "is_driver_side", "OT"
-] # 共12个特征列，11个连续值+1个二分类标志位+1个整数OT; 顺序不可更改！严格依赖此顺序读取和存储数据，与损伤预测模型输入对应！
-
-REQUIRED_COLUMNS_FOR_PACKING = set(FEATURE_ORDER + [
-    "case_id", "is_pulse_ok", "is_injury_ok",
-    "HIC15", "Dmax", "Nij"
-])
 
 def _read_distribution(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".csv":

@@ -5,29 +5,8 @@ from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
 
 from common.settings import NORMALIZATION_CONFIG_PATH
+from common.settings import FEATURE_ORDER, CONTINUOUS_INDICES, DISCRETE_INDICES, DISCRETE_VALUE_TO_INDEX, MAXABS_INDICES_IN_CONTINUOUS, MINMAX_INDICES_IN_CONTINUOUS
 
-
-# 与 InjuryPredict/utils/dataset_prepare.py 中 CrashDataset/DataProcessor 的约定保持一致
-FEATURE_ORDER = [
-    "impact_velocity", "impact_angle", "overlap",
-    "LL1", "LL2", "BTF", "LLATTF", "AFT", "SP", "SH", "RA",
-    "is_driver_side", "OT"
-]
-
-CONTINUOUS_INDICES_11 = list(range(11))
-DISCRETE_INDICES_2 = [11, 12]
-
-# 在连续子向量(11维)中的索引（对应 impact_angle, overlap）
-MAXABS_INDICES_IN_CONTINUOUS = [1, 2]
-
-# 在连续子向量(11维)中的索引（对应 impact_velocity + 其余8个连续特征）
-MINMAX_INDICES_IN_CONTINUOUS = [0, 3, 4, 5, 6, 7, 8, 9, 10]
-
-# 固定离散映射（等价于LabelEncoder在这些取值上的编码）
-DISCRETE_VALUE_TO_INDEX = {
-    "is_driver_side": {"0": 0, "1": 1},
-    "OT": {"1": 0, "2": 1, "3": 2}
-}
 class UnifiedDataProcessor:
     """
     统一数据归一化处理器。
@@ -148,7 +127,7 @@ class UnifiedDataProcessor:
             if x_att_raw.ndim != 2 or x_att_raw.shape[1] != 13:
                 raise ValueError("x_att_raw 必须是形状 (N,13) 的数组")
 
-            cont_raw = x_att_raw[:, CONTINUOUS_INDICES_11].astype(float)
+            cont_raw = x_att_raw[:, CONTINUOUS_INDICES].astype(float)
 
             cont_cfg = self.config.get('continuous', {})
             cont_cfg.setdefault('feature_order_11', FEATURE_ORDER[:11])
@@ -179,7 +158,7 @@ class UnifiedDataProcessor:
         # 3. 离散特征（严格按CrashDataset：x_att_raw[:,11:13]）
         if 'x_att_raw' in dataset_dict:
             x_att_raw = np.asarray(dataset_dict['x_att_raw'])
-            disc_raw = x_att_raw[:, DISCRETE_INDICES_2].astype(int)
+            disc_raw = x_att_raw[:, DISCRETE_INDICES].astype(int)
             # 仅用于校验取值范围（映射固定，避免训练集缺类导致不可复现）
             is_driver_vals = set(np.unique(disc_raw[:, 0]).tolist())
             ot_vals = set(np.unique(disc_raw[:, 1]).tolist())
@@ -417,8 +396,8 @@ class UnifiedDataProcessor:
             if x_att_raw.ndim != 2 or x_att_raw.shape[1] != 13:
                 raise ValueError("x_att_raw 必须是形状 (N,13) 的数组")
 
-            cont_raw = x_att_raw[:, CONTINUOUS_INDICES_11].astype(float)
-            disc_raw = x_att_raw[:, DISCRETE_INDICES_2].astype(int)
+            cont_raw = x_att_raw[:, CONTINUOUS_INDICES].astype(float)
+            disc_raw = x_att_raw[:, DISCRETE_INDICES].astype(int)
 
             output['x_att_continuous'] = self.transform_continuous_crashdataset(cont_raw)
             output['x_att_discrete'] = self.transform_discrete_crashdataset(disc_raw)

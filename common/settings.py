@@ -1,7 +1,35 @@
 from pathlib import Path
 import os
-''' 设置项目中的关键路径 '''
 
+''' 设置数据集特征相关的常量, 规范数据接口 '''
+CASE_ID_OFFSET_DEFAULT = 50000 # 默认的主副驾 case_id 差量，可用于生成识别原始碰撞波形csv文件的唯一case_id
+
+FEATURE_ORDER = [
+    "impact_velocity", "impact_angle", "overlap",
+    "LL1", "LL2", "BTF", "LLATTF", "AFT", "SP", "SH", "RA",
+    "is_driver_side", "OT"
+] # 共12个特征列，11个连续值+1个二分类标志位+1个整数OT; 顺序不可更改！严格依赖此顺序读取和存储数据，与损伤预测模型输入对应！
+
+CONTINUOUS_INDICES = list(range(11)) # 在特征向量中的索引（对应前11个连续特征）
+
+DISCRETE_INDICES = [11, 12] # 在特征向量中的索引（对应 is_driver_side, OT）
+
+MAXABS_INDICES_IN_CONTINUOUS = [1, 2] # 在连续子向量(11维)中的索引（对应 impact_angle, overlap）
+
+MINMAX_INDICES_IN_CONTINUOUS = [0, 3, 4, 5, 6, 7, 8, 9, 10] # 在连续子向量(11维)中的索引（对应 impact_velocity + 其余8个连续特征）
+
+DISCRETE_VALUE_TO_INDEX = {
+    "is_driver_side": {"0": 0, "1": 1},
+    "OT": {"1": 0, "2": 1, "3": 2}
+} # 固定离散映射（等价于LabelEncoder在这些取值上的编码）
+
+REQUIRED_COLUMNS_FOR_PACKING = set(FEATURE_ORDER + [
+    "case_id", "is_pulse_ok", "is_injury_ok",
+    "HIC15", "Dmax", "Nij"
+])
+
+# ================================================================
+''' 设置项目中的关键路径 '''
 # Project Root (LX_project/)
 # 保证此文件位于 LX_project/common/settings.py
 _DEFAULT_ROOT = Path(__file__).resolve().parent.parent
