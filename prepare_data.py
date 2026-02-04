@@ -471,18 +471,14 @@ def main():
         
         processor = UnifiedDataProcessor(config_path=NORMALIZATION_CONFIG_PATH)
         
-        if not NORMALIZATION_CONFIG_PATH.exists():
-            # 配置文件不存在，基于训练集计算统计量并生成
-            print(f"[prepare_data] 配置文件不存在，正在基于{out_raw.name}的训练集:{train_indices_path.name} 生成...")
-            generated = processor.generate_config_if_absent(
-                dataset_dict=train_data,
-                top_k_waveform=50,
-                dataset_id=str(out_raw.name),
-                fit_split=str(train_indices_path.name)
-            )
-            if generated:
-                print(f"\n⚠️  归一化配置已生成: {NORMALIZATION_CONFIG_PATH}")
-                print(f"⚠️  请检查并根据需要手动编辑配置文件中的数值！")
+        generated = processor.generate_config_if_absent(
+            dataset_dict=train_data,
+            top_k_waveform=50,
+            dataset_id=str(out_raw.name),
+            fit_split=str(train_indices_path.name)
+        )
+        if generated:
+            print(f"✅️ 请检查并根据需要可手动编辑配置文件中的数值！")
         else:
             # 配置文件已存在，仅打印当前数据的统计量供用户参考
             print(f"[prepare_data] 配置文件已存在: {NORMALIZATION_CONFIG_PATH}")
@@ -492,7 +488,7 @@ def main():
         print(f"[prepare_data] 警告: 未找到训练集索引文件 {train_indices_path}，跳过归一化配置生成")
     
     print("="*60)
-    print("✅️ 数据准备完成！")
+    print("✅️ [prepare_data] 数据准备完成！")
     print("="*60)
 
 
