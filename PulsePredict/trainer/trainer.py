@@ -79,7 +79,7 @@ class Trainer(BaseTrainer):
             
         log = self.train_metrics.result()
 
-        if self.do_validation:
+        if self.do_validation: # 当存在验证集时，进行验证
             val_log = self._valid_epoch(epoch)
             log.update(**{'val_'+k : v for k, v in val_log.items()})
 

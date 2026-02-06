@@ -18,7 +18,6 @@ def build_case_id_index_map(case_ids: Sequence[int]) -> Dict[int, int]:
         mapping[cid_int] = int(idx)
     return mapping
 
-
 def case_ids_to_indices(case_ids_all: Sequence[int], subset_case_ids: Sequence[int]) -> np.ndarray:
     """将case_id列表转换为在case_ids_all中的indices。"""
     mapping = build_case_id_index_map(case_ids_all)
@@ -185,7 +184,6 @@ def stratified_split(
     }
     
     return final_train, final_val, final_test, summary
-
 
 def stratified_split_case_ids(
     case_ids: np.ndarray,

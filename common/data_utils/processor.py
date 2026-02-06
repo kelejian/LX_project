@@ -33,7 +33,7 @@ class UnifiedDataProcessor:
         - process_continuous(data, feature_names, inverse): 连续特征归一化/反归一化
         - process_discrete(data, feature_names, inverse): 离散特征编码/解码
         - process_by_name(values, feature_names, inverse): 通用接口，按特征名处理任意子集
-        - process_all_features(x_raw, inverse): 处理完整 13 维特征向量
+        - process_all_features(x_raw, inverse): 处理完整的FEATURE_ORDER中的特征
     
     使用示例:
         >>> processor = UnifiedDataProcessor()
@@ -193,7 +193,7 @@ class UnifiedDataProcessor:
         
         Args:
             data: 连续特征数组，形状 [N, D] 或 [D,]
-            feature_names: 特征名列表，长度必须等于 D。若为 None，则使用全部 11 个连续特征
+            feature_names: 特征名列表，长度必须等于 D。若为 None，则使用全部 n_continuous 个连续特征
             inverse: False=归一化, True=反归一化
         
         Returns:
@@ -352,16 +352,16 @@ class UnifiedDataProcessor:
         x_raw: np.ndarray,
         inverse: bool = False
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """处理完整的 13 维特征向量（InjuryPredict 主要使用此接口）。
+        """处理完整的 n_features 维特征向量（InjuryPredict 主要使用此接口）。
         
         Args:
-            x_raw: 原始特征数组，形状 [N, 13]
+            x_raw: 原始特征数组，形状 [N, n_features]
             inverse: False=归一化, True=反归一化
         
         Returns:
             (x_continuous, x_discrete): 
-                - x_continuous: 归一化后的连续特征 [N, 11], float64
-                - x_discrete: 编码后的离散特征 [N, 2], int64
+                - x_continuous: 归一化后的连续特征 [N, n_continuous], float64
+                - x_discrete: 编码后的离散特征 [N, n_discrete], int64
         """
         self._ensure_config()
         
@@ -389,8 +389,8 @@ class UnifiedDataProcessor:
         
         Returns:
             (scale, offset): 归一化公式为 x' = (x - offset) / scale
-                - scale: [11,] 数组
-                - offset: [11,] 数组
+                - scale: [n_continuous,] 数组
+                - offset: [n_continuous,] 数组
             对于 MinMax 特征: scale = max - min, offset = min
             对于 MaxAbs 特征: scale = abs_max, offset = 0
         """

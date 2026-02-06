@@ -250,7 +250,7 @@ def package_raw_packed(
     np.savez(
         output_npz,
         case_ids=case_ids.astype(np.int64), # (n,)
-        x_att_raw=x_att_raw.astype(np.float32), # ndarray (n,13)
+        x_att_raw=x_att_raw.astype(np.float32), # ndarray (n,13) 顺序与 FEATURE_ORDER 保持一致
         x_acc_xyz=x_acc_xyz.astype(np.float32), # ndarray (n,3,150)
         x_acc_xy=x_acc_xy.astype(np.float32), # ndarray (n,2,150)
         is_pulse_ok=is_pulse_ok.astype(bool), # (n,)
@@ -306,7 +306,10 @@ def generate_splits(
     val_ratio: float,
     test_ratio: float
 ):
-    """基于打包数据.npz文件 生成 injury/pulse 两套划分结果。"""
+    """
+    基于打包数据.npz文件 生成 injury/pulse 两套划分结果。
+    生成的./data 下保存的所有数据集索引(_indices.npy 文件)，严格对应 raw_data_packed.npz 中各个 np.ndarray 的行索引. raw_data_packed.npz 目前只包含 is_pulse_ok==True 的样本。
+    """
     data = np.load(raw_npz_path)
     case_ids_all = data["case_ids"].astype(np.int64) # (N,), 全量 pulse_ok==True 的 case_ids
     x_att_raw = data["x_att_raw"].astype(np.float32)  # (N, len(FEATURE_ORDER))

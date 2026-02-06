@@ -17,41 +17,25 @@
         }
     },
     "data_loader_train": {
-        "type": "CollisionDataLoader",
+        "type": "PulseDataLoader",
         "args": {
-            "packaged_data_path": "E:/WPS Office/1628575652/WPS企业云盘/清华大学/我的企业文档/课题组相关/理想项目/仿真数据库相关/VCS波形数据集打包/acc_data_before1111_6134/packaged_data_train.npz",
+            "packaged_data_path": "data/raw_packed/raw_data_packed.npz",
+            "split_indices_dir": "data/split_indices",
+            "processor_config": "data/normalization_config.json",
             "batch_size": 128,
-            "shuffle": true,
-            "validation_split": 0.1,
             "num_workers": 0,
-            "pulse_norm_mode": "absmax",
-            "scaler_path": "data_loader/pulse_scaler.joblib",
-            "training": true,
-            "physics_bounds": {
-                "v_min": 23.5,
-                "v_max": 65,
-                "a_abs_max": 45,
-                "o_abs_max": 1
-            }
+            "training": true
         }
     },
     "data_loader_test": {
-        "type": "CollisionDataLoader",
+        "type": "PulseDataLoader",
         "args": {
-            "packaged_data_path": "E:/WPS Office/1628575652/WPS企业云盘/清华大学/我的企业文档/课题组相关/理想项目/仿真数据库相关/VCS波形数据集打包/acc_data_before1111_6134/packaged_data_test.npz",
+            "packaged_data_path": "data/raw_packed/raw_data_packed.npz",
+            "split_indices_dir": "data/split_indices",
+            "processor_config": "data/normalization_config.json",
             "batch_size": 64,
-            "shuffle": false,
-            "validation_split": 0,
             "num_workers": 0,
-            "pulse_norm_mode": "absmax",
-            "scaler_path": "data_loader/pulse_scaler.joblib",
-            "training": false,
-            "physics_bounds": {
-                "v_min": 23.5,
-                "v_max": 65,
-                "a_abs_max": 45,
-                "o_abs_max": 1
-            }
+            "training": false
         }
     },
     "optimizer": {
