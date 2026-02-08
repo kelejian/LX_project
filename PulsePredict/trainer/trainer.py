@@ -1,9 +1,7 @@
 import numpy as np
 import torch
-from torchvision.utils import make_grid
 from base import BaseTrainer
 from utils import inf_loop, MetricTracker, inverse_transform
-import torch.nn.functional as F
 
 class Trainer(BaseTrainer):
     """

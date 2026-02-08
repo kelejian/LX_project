@@ -4,7 +4,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from base import BaseModel
 import model.loss as module_loss
-from torch_geometric.nn import MLP as PygMLP # 直接用PyG的MLP模块
 
 # ==========================================================================================
 # 基础组件定义 (Basic Components)
@@ -761,6 +760,6 @@ class HybridPulseCNN(BaseModel):
         """
         提取用于评估指标的模型输出
         
-        返回: 最终阶段的均值预测 (B, output_channels, output_lengths[-1])
+        返回: 最终阶段的波形(均值)预测 (B, output_channels, output_lengths[-1])
         """
         return model_output[-1][0] if self.GauNll_use else model_output[-1]

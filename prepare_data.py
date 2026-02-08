@@ -108,8 +108,7 @@ def _load_waveforms_batch(
     Returns:
         x_acc_xyz: (M, WAVEFORM_CHANNELS_XYZ, WAVEFORM_LENGTH)
         x_acc_xy:  (M, WAVEFORM_CHANNELS_XY, WAVEFORM_LENGTH)
-        ok_mask:   (N,) 表示输入 case_ids 中哪些成功读取
-    """
+        ok_mask:   (N,) 表示输入 case_ids 中哪些成功读取。在 strict=True 且函数“正常返回”（不抛出异常）的前提下，返回的 ok_mask 对应的输入行要么全部为 True(对于非空输入), 要么为空数组(输入长度为0)    """
     if case_ids.ndim != 1:
         raise ValueError("case_ids 必须是一维数组")
     if is_driver_side.shape[0] != case_ids.shape[0]:
@@ -127,15 +126,16 @@ def _load_waveforms_batch(
             driver_order.append(d_int)
         driver_to_indices[d_int].append(idx)
 
-    n = case_ids.shape[0]
+    n = case_ids.shape[0] # 输入的 case_ids 数量（包含主/副驾）
     x_acc_xyz = np.empty((n, WAVEFORM_CHANNELS_XYZ, WAVEFORM_LENGTH), dtype=np.float32)
     x_acc_xy = np.empty((n, WAVEFORM_CHANNELS_XY, WAVEFORM_LENGTH), dtype=np.float32)
-    ok_mask = np.zeros((n,), dtype=bool)
+    ok_mask = np.zeros((n,), dtype=bool) # 初始化全部为 False
 
     for driver_id in  tqdm(driver_order, total=len(driver_order), desc="读取主驾波形", unit="case"):
         try:
             # 只读取主驾波形（driver_id 本身就是主驾 case_id）
             xyz, xy = _load_xyz_waveforms(pulse_dir, int(driver_id), 1, case_id_offset)
+            # 将同一份 xyz/xy 复制到该主驾对应的所有原始样本索引（即包含主驾和副驾）
             for idx in driver_to_indices[int(driver_id)]:
                 x_acc_xyz[idx] = xyz
                 x_acc_xy[idx] = xy
@@ -202,11 +202,10 @@ def package_raw_packed(
         case_ids=case_ids_all, # 仅 is_pulse_ok==True 的 case_ids
         is_driver_side=is_driver_side_all,
         case_id_offset=case_id_offset,
-        strict=strict,
+        strict=strict, # 如果 strict=True 则遇到缺失波形/异常 case 直接报错退出；如果 strict=False 则跳过这些 case，继续打包剩余数据
     )
 
-    # 过滤掉 non-strict 下失败的样本
-    # 如果 strict 模式（默认，即未设置 --non-strict），则上面会直接报错退出
+    # 如果 strict 模式（默认，即未设置 --non-strict），则要么全部成功（ok_mask 全为 True），要么函数直接抛出异常退出；如果 non-strict 模式，则会过滤掉那些缺失波形的 case，剩余 case_ids 以及对应的参数/标签等数据只包含成功读取波形的样本。
     case_ids = case_ids_all[ok_mask]
     x_att_raw = x_att_raw_all[ok_mask]
     is_pulse_ok = is_pulse_ok_all[ok_mask]
@@ -247,6 +246,7 @@ def package_raw_packed(
     output_npz.parent.mkdir(parents=True, exist_ok=True)
     print(f"✅️ 标签计算完成并打包")
 
+    # 包含成功读取波形的 case_ids 以及对应的参数/标签等数据只包含成功读取波形的样本（如果 strict=False 则会过滤掉那些缺失波形的 case）
     np.savez(
         output_npz,
         case_ids=case_ids.astype(np.int64), # (n,)

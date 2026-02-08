@@ -17,41 +17,43 @@ class PulseDataset(Dataset):
         # 加载全量数据
         data = np.load(packaged_data_path, allow_pickle=True)
         self.case_ids = data['case_ids']      
-        self.x_att_raw = data['x_att_raw']    # (N, 13)
-        self.x_acc_xyz = data['x_acc_xyz']    # (N, 3, 150)
+        self.att_raw = data['x_att_raw']    # (N, 13)
+        self.acc_raw = data['x_acc_xyz']    # (N, 3, 150)
         
-        # 初始化公共处理器
-        self.processor = UnifiedDataProcessor(config_path=processor_config_path)
+        # 初始化公共处理器（保留 config 路径）
+        self._processor_config_path = processor_config_path
+        self.processor = UnifiedDataProcessor(config_path=self._processor_config_path)
         if not self.processor.load_config():
             raise RuntimeError(f"Failed to load processor config: {processor_config_path}")
 
-        self.feature_names = ["impact_velocity", "impact_angle", "overlap"]
-        self.feature_indices = [FEATURE_ORDER.index(name) for name in self.feature_names]
+        self.impact_feat_names = ["impact_velocity", "impact_angle", "overlap"]
+        self.impact_feat_indices = [FEATURE_ORDER.index(name) for name in self.impact_feat_names]
+
+        # -----------------------------
+        # 预先向量化归一化（内存缓存，避免每个样本的 Python 开销）
+        # - 使用 processor 的批量接口（注意参数名与返回 dtype）
+        # - 处理时使用 float64 做计算，最终存为 float32 以减少内存和拷贝开销
+        # -----------------------------
+        # impact features: (N, 3)
+        self.impact_feats_raw = self.att_raw[:, self.impact_feat_indices]
+        self.impact_feats_norm = self.processor.process_by_name(
+            values=self.impact_feats_raw,
+            feature_names=self.impact_feat_names,
+            inverse=False
+        ).astype(np.float32)
+
+        # 波形支持批量输入 (N, C, T)
+        self.acc_norm = self.processor.process_waveform(self.acc_raw.astype(np.float64), inverse=False).astype(np.float32)
         
     def __len__(self):
         return len(self.case_ids)
 
     def __getitem__(self, idx):
-        # 1. 获取原始数据 (物理尺度)
-        raw_features = self.x_att_raw[idx, self.feature_indices] 
-        raw_waveform = self.x_acc_xyz[idx]                       
-
-        # 2. 调用公共接口归一化
-        norm_features = self.processor.process_by_name(
-            values=raw_features, 
-            feature_names=self.feature_names, 
-            inverse=False
-        )
-        # 输出的波形也归一化
-        norm_waveform = self.processor.process_waveform(
-            data=raw_waveform, 
-            inverse=False
-        )
-
+        # 返回预先归一化并缓存的 numpy -> tensor（零计算开销）
         return (
-            torch.tensor(norm_features, dtype=torch.float32), 
-            torch.tensor(norm_waveform, dtype=torch.float32),
-            self.case_ids[idx] # 传递ID以便调试或追踪
+            torch.from_numpy(self.impact_feats_norm[idx]),
+            torch.from_numpy(self.acc_norm[idx]),
+            self.case_ids[idx]  # 传递ID以便调试或追踪
         )
     
 #==========================================================================================
