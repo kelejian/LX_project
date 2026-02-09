@@ -148,7 +148,7 @@
     },
     "trainer": {
         "epochs": 150,
-        "save_dir": "saved/",
+        "save_dir": "PulsePredict/saved/",
         "save_period": 20,
         "verbosity": 2,
         "monitor": "max val_iso_rating_x",
