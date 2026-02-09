@@ -17,6 +17,7 @@ class PulseDataset(Dataset):
         
         # 加载全量数据
         data = np.load(packaged_data_path, allow_pickle=True)
+        print(f"[PulseDataset] Loaded raw scale data from {packaged_data_path} with keys: {list(data.keys())}")
         self.case_ids = data['case_ids']      
         self.att_raw = data['x_att_raw']    # (N, 13)
         self.acc_raw = data['x_acc_xyz']    # (N, 3, 150)
@@ -28,7 +29,8 @@ class PulseDataset(Dataset):
             raise RuntimeError(f"Failed to load processor config: {processor_config_path}")
         if not self.processor.validate_config():
             raise ValueError(f"Invalid processor config: {processor_config_path}")
-
+        # 打印processor信息
+        print(f"[PulseDataset] Loaded UnifiedDataProcessor with config: {processor_config_path}")
         self.impact_feat_names = ["impact_velocity", "impact_angle", "overlap"]
         self.impact_feat_indices = [FEATURE_ORDER.index(name) for name in self.impact_feat_names]
 
@@ -44,10 +46,12 @@ class PulseDataset(Dataset):
             feature_names=self.impact_feat_names,
             inverse=False
         ).astype(np.float32)
+        print(f"[PulseDataset] Preprocessed impact features with shape {self.impact_feats_norm.shape} and dtype {self.impact_feats_norm.dtype}")
 
         # 波形支持批量输入 (N, C, T)
         self.acc_norm = self.processor.process_waveform(self.acc_raw.astype(np.float64), inverse=False).astype(np.float32)
-        
+        print(f"[PulseDataset] Preprocessed waveforms with shape {self.acc_norm.shape} and dtype {self.acc_norm.dtype}")
+
     def __len__(self):
         return len(self.case_ids)
 

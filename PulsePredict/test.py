@@ -13,7 +13,7 @@ import PulsePredict.model.metric as module_metric
 import PulsePredict.model.model as module_arch
 from PulsePredict.parse_config import ConfigParser
 from PulsePredict.model.metric import ISORating # 导入 ISORating 类用于计算
-from PulsePredict.utils import inverse_transform, plot_waveform_comparison, InputScaler
+from PulsePredict.utils import plot_waveform_comparison
 
 
 def main(config):
@@ -68,6 +68,10 @@ def main(config):
 
     # setup data_loader instances
     data_loader = config.init_obj('data_loader_test', module_data)
+    # 强制 dataset 提供 UnifiedDataProcessor
+    processor = getattr(data_loader, 'processor', None)
+    if processor is None:
+        raise RuntimeError("Dataset.processor (UnifiedDataProcessor) is required — run prepare_data.py to generate normalization_config.json")
     # 打印测试集数据量
     logger.info(f"测试集数据量: {len(data_loader.dataset)}")
 
@@ -99,9 +103,6 @@ def main(config):
     all_targets_orig = []
     all_losses = []
 
-    # 获取用于逆变换的 scaler
-    target_scaler = getattr(data_loader, 'target_scaler', None) # 获取数据集中的scaler属性，如果有的话
-
     with torch.no_grad():
         for batch_idx, (data, target, case_ids) in enumerate(tqdm(data_loader, desc="Predicting")):
             data, target = data.to(device), target.to(device)
@@ -114,31 +115,27 @@ def main(config):
             # 收集每个样本的损失值；注意，损失函数reduction不是'none'，这里loss.item()是批次的平均损失；为简化，我们直接用批次平均损失代表该批次中每个样本的损失
             all_losses.extend([loss.item()] * data.shape[0])
 
-            # 计算指标前，先对数据进行逆变换，如果没有scaler，则返回原始张量
-            pred_mean_orig, target_orig = inverse_transform(metrics_output, target, target_scaler)
+            # 使用 UnifiedDataProcessor 进行逆归一化（tensor -> numpy -> processor -> tensor）
+            metrics_output_np = processor.process_waveform(metrics_output.detach().cpu().numpy(), inverse=True)
+            target_np = processor.process_waveform(target.detach().cpu().numpy(), inverse=True)
+            pred_mean_orig = torch.from_numpy(metrics_output_np).to(metrics_output.device).type_as(metrics_output)
+            target_orig = torch.from_numpy(target_np).to(target.device).type_as(target)
 
             # ---------------------------------------       
 
-            # 收集逆变换后的工况、预测和目标
-            # 从 data_loader.dataset 中获取 scaler (优先)，或者从 config 中读取参数重新构建
-            if hasattr(data_loader.dataset, 'input_scaler'):
-                input_scaler = data_loader.dataset.input_scaler
-            else:
-                # 兜底逻辑：从 config 获取参数
-                bounds = config['data_loader_test']['args'].get('physics_bounds')
-                input_scaler = InputScaler(**bounds)
-                
+            # 收集逆变换后的工况、预测和目标（使用 UnifiedDataProcessor）
             for i in range(data.shape[0]):
-                norm_vel, norm_ang, norm_ov = data[i].cpu().numpy()
-                raw_vel, raw_ang, raw_ov = input_scaler.inverse_transform(norm_vel, norm_ang, norm_ov)
+                norm_params = data[i].cpu().numpy()
+                raw_vals = processor.process_by_name(norm_params[None, :], ["impact_velocity", "impact_angle", "overlap"], inverse=True)[0]
+                raw_vel, raw_ang, raw_ov = float(raw_vals[0]), float(raw_vals[1]), float(raw_vals[2])
                 all_raw_params.append([raw_vel, raw_ang, raw_ov])
-            
+
             all_preds_orig.append(pred_mean_orig.cpu())
             all_targets_orig.append(target_orig.cpu())
 
             # ------------------------------画图----------------------------------
             if batch_idx == BATCH_IDX:
-                plot_samples(data, batch_idx, pred_mean_orig, target_orig, case_ids, input_scaler, config, logger, plot_iso_ratings=PLOT_ISO_RATINGS_IN_TITLE)
+                plot_samples(data, batch_idx, pred_mean_orig, target_orig, case_ids, processor, config, logger, plot_iso_ratings=PLOT_ISO_RATINGS_IN_TITLE)
             # --------------------------------------------------------------------
 
     # 将列表中的批次拼接成一个大的张量/数组
@@ -256,18 +253,18 @@ def main(config):
         evaluate_subset(subset_preds, subset_targets, subset_losses, metric_fns, logger, f"样本数: {len(indices)}")
     # ----------------------------------------------------
 
-def plot_samples(data, batch_idx, pred_mean_orig, target_orig, case_ids, input_scaler, config, logger, plot_iso_ratings=False):
+def plot_samples(data, batch_idx, pred_mean_orig, target_orig, case_ids, processor, config, logger, plot_iso_ratings=False):
     """
     为指定批次的样本绘图。
+    :param processor: UnifiedDataProcessor 实例（用于逆归一化）
     """
     num_samples_to_plot = data.shape[0]
     print(f"\nPlotting samples from batch {batch_idx}...")
     for j in range(num_samples_to_plot):
         # --- 从归一化输入中反算出原始工况参数 ---
-        normalized_params = data[j].cpu().numpy()
-        norm_vel, norm_ang, norm_ov = normalized_params[0], normalized_params[1], normalized_params[2]
-        
-        raw_vel, raw_ang, raw_ov = input_scaler.inverse_transform(norm_vel, norm_ang, norm_ov)
+        norm_params = data[j].cpu().numpy()
+        proc_vals = processor.process_by_name(norm_params[None, :], ["impact_velocity", "impact_angle", "overlap"], inverse=True)[0]
+        raw_vel, raw_ang, raw_ov = float(proc_vals[0]), float(proc_vals[1]), float(proc_vals[2])
 
         collision_params = {'vel': raw_vel, 'ang': raw_ang, 'ov': raw_ov}
         
