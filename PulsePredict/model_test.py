@@ -548,9 +548,9 @@ def _get_output_names(outputs):
 
 
 if __name__ == "__main__":
-    from utils import read_json
-    from parse_config import ConfigParser
-    import model.model as module_arch
+    from PulsePredict.utils import read_json
+    from PulsePredict.parse_config import ConfigParser
+    import PulsePredict.model.model as module_arch
 
     config = ConfigParser(read_json('config.json'))
     Pulsemodel = config.init_obj('arch', module_arch)

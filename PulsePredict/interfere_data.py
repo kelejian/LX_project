@@ -13,10 +13,10 @@ from tqdm import tqdm
 import pandas as pd
 
 # 导入项目模块
-import model.model as module_arch
-from model.metric import ISORating
-from parse_config import ConfigParser # 仅用于日志记录器
-from utils.util import InputScaler, inverse_transform, plot_waveform_comparison
+import PulsePredict.model.model as module_arch
+from PulsePredict.model.metric import ISORating
+from PulsePredict.parse_config import ConfigParser # 仅用于日志记录器
+from PulsePredict.utils.util import InputScaler, inverse_transform, plot_waveform_comparison
 
 #==========================================================================================
 # 1. 配置文件

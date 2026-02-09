@@ -2,8 +2,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from base import BaseModel
-import model.loss as module_loss
+
+from PulsePredict.base import BaseModel
 
 # ==========================================================================================
 # 基础组件定义 (Basic Components)

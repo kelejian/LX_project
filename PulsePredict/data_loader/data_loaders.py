@@ -2,8 +2,9 @@ import os
 import numpy as np
 import torch
 from pathlib import Path
-from base import BaseDataLoader
 from torch.utils.data import Dataset
+
+from PulsePredict.base import BaseDataLoader
 from common.data_utils.processor import UnifiedDataProcessor
 from common.settings import FEATURE_ORDER
 #==========================================================================================
@@ -25,6 +26,8 @@ class PulseDataset(Dataset):
         self.processor = UnifiedDataProcessor(config_path=self._processor_config_path)
         if not self.processor.load_config():
             raise RuntimeError(f"Failed to load processor config: {processor_config_path}")
+        if not self.processor.validate_config():
+            raise ValueError(f"Invalid processor config: {processor_config_path}")
 
         self.impact_feat_names = ["impact_velocity", "impact_angle", "overlap"]
         self.impact_feat_indices = [FEATURE_ORDER.index(name) for name in self.impact_feat_names]
@@ -70,6 +73,7 @@ class PulseDataLoader(BaseDataLoader):
             packaged_data_path=packaged_data_path,
             processor_config_path=processor_config
         )
+        self.processor = self.dataset.processor  # 共享处理器实例（如果需要在外部访问）
 
         # 2. 准备索引 (Strict Mode)
         train_test_indices = None

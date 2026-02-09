@@ -5,14 +5,14 @@ warnings.filterwarnings('ignore')
 import argparse
 import collections
 import torch
-import numpy as np
-import data_loader.data_loaders as module_data
-import model.loss as module_loss
-import model.metric as module_metric
-import model.model as module_arch
-from parse_config import ConfigParser
-from trainer import Trainer
-from utils import prepare_device, get_parameter_groups
+
+import PulsePredict.data_loader.data_loaders as module_data
+import PulsePredict.model.loss as module_loss
+import PulsePredict.model.metric as module_metric
+import PulsePredict.model.model as module_arch
+from PulsePredict.parse_config import ConfigParser
+from PulsePredict.trainer import Trainer
+from PulsePredict.utils import prepare_device, get_parameter_groups
 from common.utils.seeding import set_random_seed
 
 def main(config):

@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import torch
-import torch.nn as nn
 
 def ensure_dir(dirname):
     dirname = Path(dirname)

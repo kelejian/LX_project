@@ -1,7 +1,7 @@
 import numpy as np
 import torch
-from base import BaseTrainer
-from utils import inf_loop, MetricTracker, inverse_transform
+from PulsePredict.base import BaseTrainer
+from PulsePredict.utils import inf_loop, MetricTracker, inverse_transform
 
 class Trainer(BaseTrainer):
     """
