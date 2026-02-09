@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from PulsePredict.base import BaseTrainer
-from PulsePredict.utils import inf_loop, MetricTracker, inverse_transform
+from PulsePredict.utils import inf_loop, MetricTracker
 
 class Trainer(BaseTrainer):
     """
@@ -38,7 +38,9 @@ class Trainer(BaseTrainer):
         """
         self.model.train()
         self.train_metrics.reset()
-        scaler = getattr(self.data_loader, 'target_scaler', None)
+        processor = getattr(self.data_loader, 'processor', None)
+        if processor is None:
+            raise RuntimeError("Dataset.processor (UnifiedDataProcessor) is required for inverse transforms.")
         
         for batch_idx, (data, target, case_ids) in enumerate(self.data_loader):
             data, target = data.to(self.device), target.to(self.device)
@@ -59,7 +61,12 @@ class Trainer(BaseTrainer):
 
             # Get the primary model output for metrics calculation
             metrics_output = self.model.get_metrics_output(output)
-            metrics_output_orig, target_orig = inverse_transform(metrics_output, target, scaler)
+            # Use UnifiedDataProcessor for inverse transform (tensor -> numpy -> processor -> tensor)
+            with torch.no_grad():
+                metrics_output_np = processor.process_waveform(metrics_output.detach().cpu().numpy(), inverse=True)
+                target_np = processor.process_waveform(target.detach().cpu().numpy(), inverse=True)
+            metrics_output_orig = torch.from_numpy(metrics_output_np).to(metrics_output.device).type_as(metrics_output)
+            target_orig = torch.from_numpy(target_np).to(target.device).type_as(target)
 
             for met in self.metric_ftns:
                 self.train_metrics.update(met.__name__, met(metrics_output_orig, target_orig))
@@ -91,7 +98,9 @@ class Trainer(BaseTrainer):
         """
         self.model.eval()
         self.valid_metrics.reset()
-        scaler = getattr(self.data_loader, 'target_scaler', None)
+        processor = getattr(self.data_loader, 'processor', None)
+        if processor is None:
+            raise RuntimeError("Dataset.processor (UnifiedDataProcessor) is required for inverse transforms.")
         
         with torch.no_grad():
             for batch_idx, (data, target, case_ids) in enumerate(self.valid_data_loader):
@@ -107,7 +116,11 @@ class Trainer(BaseTrainer):
                     self.valid_metrics.update(loss_name, loss_val)
                 
                 metrics_output = self.model.get_metrics_output(output)
-                metrics_output_orig, target_orig = inverse_transform(metrics_output, target, scaler)
+                # Use UnifiedDataProcessor for inverse transform (tensor -> numpy -> processor -> tensor)
+                metrics_output_np = processor.process_waveform(metrics_output.detach().cpu().numpy(), inverse=True)
+                target_np = processor.process_waveform(target.detach().cpu().numpy(), inverse=True)
+                metrics_output_orig = torch.from_numpy(metrics_output_np).to(metrics_output.device).type_as(metrics_output)
+                target_orig = torch.from_numpy(target_np).to(target.device).type_as(target)
 
                 for met in self.metric_ftns:
                     self.valid_metrics.update(met.__name__, met(metrics_output_orig, target_orig))

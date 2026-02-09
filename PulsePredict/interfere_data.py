@@ -3,7 +3,6 @@ os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = 'T'
 import warnings
 warnings.filterwarnings('ignore')
 import json
-import joblib
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
@@ -16,7 +15,9 @@ import pandas as pd
 import PulsePredict.model.model as module_arch
 from PulsePredict.model.metric import ISORating
 from PulsePredict.parse_config import ConfigParser # 仅用于日志记录器
-from PulsePredict.utils.util import InputScaler, inverse_transform, plot_waveform_comparison
+from PulsePredict.utils.util import plot_waveform_comparison
+from common.data_utils.processor import UnifiedDataProcessor
+from common.settings import FEATURE_ORDER
 
 #==========================================================================================
 # 1. 配置文件
@@ -32,11 +33,9 @@ CHECKPOINT_PATH = (
     r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_model_PulsePredict\saved\models\HybridPulseCNN\1213_095952\model_best.pth"
 )
 
-# 指定要分析的数据集 (.npz) 文件路径 (例如，测试集或包含所有工况的完整数据集)
-DATASET_NPZ_PATH_LIST = [
-    r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\VCS波形数据集打包\acc_data_before1111_6134\packaged_data_test.npz",
-    r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\VCS波形数据集打包\acc_data_before1111_6134\packaged_data_train.npz"
-]
+# 数据集路径（已弃用旧的多文件列表）：
+# DATASET_NPZ_PATH_LIST 已被移除，脚本现在直接从 checkpoint 的 config.json
+# 中读取单一 canonical 打包文件（data/packaged ... -> 'packaged_data_path'），不再兼容旧格式。
 
 # 1.2. 绘图轴配置
 # --------------------------------------------------------------------------------------
@@ -360,78 +359,50 @@ def main():
     model.eval()
     logger.info(f"模型 '{model_arch_type}' 加载成功并设置到 {device}。")
 
-    # --- 3. 加载 Scalers ---
-    bounds = config['data_loader_train']['args'].get('physics_bounds')
-    if not bounds:
-         raise ValueError("配置文件中未找到 'physics_bounds'")
-    input_scaler = InputScaler(**bounds)
-
-    target_scaler = None
-    try:
-        scaler_path_str = config['data_loader_train']['args'].get('scaler_path')
-        if scaler_path_str:
-            scaler_path = Path(scaler_path_str)
-            if scaler_path.exists():
-                target_scaler = joblib.load(scaler_path)
-                logger.info(f"成功加载目标波形 Scaler: {scaler_path}")
-            else:
-                logger.warning(f"Scaler 文件 '{scaler_path}' 未找到。")
-        else:
-            logger.warning("配置中未指定 'scaler_path'。")
-        
-        if target_scaler is None:
-             logger.warning("未加载 Target Scaler，将使用归一化尺度进行评估（可能不准确）。")
-             
-    except Exception as e:
-        logger.error(f"加载 Scaler 时出错: {e}")
-        return
+    # --- 3. 归一化器（使用统一的 UnifiedDataProcessor） ---
+    # 使用 prepare_data.py 生成的 data/normalization_config.json。此处直接从配置中构建 UnifiedDataProcessor。
+    proc_cfg_path = Path(config['data_loader_train']['args'].get('processor_config', 'data/normalization_config.json'))
+    processor = UnifiedDataProcessor(config_path=proc_cfg_path)
+    if not processor.load_config():
+        raise RuntimeError(f"无法加载归一化配置: {proc_cfg_path}")
+    if not processor.validate_config():
+        raise RuntimeError(f"归一化配置校验失败: {proc_cfg_path}")
+    logger.info(f"使用 UnifiedDataProcessor (config={proc_cfg_path}) 进行归一化/反归一化")
 
     # --- 4. 加载并筛选数据 ---
     logger.info(f"正在加载并筛选数据集...")
     
-    # <--- 修改: 循环加载多个文件并合并 --->
-    all_raw_params_list = []
-    all_waveforms_list = []
-    all_case_ids_list = []
-    all_source_files_list = []
-
-    for npz_path_str in DATASET_NPZ_PATH_LIST:
-        npz_path = Path(npz_path_str)
-        if not npz_path.exists():
-            logger.warning(f"文件不存在，跳过: {npz_path}")
-            continue
-            
-        try:
-            data = np.load(npz_path)
-            # 读取数据
-            params = data['params']
-            waveforms = data['waveforms']
-            case_ids = data['case_ids']
-            
-            all_raw_params_list.append(params)
-            all_waveforms_list.append(waveforms)
-            all_case_ids_list.append(case_ids)
-            
-            # 记录来源文件名 (扩展为与数据等长的列表)
-            file_name = npz_path.name
-            all_source_files_list.extend([file_name] * len(case_ids))
-            
-            logger.info(f"成功加载: {file_name} (样本数: {len(case_ids)})")
-            
-        except Exception as e:
-            logger.error(f"加载 {npz_path} 失败: {e}")
-
-    if not all_raw_params_list:
-        logger.error("未成功加载任何数据，脚本终止。")
+    # <--- 循环加载多个文件并合并 --->
+    # 加载单一 canonical .npz 文件（路径从 config 中读取）。
+    npz_path = Path(config['data_loader_train']['args'].get('packaged_data_path', 'data/raw_packed/raw_data_packed.npz'))
+    if not npz_path.exists():
+        logger.error(f"数据文件不存在: {npz_path} — 请先运行 `python prepare_data.py` 来生成原始尺度的打包数据文件 (.npz)")
         return
 
-    # 合并所有数据
-    all_raw_params = np.concatenate(all_raw_params_list, axis=0)
-    all_waveforms = np.concatenate(all_waveforms_list, axis=0)
-    all_case_ids = np.concatenate(all_case_ids_list, axis=0)
-    all_source_files = np.array(all_source_files_list)
-    
-    logger.info(f"数据合并完成，总样本数: {len(all_case_ids)}")
+    data = np.load(npz_path)
+    # canonical keys produced by prepare_data.py
+    # x_att_raw: (N, D)  (full FEATURE_ORDER)
+    # x_acc_xyz: (N, 3, T)
+    # case_ids:  (N,)
+    try:
+        full_att = data['x_att_raw']
+        waveforms = data['x_acc_xyz']
+        case_ids = data['case_ids']
+    except Exception as e:
+        logger.error(f"数据文件 {npz_path} 不包含预期键 (x_att_raw/x_acc_xyz/case_ids): {e}")
+        return
+
+    # 仅保留脚本需要的三项标量参数 (velocity, angle, overlap)
+    impact_feat_names = ["impact_velocity", "impact_angle", "overlap"]
+    impact_indices = [FEATURE_ORDER.index(n) for n in impact_feat_names]
+    params = full_att[:, impact_indices]  # (N, 3)
+
+    all_raw_params = params
+    all_waveforms = waveforms
+    all_case_ids = case_ids
+    all_source_files = np.array([npz_path.name] * len(case_ids))
+
+    logger.info(f"成功加载: {npz_path.name} (样本数: {len(case_ids)})")
 
     # 应用工况筛选
     conditions = SPECIFIC_CASE_CONFIG.get('conditions', [])
@@ -470,13 +441,16 @@ def main():
     filtered_source_files = all_source_files[filtered_indices]
 
     # --- 5. 准备模型输入 (归一化) ---
+    # 使用 UnifiedDataProcessor 的 forward 接口（process_by_name）进行参数归一化
     normalized_params_list = []
     for params in filtered_raw_params:
-        norm_vel, norm_ang, norm_ov = input_scaler.transform(params[0], params[1], params[2])
+        vals = np.asarray(params)[None, :]
+        proc_vals = processor.process_by_name(vals, ["impact_velocity", "impact_angle", "overlap"], inverse=False)[0]
+        norm_vel, norm_ang, norm_ov = float(proc_vals[0]), float(proc_vals[1]), float(proc_vals[2])
         normalized_params_list.append([norm_vel, norm_ang, norm_ov])
-    
+
     normalized_params_np = np.array(normalized_params_list, dtype=np.float32)
-    
+
     # 转换为 PyTorch Tensors
     norm_params_tensor = torch.from_numpy(normalized_params_np)
     true_waveforms_tensor = torch.from_numpy(filtered_true_waveforms).float()
@@ -494,7 +468,7 @@ def main():
     with torch.no_grad():
         for batch_data, batch_target in tqdm(inference_loader, desc="Inference"):
             batch_data = batch_data.to(device)
-            batch_target = batch_target.to(device) # 目标也放上GPU，以便inverse_transform
+            batch_target = batch_target.to(device)  # batch_target 用于对比（后续通过 processor 反归一化）
 
             # ------------------- 模型推理 ----------------------
             output = model(batch_data)
@@ -503,9 +477,12 @@ def main():
             metrics_output = model.get_metrics_output(output)
             # ---------------------------------------------------
 
-            # 逆变换到物理尺度
-            pred_orig, _ = inverse_transform(metrics_output, batch_target, target_scaler)
-            
+            # 使用 UnifiedDataProcessor 进行波形反归一化（tensor -> numpy -> processor -> tensor）
+            metrics_output_np = processor.process_waveform(metrics_output.detach().cpu().numpy(), inverse=True)
+            target_np = processor.process_waveform(batch_target.detach().cpu().numpy(), inverse=True)
+            pred_orig = torch.from_numpy(metrics_output_np).to(metrics_output.device).type_as(metrics_output)
+            batch_target_orig = torch.from_numpy(target_np).to(batch_target.device).type_as(batch_target)
+
             all_pred_waveforms_orig.append(pred_orig.cpu())
 
     # 拼接所有批次的预测结果
