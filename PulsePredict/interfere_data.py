@@ -30,7 +30,7 @@ plt.rcParams['axes.unicode_minus'] = False    # 负号正常显示
 # --------------------------------------------------------------------------------------
 # 指定要加载的模型检查点 (.pth) 文件路径
 CHECKPOINT_PATH = (
-    r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_model_PulsePredict\saved\models\HybridPulseCNN\1213_095952\model_best.pth"
+    r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_project\PulsePredict\saved\models\HybridPulseCNN\0210_115651\model_best.pth"
 )
 
 # 数据集路径（已弃用旧的多文件列表）：
@@ -385,9 +385,11 @@ def main():
     # x_acc_xyz: (N, 3, T)
     # case_ids:  (N,)
     try:
-        full_att = data['x_att_raw']
-        waveforms = data['x_acc_xyz']
-        case_ids = data['case_ids']
+        # 仅考虑主驾侧case_id <= 50000 的样本，排除副驾侧
+        data_mask = data['case_ids'] <= 50000
+        full_att = data['x_att_raw'][data_mask]
+        waveforms = data['x_acc_xyz'][data_mask]
+        case_ids = data['case_ids'][data_mask]
     except Exception as e:
         logger.error(f"数据文件 {npz_path} 不包含预期键 (x_att_raw/x_acc_xyz/case_ids): {e}")
         return
@@ -402,7 +404,7 @@ def main():
     all_case_ids = case_ids
     all_source_files = np.array([npz_path.name] * len(case_ids))
 
-    logger.info(f"成功加载: {npz_path.name} (样本数: {len(case_ids)})")
+    logger.info(f"成功加载数据文件: {npz_path.name} (波形样本数: {len(case_ids)})")
 
     # 应用工况筛选
     conditions = SPECIFIC_CASE_CONFIG.get('conditions', [])

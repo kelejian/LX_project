@@ -41,10 +41,10 @@
     "optimizer": {
         "type": "AdamW",
         "args": {
-            "lr": 0.001,
-            "weight_decay": 5e-2
+            "lr": 0.0015,
+            "weight_decay": 0.1
         },
-        "head_decay_ratio": 0.01
+        "head_decay_ratio": 0.001
     },
 
     "loss": {
@@ -58,7 +58,7 @@
                         "scale_weights": [0, 0.2, 1.0],
                         "base_loss_type": "GaussianNLLLoss",
                         "base_loss_args": { "eps": 1e-06, "reduction": "none" },
-                        "channel_weights": [1.0, 0.5, 0.05]
+                        "channel_weights": [1.0, 0.5, 0.01]
                     }
                 },
                 {
@@ -76,7 +76,7 @@
                     "args": {
                         "apply_smoothing": false,
                         "smoothing_window_size": 5,
-                        "channel_weights": [1.0, 0.5, 0.02]
+                        "channel_weights": [1.0, 0.5, 0.01]
                     }
                 },
                 {
@@ -115,7 +115,7 @@
                     "args": {
                         "dt": 0.001,
                         "loss_type": "MSELoss",
-                        "channel_weights": [1.0, 0.6, 0.2]
+                        "channel_weights": [1.0, 0.6, 0.3]
                     }
                 },
                 {
@@ -124,7 +124,7 @@
                     "args": {
                         "dt": 0.001,
                         "loss_type": "MSELoss",
-                        "channel_weights": [1.0, 0.6, 0.2]
+                        "channel_weights": [1.0, 0.6, 0.3]
                     }
                 }
             ]

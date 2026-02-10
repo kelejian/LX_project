@@ -552,7 +552,7 @@ if __name__ == "__main__":
     from PulsePredict.parse_config import ConfigParser
     import PulsePredict.model.model as module_arch
 
-    config = ConfigParser(read_json('config.json'))
+    config = ConfigParser(read_json('PulsePredict/config.json'))
     Pulsemodel = config.init_obj('arch', module_arch)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
