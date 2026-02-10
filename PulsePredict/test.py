@@ -73,7 +73,7 @@ def main(config):
     if processor is None:
         raise RuntimeError("Dataset.processor (UnifiedDataProcessor) is required — run prepare_data.py to generate normalization_config.json")
     # 打印测试集数据量
-    logger.info(f"测试集数据量: {len(data_loader.dataset)}")
+    logger.info(f"测试集数据量: {len(data_loader.train_test_indices)}")
 
     # build model architecture
     model = config.init_obj('arch', module_arch)

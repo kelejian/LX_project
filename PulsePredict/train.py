@@ -22,9 +22,9 @@ def main(config):
     data_loader = config.init_obj('data_loader_train', module_data) # 只包含训练集数据的加载器，但内部已经划分好了验证集的范围
     valid_data_loader = data_loader.split_validation() # 把验证集加载器作为一个独立的对象分离出来
     # 打印各自数据量
-    logger.info(f"训练集数据量: {len(data_loader.dataset)}")
+    logger.info(f"训练集数据量: {len(data_loader.train_test_indices)}")
     if valid_data_loader is not None:
-        logger.info(f"验证集数据量: {len(valid_data_loader.dataset)}")
+        logger.info(f"验证集数据量: {len(data_loader.val_indices)}")
     else:
         logger.info("验证集数据量: 0")
 

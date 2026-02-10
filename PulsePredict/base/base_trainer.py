@@ -1,8 +1,9 @@
 import torch
 from abc import abstractmethod
 from numpy import inf
-from logger import TensorboardWriter
 import numpy as np
+
+from PulsePredict.logger import TensorboardWriter
 
 class BaseTrainer:
     """

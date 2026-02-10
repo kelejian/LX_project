@@ -27,6 +27,8 @@ class ConfigParser:
 
         timestamp = datetime.now().strftime(r'%m%d_%H%M%S')
         save_dir_root = Path(self.config['trainer']['save_dir'])
+
+        self.project_root = Path(__file__).parent.resolve() # 该文件的父级目录即
         exper_name = self.config['name']
 
         save_dir_root = save_dir_root.resolve()
@@ -79,7 +81,7 @@ class ConfigParser:
             write_json(self.config, self.save_dir / 'config.json')
 
         # 统一的日志模块配置，指向最终确定的log_dir
-        setup_logger(save_dir=self.log_dir, log_config='logger/logger_config.json')
+        setup_logger(save_dir=self.log_dir, log_config=self.project_root/'logger/logger_config.json')
         self.log_levels = {
             0: logging.WARNING,
             1: logging.INFO,

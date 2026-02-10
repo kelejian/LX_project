@@ -67,8 +67,7 @@ class PulseDataset(Dataset):
 #  DataLoader 类
 #==========================================================================================
 class PulseDataLoader(BaseDataLoader):
-    def __init__(self, packaged_data_path, split_indices_dir, processor_config, 
-                 batch_size, num_workers=0, training=True):
+    def __init__(self, packaged_data_path, split_indices_dir, processor_config, batch_size, num_workers=0, training=True):
 
         self.split_dir = Path(split_indices_dir)
         
@@ -80,8 +79,8 @@ class PulseDataLoader(BaseDataLoader):
         self.processor = self.dataset.processor  # 共享处理器实例（如果需要在外部访问）
 
         # 2. 准备索引 (Strict Mode)
-        train_test_indices = None
-        val_indices = None
+        self.train_test_indices = None
+        self.val_indices = None
         
         if training:
             # --- 训练模式 ---
@@ -91,12 +90,12 @@ class PulseDataLoader(BaseDataLoader):
             # 严格检查训练索引
             if not t_path.exists():
                 raise FileNotFoundError(f"[data_loader] Train indices missing: {t_path}")
-            train_test_indices = np.load(t_path)
+            self.train_test_indices = np.load(t_path)
             
             # 加载验证索引 (如果存在)
             if v_path.exists():
-                val_indices = np.load(v_path)
-            # 注意：如果验证集文件不存在，val_indices 为 None，BaseDataLoader 将不创建验证集 loader
+                self.val_indices = np.load(v_path)
+            # 注意：如果验证集文件不存在，self.val_indices 为 None，BaseDataLoader 将不创建验证集 loader
             
         else:
             # --- 测试模式 ---
@@ -106,11 +105,11 @@ class PulseDataLoader(BaseDataLoader):
             if not test_path.exists():
                 raise FileNotFoundError(f"[data_loader] Test indices missing: {test_path}")
             
-            # 将测试集索引传给 train_test_indices，作为 Loader 的主迭代对象
-            train_test_indices = np.load(test_path) 
+            # 将测试集索引传给 self.train_test_indices，作为 Loader 的主迭代对象
+            self.train_test_indices = np.load(test_path) 
             
             # 测试模式下强制无验证集
-            val_indices = None
+            self.val_indices = None
 
         # 3. 初始化基类
         super().__init__(
@@ -118,6 +117,6 @@ class PulseDataLoader(BaseDataLoader):
             batch_size=batch_size, 
             num_workers=num_workers,
             training=training,
-            train_test_indices=train_test_indices,  # 显式传入，不可为None
-            val_indices=val_indices                 # 显式传入
+            train_test_indices=self.train_test_indices,  # 显式传入，不可为None
+            val_indices=self.val_indices                 # 显式传入
         )
