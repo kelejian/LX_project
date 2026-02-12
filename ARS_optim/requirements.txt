@@ -5,7 +5,6 @@ torch>=1.10.0
 numpy
 pandas
 scikit-learn
-joblib
 
 # --- Visualization & Logging ---
 matplotlib

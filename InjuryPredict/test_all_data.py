@@ -15,28 +15,27 @@ import torch
 import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
-from sklearn.metrics import mean_absolute_error, accuracy_score
 
-# 导入项目中的必要模块
-from utils import models
-# 导入 CrashDataset 即使不直接使用，torch.load 也需要它来反序列化
-from utils.dataset_prepare import CrashDataset 
-from utils.AIS_cal import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
-from utils.set_random_seed import set_random_seed
+from common.settings import INJURY_PROCESSED_DIR
+from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
+from common.utils.seeding import set_random_seed
+
+from InjuryPredict.utils import models
+from InjuryPredict.config import RUNS_DIR
 
 # --- 1. 配置区：请在此处设置您的路径 ---
 
 # 1.1) 要评估的模型所在的运行目录
-RUN_DIR = "./runs/InjuryPredictModel_01281059"  # 示例: "./runs/InjuryPredictModel_XXXXXXXX" 或 "./runs/StudentModel_XXXXXX"
+RUN_DIR = os.path.join(RUNS_DIR, "InjuryPredictModel_01281059")  # 示例: "./runs/InjuryPredictModel_XXXXXXXX" 或 "./runs/StudentModel_XXXXXX"
 
 # 1.2) 要加载的模型权重文件名
 WEIGHT_FILE = "best_val_loss.pth"
 
 # 1.3) 包含原始13个标量特征的 distribution 文件路径
-DISTRIBUTION_FILE = r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0123.csv" 
+DISTRIBUTION_FILE = r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0206.csv" 
 
 # 1.4) 存放 .pt 数据集的目录
-DATA_DIR = "./data"
+DATA_DIR = INJURY_PROCESSED_DIR.as_posix()
 
 # --- 结束配置 ---
 
@@ -83,18 +82,18 @@ def load_model_and_data(run_dir, weight_file, data_dir=DATA_DIR):
     model_params = training_record["hyperparameters"]["model"]
     
     # 2. 加载数据集 .pt 文件
-    train_pt_path = os.path.join(data_dir, "train_dataset.pt")
-    val_pt_path = os.path.join(data_dir, "val_dataset.pt")
-    test_pt_path = os.path.join(data_dir, "test_dataset.pt")
+    train_pt_path = (INJURY_PROCESSED_DIR / "train_dataset.pt").as_posix()
+    val_pt_path = (INJURY_PROCESSED_DIR / "val_dataset.pt").as_posix() 
+    test_pt_path = (INJURY_PROCESSED_DIR / "test_dataset.pt").as_posix()
     
     if not all(os.path.exists(p) for p in [train_pt_path, val_pt_path, test_pt_path]):
-        raise FileNotFoundError(f"未在 {data_dir} 中找到 train/val/test_dataset.pt。请先运行 utils/dataset_prepare.py。")
+        raise FileNotFoundError(f"未在 {INJURY_PROCESSED_DIR.as_posix()} 中找到 train/val/test_dataset.pt。请先运行：python -m InjuryPredict.Injurydata_prepare 来生成数据集文件。")
         
     train_subset = torch.load(train_pt_path)
     val_subset = torch.load(val_pt_path)
     test_subset = torch.load(test_pt_path)
     
-    # 获取底层的、包含所有样本的 CrashDataset 实例
+    # 获取底层的 InjuryPackedDataset 实例（通过 Subset.dataset 可访问底层原始 arrays）
     full_dataset = train_subset.dataset
     all_case_ids = full_dataset.case_ids # 获取所有 case_id 的顺序
     
@@ -131,7 +130,7 @@ def load_model_and_data(run_dir, weight_file, data_dir=DATA_DIR):
 def run_inference(model, dataset, device):
     """在完整数据集上运行推理"""
     
-    # DataLoader 直接加载 CrashDataset 实例，以保证顺序
+    # DataLoader 直接加载通过 Subset 保存的底层 InjuryPackedDataset（shuffle=False 保证顺序）
     data_loader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=0)
     
     all_preds_list = []
@@ -139,7 +138,7 @@ def run_inference(model, dataset, device):
     print("开始在完整数据集上运行模型推理...")
     with torch.no_grad():
         for batch in data_loader:
-            # 从 CrashDataset 的 __getitem__ 解包
+            # 从底层 Dataset 的 __getitem__ 解包（与旧 CrashDataset 行为兼容）
             (batch_x_acc, batch_x_att_continuous, batch_x_att_discrete,
              batch_y_HIC, batch_y_Dmax, batch_y_Nij,
              batch_ais_head, batch_ais_chest, batch_ais_neck, batch_y_MAIS, batch_OT) = [d.to(device) for d in batch]

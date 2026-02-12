@@ -16,7 +16,7 @@ class ARSDataLoader:
     ARS 数据加载器 (Data Loader)
     
     职责：
-    1. 加载原始的测试/验证数据集 (基于InjuryPredict项目的 CrashDataset)。
+    1. 加载原始的测试/验证数据集（使用 InjuryPredict 的 InjuryPackedDataset / processed .pt）。
     2. 提取"物理空间"的原始波形和工况参数。
     3. 将数据打包成 Optimizer 需要的格式 (state_dict, waveform)。
     """
@@ -46,16 +46,12 @@ class ARSDataLoader:
         logger.info(f"ARSDataLoader initialized. Mode: {split}, Samples: {len(self.indices)}")
 
     def _setup_imports(self):
-        """挂载兄弟项目路径以导入 CrashDataset"""
-        abs_path = os.path.abspath(self.surrogate_dir)
-        if abs_path not in sys.path:
-            sys.path.insert(0, abs_path)
-        
+        """导入 InjuryPredict 的数据类（不再通过修改 sys.path）。"""
         try:
-            from utils.dataset_prepare import CrashDataset
-            self.dataset_cls = CrashDataset
-        except ImportError as e:
-            raise ImportError(f"Failed to import CrashDataset from {abs_path}: {e}")
+            from InjuryPredict.Injurydata_prepare import InjuryPackedDataset
+            self.dataset_cls = InjuryPackedDataset
+        except Exception as e:
+            raise ImportError(f"Failed to import InjuryPackedDataset from InjuryPredict: {e}")
 
     def _load_param_definitions(self) -> list:
         """加载 param_space.yaml 以获取参数名称和索引"""
@@ -68,7 +64,7 @@ class ARSDataLoader:
         return cfg['parameters'] # 类型: list of dict
 
     def _load_dataset(self):
-        """实例化 CrashDataset"""
+        """实例化 InjuryPackedDataset（或直接从 npz 加载原始 arrays）"""
         # 构造 npz 的绝对路径
         data_input_path = os.path.abspath(self.config['paths']['data_input'])
         data_labels_path = os.path.abspath(self.config['paths']['data_labels'])
@@ -124,7 +120,7 @@ class ARSDataLoader:
         case_id = int(self.dataset.case_ids[idx])
         
         # 2. 获取原始波形 (2, 150) -> (1, 2, 150)
-        # 注意：CrashDataset 存储的是 numpy float
+        # 注意：底层 InjuryPackedDataset 保留原始 numpy arrays（x_acc_raw）
         wave_np = self.dataset.x_acc_raw[idx]
         waveform = torch.tensor(wave_np, dtype=torch.float32).unsqueeze(0).to(self.device)
         

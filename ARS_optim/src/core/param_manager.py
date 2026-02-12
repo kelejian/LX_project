@@ -4,10 +4,11 @@ import sys
 import os
 import torch
 import yaml
-import joblib
 import logging
 import numpy as np
 from typing import Dict, Tuple, List, Any
+from common.data_utils.processor import UnifiedDataProcessor
+from common.settings import FEATURE_ORDER, CONTINUOUS_INDICES, DISCRETE_INDICES
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -34,16 +35,16 @@ class ParamManager:
 
         Args:
             param_space_path: 参数配置文件路径 (.yaml)
-            preprocessor_path: 预处理器文件路径 (.joblib)
+            preprocessor_path: 预处理器配置路径 (data/normalization_config.json)
             surrogate_project_dir: 代理模型项目根目录 (用于导入相关类定义)
             device: 计算设备
         """
         self.device = device
         
         # 1. 环境准备与文件加载
-        self._setup_imports(surrogate_project_dir)
         self.params_config = self._load_yaml(param_space_path)
-        self.processor = self._load_joblib(preprocessor_path)
+        # 现在使用 common.UnifiedDataProcessor（JSON 配置），不再依赖 .joblib
+        self.processor = self._load_processor(preprocessor_path)
         
         # 2. 解析参数元数据
         self._parse_parameter_metadata()
@@ -57,25 +58,27 @@ class ParamManager:
         self.print_info()
 
     def _setup_imports(self, project_dir: str):
-        """将代理模型项目路径加入 sys.path 以便正确反序列化 joblib 对象。"""
+        """验证 surrogate 项目路径可达（不再向 sys.path 注入或依赖 DataProcessor）。"""
         abs_path = os.path.abspath(project_dir)
-        if abs_path not in sys.path:
-            sys.path.insert(0, abs_path)
-        
-        try:
-            from utils.dataset_prepare import DataProcessor
-        except ImportError as e:
-            logger.error(f"Failed to import DataProcessor from {abs_path}. Check project structure.")
-            raise e
+        if not os.path.exists(abs_path):
+            logger.warning(f"Surrogate project dir not found at {abs_path}; certain legacy flows may fail.")
+        return abs_path
 
     def _load_yaml(self, path: str) -> Dict:
         with open(path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
 
-    def _load_joblib(self, path: str) -> Any:
+    def _load_processor(self, path: str) -> UnifiedDataProcessor:
+        """加载 UnifiedDataProcessor 配置 (JSON)。
+        期望 path 指向 data/normalization_config.json（或等效文件）。
+        """
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Preprocessor file not found at: {path}")
-        return joblib.load(path)
+            raise FileNotFoundError(f"Preprocessor config not found at: {path}")
+        proc = UnifiedDataProcessor(config_path=path)
+        ok = proc.load_config()
+        if not ok:
+            raise RuntimeError(f"Failed to load processor config from {path}")
+        return proc
 
     def _parse_parameter_metadata(self):
         """
@@ -125,52 +128,52 @@ class ParamManager:
 
     def _build_normalization_tensors(self):
         """
-        从预处理器中提取均值和方差，构建可微的归一化计算图。
-        支持 MinMaxScaler 和 MaxAbsScaler。
+        从 UnifiedDataProcessor 配置构建归一化张量（支持 MinMax / MaxAbs / discrete）。
         """
-        proc = self.processor
-        self.waveform_factor = float(proc.waveform_norm_factor)
-        
+        proc: UnifiedDataProcessor = self.processor
+        # 波形缩放因子
+        self.waveform_factor = float(proc.config.get('waveform', {}).get('scale_factor', 1.0))
+
         # 初始化 offset 和 scale 张量 (默认不缩放)
         self.cont_offset = torch.zeros(self.num_total, device=self.device, dtype=torch.float32)
         self.cont_scale = torch.ones(self.num_total, device=self.device, dtype=torch.float32)
-        
-        # 处理 MinMaxScaler 对应的特征
-        if hasattr(proc, 'minmax_indices_in_continuous'):
-            min_vals = proc.scaler_minmax.data_min_
-            max_vals = proc.scaler_minmax.data_max_
-            for i, global_idx in enumerate(proc.minmax_indices_in_continuous):
-                # 仅当该索引确实被定义为连续变量时才应用
-                if global_idx in self.cont_indices:
-                    d_min = float(min_vals[i])
-                    d_max = float(max_vals[i])
-                    scale = d_max - d_min
-                    # 防止除以零
-                    if abs(scale) < 1e-8: scale = 1.0
-                    
-                    self.cont_offset[global_idx] = d_min
-                    self.cont_scale[global_idx] = 1.0 / scale
 
-        # 处理 MaxAbsScaler 对应的特征
-        if hasattr(proc, 'maxabs_indices_in_continuous'):
-            max_abs_vals = proc.scaler_maxabs.max_abs_
-            for i, global_idx in enumerate(proc.maxabs_indices_in_continuous):
-                if global_idx in self.cont_indices:
-                    m_abs = float(max_abs_vals[i])
-                    if abs(m_abs) < 1e-8: m_abs = 1.0
-                    
-                    self.cont_offset[global_idx] = 0.0
-                    self.cont_scale[global_idx] = 1.0 / m_abs
+        # MinMax: proc._minmax_params -> {feature_name: (min, max)}
+        for name, (vmin, vmax) in proc._minmax_params.items():
+            if name not in FEATURE_ORDER:
+                continue
+            global_idx = FEATURE_ORDER.index(name)
+            if global_idx not in self.cont_indices:
+                continue
+            d_min = float(vmin)
+            d_max = float(vmax)
+            scale = d_max - d_min
+            if abs(scale) < 1e-8:
+                scale = 1.0
+            self.cont_offset[global_idx] = d_min
+            self.cont_scale[global_idx] = 1.0 / scale
 
-        # 构建离散特征编码表
+        # MaxAbs: proc._maxabs_params -> {feature_name: abs_max}
+        for name, abs_max in proc._maxabs_params.items():
+            if name not in FEATURE_ORDER:
+                continue
+            global_idx = FEATURE_ORDER.index(name)
+            if global_idx not in self.cont_indices:
+                continue
+            m_abs = float(abs_max)
+            if abs(m_abs) < 1e-8:
+                m_abs = 1.0
+            self.cont_offset[global_idx] = 0.0
+            self.cont_scale[global_idx] = 1.0 / m_abs
+
+        # 离散特征映射: proc._discrete_mappings -> name -> {value: index}
         self.discrete_maps = {}
-        if hasattr(proc, 'discrete_indices'):
-            for i, global_idx in enumerate(proc.discrete_indices):
-                if global_idx in self.disc_indices:
-                    encoder = proc.encoders_discrete[i]
-                    # 建立 {物理值: 编码值} 的映射
-                    mapping = {val: idx for idx, val in enumerate(encoder.classes_)}
-                    self.discrete_maps[global_idx] = mapping
+        for name, mapping in proc._discrete_mappings.items():
+            if name not in FEATURE_ORDER:
+                continue
+            global_idx = FEATURE_ORDER.index(name)
+            if global_idx in self.disc_indices:
+                self.discrete_maps[global_idx] = mapping
 
     def _build_optimization_bounds(self):
         """

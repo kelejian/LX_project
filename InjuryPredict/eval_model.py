@@ -21,11 +21,11 @@ from imblearn.metrics import geometric_mean_score, classification_report_imbalan
 from sklearn.metrics import confusion_matrix, r2_score, accuracy_score
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 
-from utils import models
-from utils.dataset_prepare import CrashDataset
-from utils.AIS_cal import AIS_cal_head, AIS_cal_chest, AIS_cal_neck 
+from InjuryPredict.utils import models
 
-from utils.set_random_seed import set_random_seed
+from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
+from common.utils.seeding import set_random_seed
+from common.settings import INJURY_PROCESSED_DIR
 
 def test(model, loader):
     """
@@ -207,9 +207,11 @@ if __name__ == "__main__":
     
     model_params = training_record["hyperparameters"]["model"]
     
-    train_dataset = torch.load("./data/train_dataset.pt", weights_only=False) # 仅用于获取 num_classes_of_discrete
-    test_dataset1 = torch.load("./data/val_dataset.pt", weights_only=False)
-    test_dataset2 = torch.load("./data/test_dataset.pt", weights_only=False)
+    train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
+    val_pt = INJURY_PROCESSED_DIR / "val_dataset.pt"
+    train_dataset = torch.load(train_pt.as_posix(), weights_only=False)  # 仅用于获取 num_classes_of_discrete
+    test_dataset1 = torch.load(val_pt.as_posix(), weights_only=False)
+    test_dataset2 = torch.load((INJURY_PROCESSED_DIR / "test_dataset.pt").as_posix(), weights_only=False)
     test_dataset = ConcatDataset([test_dataset1, test_dataset2])
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=0)
 

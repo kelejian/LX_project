@@ -411,6 +411,7 @@ def main():
     parser.add_argument("--pulse-dir", type=str, 
                         default=r'G:\VCS_acc_data\acc_data_before1111_6134', 
                         help="波形CSV目录（包含x*.csv/y*.csv/z*.csv）")
+    #--------------------------------------------------------------------------------------
     parser.add_argument("--out-raw", type=str, 
                         default=str(RAW_DATA_DIR / "raw_data_packed.npz"), 
                         help="输出raw_packed npz路径")

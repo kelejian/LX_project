@@ -599,12 +599,14 @@ def _get_output_names(outputs):
 if __name__ == "__main__":
     import os
     import numpy as np
-    from utils.dataset_prepare import CrashDataset
+
     from utils.models import InjuryPredictModel
     from utils.weighted_loss import weighted_loss
     from config import model_params, loss_params
     
-    train_dataset = torch.load(os.path.join("data", "train_dataset.pt"))
+    from common.settings import INJURY_PROCESSED_DIR
+    train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
+    train_dataset = torch.load(train_pt.as_posix()) 
 
     # --- 从 config 加载超参数 ---
     Ksize_init = model_params['Ksize_init']

@@ -7,22 +7,19 @@ import os, json
 import time
 from datetime import datetime
 import torch
-import random
 import numpy as np
-from torch import nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 import torch.optim as optim
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error, accuracy_score, r2_score
 
-from utils import models
-from utils.weighted_loss import weighted_loss
-from utils.dataset_prepare import CrashDataset
-from utils.AIS_cal import AIS_cal_head, AIS_cal_chest, AIS_cal_neck 
-from utils.set_random_seed import set_random_seed, GLOBAL_SEED
-from utils.optimizer_utils import get_parameter_groups
+from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
+from common.utils.seeding import set_random_seed, GLOBAL_SEED
+from common.settings import INJURY_PROCESSED_DIR
 
-# --- 从 config.py 导入超参数 ---
-from config import training_params, loss_params, model_params
+from InjuryPredict.utils import models
+from InjuryPredict.utils.weighted_loss import weighted_loss
+from InjuryPredict.utils.optimizer_utils import get_parameter_groups
+from InjuryPredict.config import RUNS_DIR, training_params, loss_params, model_params
 
 # --- 合并 train 和 valid 为一个函数 ---
 def run_one_epoch(model, loader, criterion, device, optimizer=None):
@@ -138,7 +135,7 @@ if __name__ == "__main__":
 
     # 创建独立文件夹保存本次运行结果
     current_time = datetime.now().strftime("%m%d%H%M")
-    run_dir = os.path.join("./runs", f"InjuryPredictModel_{current_time}")
+    run_dir = os.path.join(RUNS_DIR, f"InjuryPredictModel_{current_time}")
     os.makedirs(run_dir, exist_ok=True)
 
     # 初始化 TensorBoard
@@ -182,10 +179,17 @@ if __name__ == "__main__":
     if Patience > Epochs: Patience = Epochs
 
     # 加载数据集对象
-    train_dataset = torch.load("./data/train_dataset.pt", weights_only=False)
-    val_dataset = torch.load("./data/val_dataset.pt", weights_only=False)
+
+    train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
+    val_pt = INJURY_PROCESSED_DIR / "val_dataset.pt"
+    if not (train_pt.exists() and val_pt.exists()):
+        raise FileNotFoundError(
+            f"找不到训练数据 ({INJURY_PROCESSED_DIR}/*.pt)。请先运行: python -m InjuryPredict.Injurydata_prepare"
+        )
+    train_dataset = torch.load(train_pt.as_posix(), weights_only=False)
+    val_dataset = torch.load(val_pt.as_posix(), weights_only=False)
     train_loader = DataLoader(train_dataset, batch_size=Batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=Batch_size, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=Batch_size, shuffle=False, num_workers=0) 
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 

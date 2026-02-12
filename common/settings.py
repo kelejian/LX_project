@@ -50,6 +50,10 @@ SPLIT_INDICES_DIR = DATA_DIR / "split_indices"
 # 配置文件（全局共用）
 NORMALIZATION_CONFIG_PATH = DATA_DIR / "normalization_config.json"
 
+# 处理后数据（processed）目录 — 供子项目共享
+PROCESSED_DATA_DIR = DATA_DIR / "processed"
+INJURY_PROCESSED_DIR = PROCESSED_DATA_DIR / "injury" # 专门为 InjuryPredict 处理后数据.pt 文件设置的子目录
+
 # 子项目目录
 PULSE_PREDICT_DIR = ROOT_DIR / "PulsePredict"
 INJURY_PREDICT_DIR = ROOT_DIR / "InjuryPredict"
@@ -62,6 +66,8 @@ def get_paths():
         "data": DATA_DIR,
         "raw_packed": RAW_DATA_DIR,
         "split_indices": SPLIT_INDICES_DIR,
+        "processed": PROCESSED_DATA_DIR,
+        "injury_processed": INJURY_PROCESSED_DIR,
         "normalization_config": NORMALIZATION_CONFIG_PATH,
         "pulse_predict": PULSE_PREDICT_DIR,
         "injury_predict": INJURY_PREDICT_DIR,
@@ -70,7 +76,7 @@ def get_paths():
 
 def ensure_dirs(paths=None):
     """显式创建关键目录，避免 import 时产生副作用。"""
-    required_dirs = [DATA_DIR, RAW_DATA_DIR, SPLIT_INDICES_DIR]
+    required_dirs = [DATA_DIR, RAW_DATA_DIR, SPLIT_INDICES_DIR, PROCESSED_DATA_DIR]
     if paths:
         required_dirs = list({Path(p) for p in required_dirs + list(paths)})
     for d in required_dirs:

@@ -12,12 +12,15 @@ from sklearn.metrics import accuracy_score
 from optuna.storages import RDBStorage
 import joblib
 
-from utils import models
-from utils.dataset_prepare import CrashDataset
-from utils.AIS_cal import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
-from utils.weighted_loss import weighted_loss
-from utils.set_random_seed import set_random_seed
-from utils.optimizer_utils import get_parameter_groups
+from common.utils.seeding import set_random_seed
+from common.settings import INJURY_PROCESSED_DIR
+from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
+
+from InjuryPredict.utils import models
+from InjuryPredict.utils.weighted_loss import weighted_loss
+from InjuryPredict.utils.optimizer_utils import get_parameter_groups
+from InjuryPredict.config import RUNS_DIR
+
 
 # 沿用 train.py 中标准化的单轮训练/验证函数
 def run_one_epoch(model, loader, criterion, device, optimizer=None):
@@ -135,8 +138,12 @@ def objective(trial):
 
     
     # 加载数据集
-    train_dataset = torch.load("./data/train_dataset.pt", weights_only=False)
-    val_dataset = torch.load("./data/val_dataset.pt", weights_only=False)
+    train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
+    val_pt = INJURY_PROCESSED_DIR / "val_dataset.pt"
+    if not (train_pt.exists() and val_pt.exists()):
+        raise FileNotFoundError(f"请先运行: python -m InjuryPredict.Injurydata_prepare 以生成 {INJURY_PROCESSED_DIR.as_posix()}/train_dataset.pt")
+    train_dataset = torch.load(train_pt.as_posix(), weights_only=False)
+    val_dataset = torch.load(val_pt.as_posix(), weights_only=False)
     train_loader = DataLoader(train_dataset, batch_size=Batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=Batch_size, shuffle=False, num_workers=0)
 
@@ -187,9 +194,10 @@ def objective(trial):
 
 if __name__ == "__main__":
     set_random_seed()
-    study_file = "./runs/optuna_study_multiobj_acc.pkl"
+    study_file = os.path.join(RUNS_DIR, "optuna_study_multiobj_acc.pkl")
+    study_file = os.path.join(RUNS_DIR, "optuna_study_multiobj_acc.pkl")
     study_name = "multiobj_acc_optimization"
-    db_path = "sqlite:///./runs/optuna_study.db"
+    db_path = f"sqlite:///{os.path.join(RUNS_DIR, 'optuna_study.db')}"
     storage = RDBStorage(db_path)
 
     try:
@@ -206,7 +214,7 @@ if __name__ == "__main__":
             directions=["maximize", "maximize", "maximize", "maximize"] # 对应 MAIS, Head, Chest, Neck 准确率
         )
 
-    print(f'请在命令行运行optuna-dashboard sqlite:///runs/optuna_study.db 来监控优化过程。')
+    print(f'请在命令行运行optuna-dashboard sqlite:///{os.path.join(RUNS_DIR, "optuna_study.db")} 来监控优化过程。')
 
     # 定义回调函数，定期保存研究结果
     def save_study_callback(study, trial):

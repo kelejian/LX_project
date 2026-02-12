@@ -3,6 +3,8 @@
 集中管理模型训练、损失函数和网络结构的可调超参数。
 """
 
+RUNS_DIR = "./InjuryPredict/runs"  # 模型训练结果的保存目录
+
 # 1. 优化与训练相关
 training_params = {
     "Epochs": 360,

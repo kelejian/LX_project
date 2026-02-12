@@ -20,7 +20,7 @@ paths:
   # 数据集路径
   data_input: "../LX_model_injurypredict/data/data_input.npz"
   data_labels: "../LX_model_injurypredict/data/data_labels.npz"
-  preprocessors_path: "../LX_model_injurypredict/data/preprocessors.joblib"
+  preprocessors_path: "../../data/normalization_config.json"  # now uses common normalization_config.json (UnifiedDataProcessor)
   
   # 本项目输出
   output_dir: "./outputs"

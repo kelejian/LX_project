@@ -15,7 +15,7 @@ import time
 from datetime import datetime
 import torch
 import numpy as np
-from torch.utils.data import DataLoader, Subset, ConcatDataset # 引入 Subset 和 ConcatDataset
+from torch.utils.data import DataLoader, Subset, ConcatDataset
 import torch.optim as optim
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error, accuracy_score, confusion_matrix, r2_score
@@ -24,15 +24,15 @@ from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from imblearn.metrics import geometric_mean_score, classification_report_imbalanced
-# --- 从 utils 导入必要的模块 ---
-from utils import models
-from utils.weighted_loss import weighted_loss
-from utils.dataset_prepare import CrashDataset # 需要导入以加载 .pt 文件
-from utils.AIS_cal import AIS_cal_head, AIS_cal_chest, AIS_cal_neck 
-from utils.set_random_seed import GLOBAL_SEED, set_random_seed # 导入 GLOBAL_SEED
-from utils.optimizer_utils import get_parameter_groups
 
-from config import training_params, loss_params, model_params, kfold_params
+from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
+from common.utils.seeding import GLOBAL_SEED, set_random_seed
+from common.settings import INJURY_PROCESSED_DIR
+
+from InjuryPredict.utils import models
+from InjuryPredict.utils.weighted_loss import weighted_loss
+from InjuryPredict.utils.optimizer_utils import get_parameter_groups
+from InjuryPredict.config import RUNS_DIR, training_params, loss_params, model_params, kfold_params
 
 def get_compare_func(func_indicator):
     """根据配置中的指示器返回比较函数和初始值"""
@@ -411,23 +411,26 @@ if __name__ == "__main__":
     
     # --- 2. 创建本次 K-Fold 运行的主目录 ---
     current_time = datetime.now().strftime("%m%d%H%M")
-    main_run_dir = os.path.join("./runs", f"InjuryPredictModel_KFold_{current_time}")
+    main_run_dir = os.path.join(RUNS_DIR, f"InjuryPredictModel_KFold_{current_time}")
     os.makedirs(main_run_dir, exist_ok=True)
     print(f"K-Fold 主运行目录: {main_run_dir}")
 
     # --- 3. 加载由 dataset_prepare.py 生成的数据 ---
     print("正在加载 pt dataset ...")
     try:
-        train_subset_orig = torch.load("./data/train_dataset.pt", weights_only=False)
-        val_subset_orig = torch.load("./data/val_dataset.pt", weights_only=False)
-        test_subset_orig = torch.load("./data/test_dataset.pt",weights_only=False)
+        train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
+        val_pt = INJURY_PROCESSED_DIR / "val_dataset.pt"
+        test_pt = INJURY_PROCESSED_DIR / "test_dataset.pt"
+        train_subset_orig = torch.load(train_pt.as_posix(), weights_only=False)
+        val_subset_orig = torch.load(val_pt.as_posix(), weights_only=False)
+        test_subset_orig = torch.load(test_pt.as_posix(), weights_only=False)
     except FileNotFoundError as e:
         print(f"错误: {e}")
-        print("请确保 './data/' 目录下存在 train_dataset.pt 和 val_dataset.pt 文件。")
-        print("您需要先运行 utils/dataset_prepare.py 来生成这些文件。")
+        print(f"请确保 {INJURY_PROCESSED_DIR} 下存在 train_dataset.pt、val_dataset.pt 和 test_dataset.pt。")
+        print(f"请使用：python -m InjuryPredict.Injurydata_prepare 来生成这些文件。")
         exit()
         
-    # 获取底层的 CrashDataset 实例 (假设两个 Subset 指向同一个实例)
+    # 各个Subset共享底层的 InjuryPackedDataset 实例
     full_processed_dataset = train_subset_orig.dataset
     
     # 合并训练集和验证集的【索引】用于 K-Fold 划分

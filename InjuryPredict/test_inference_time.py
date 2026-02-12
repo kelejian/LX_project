@@ -8,10 +8,10 @@ import torch
 import time
 import numpy as np
 from torch.utils.data import DataLoader, ConcatDataset
-from utils import models
-from utils.dataset_prepare import CrashDataset
 
-from utils.set_random_seed import set_random_seed
+from common.utils.seeding import set_random_seed
+from InjuryPredict.utils import models
+from common.settings import INJURY_PROCESSED_DIR
 
 def test_inference_time(model, loader):
     """
@@ -73,10 +73,9 @@ if __name__ == "__main__":
     # --- 从JSON结构中提取模型超参数 ---
     model_params = training_record["hyperparameters"]["model"]
     
-    # 加载数据集
-    dataset = CrashDataset()
-    test_dataset1 = torch.load("./data/val_dataset.pt", weights_only=False)
-    test_dataset2 = torch.load("./data/test_dataset.pt", weights_only=False)
+    # 加载数据集（从 processed .pt）
+    test_dataset1 = torch.load((INJURY_PROCESSED_DIR / "val_dataset.pt").as_posix(), weights_only=False)
+    test_dataset2 = torch.load((INJURY_PROCESSED_DIR / "test_dataset.pt").as_posix(), weights_only=False)
     test_dataset = ConcatDataset([test_dataset1, test_dataset2])
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, num_workers=0)
 
