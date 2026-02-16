@@ -468,7 +468,7 @@ def generate_splits(
 def main():
     parser = argparse.ArgumentParser(description="准备数据：raw_packed打包 + injury/pulse两套索引划分")
     parser.add_argument("--distribution", type=str, 
-                        default=r'E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0123.csv',  
+                        default=r'E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0206.csv',  
                         help="distribution .csv/.npz 路径")
     parser.add_argument("--pulse-dir", type=str, 
                         default=r'G:\VCS_acc_data\acc_data_before1111_6134', 
