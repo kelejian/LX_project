@@ -246,68 +246,6 @@ def package_raw_packed(
     output_npz.parent.mkdir(parents=True, exist_ok=True)
     print(f"✅️ 标签计算完成并打包")
 
-    # 检查并填充将要保存的数组中的 NaN/空值（按类型填充：float->0.0, int/uint->0, bool->False），并打印警告（不生成额外文件）
-    to_check = [
-        ("case_ids", case_ids),
-        ("x_att_raw", x_att_raw),
-        ("x_acc_xyz", x_acc_xyz),
-        ("x_acc_xy", x_acc_xy),
-        ("is_pulse_ok", is_pulse_ok),
-        ("is_injury_ok", is_injury_ok),
-        ("y_HIC", y_hic),
-        ("y_Dmax", y_dmax),
-        ("y_Nij", y_nij),
-        ("ais_head", ais_head),
-        ("ais_chest", ais_chest),
-        ("ais_neck", ais_neck),
-        ("mais", mais),
-    ]
-    for name, arr in to_check:
-        mask = pd.isnull(arr)
-        if not np.any(mask):
-            continue
-        n_missing = int(np.sum(mask))
-        kind = getattr(arr, "dtype", np.array(arr).dtype).kind
-        if kind == "b":
-            fill = False
-        elif kind == "f":
-            fill = 0.0
-        else:
-            fill = 0
-        try:
-            arr[mask] = fill
-        except Exception:
-            # 若无法原地填充，则用拷贝替换变量名（保证后续保存使用已填充版本）
-            tmp = arr.copy()
-            tmp[mask] = fill
-            if name == "case_ids":
-                case_ids = tmp
-            elif name == "x_att_raw":
-                x_att_raw = tmp
-            elif name == "x_acc_xyz":
-                x_acc_xyz = tmp
-            elif name == "x_acc_xy":
-                x_acc_xy = tmp
-            elif name == "is_pulse_ok":
-                is_pulse_ok = tmp
-            elif name == "is_injury_ok":
-                is_injury_ok = tmp
-            elif name == "y_HIC":
-                y_hic = tmp
-            elif name == "y_Dmax":
-                y_dmax = tmp
-            elif name == "y_Nij":
-                y_nij = tmp
-            elif name == "ais_head":
-                ais_head = tmp
-            elif name == "ais_chest":
-                ais_chest = tmp
-            elif name == "ais_neck":
-                ais_neck = tmp
-            elif name == "mais":
-                mais = tmp
-        print(f"[prepare_data] ⚠️ 发现并填充空值: {name} — {n_missing} 个，已填充值={fill}")
-
     # 包含成功读取波形的 case_ids 以及对应的参数/标签等数据只包含成功读取波形的样本（如果 strict=False 则会过滤掉那些缺失波形的 case）
     np.savez(
         output_npz,

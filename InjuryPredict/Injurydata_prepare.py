@@ -45,7 +45,7 @@ class InjuryPackedDataset(Dataset):
     def __init__(self, raw_npz: Path, processor: Optional[UnifiedDataProcessor] = None):
         data = np.load(raw_npz)
         # 原始字段（来自 prepare_data 的命名约定）
-        self.case_ids = data["case_ids"].astype(np.int64)
+        self.case_ids = data["case_ids"].astype(np.int32)
         # x_att_raw: shape (N, len(FEATURE_ORDER))
         self.x_att_raw = data["x_att_raw"].astype(np.float32)
         # 波形：优先使用 x_acc_xy / x_acc_xyz 的可用项
@@ -57,11 +57,11 @@ class InjuryPackedDataset(Dataset):
         self.y_HIC = data.get("y_HIC", np.full((len(self.case_ids),), np.nan)).astype(np.float32)
         self.y_Dmax = data.get("y_Dmax", np.full((len(self.case_ids),), np.nan)).astype(np.float32)
         self.y_Nij = data.get("y_Nij", np.full((len(self.case_ids),), np.nan)).astype(np.float32)
-        self.ais_head = data.get("ais_head", np.full((len(self.case_ids),), -1)).astype(np.int64)
-        self.ais_chest = data.get("ais_chest", np.full((len(self.case_ids),), -1)).astype(np.int64)
-        self.ais_neck = data.get("ais_neck", np.full((len(self.case_ids),), -1)).astype(np.int64)
-        self.mais = data.get("mais", np.full((len(self.case_ids),), -1)).astype(np.int64)
-        self.OT_raw = self.x_att_raw[:, -1].astype(np.int64)  # OT 在 FEATURE_ORDER 的末尾
+        self.ais_head = data.get("ais_head", np.full((len(self.case_ids),), -1)).astype(np.int32)
+        self.ais_chest = data.get("ais_chest", np.full((len(self.case_ids),), -1)).astype(np.int32)
+        self.ais_neck = data.get("ais_neck", np.full((len(self.case_ids),), -1)).astype(np.int32)
+        self.mais = data.get("mais", np.full((len(self.case_ids),), -1)).astype(np.int32)
+        self.OT_raw = self.x_att_raw[:, -1].astype(np.int32)  # OT 在 FEATURE_ORDER 的末尾
 
         # processed fields (在 prepare 阶段填充)
         self.x_acc = None
@@ -158,14 +158,14 @@ def build_and_save_splits(
         raise ValueError(f"处理后的波形维度异常: got {getattr(x_acc_processed, 'shape', None)}, expected (N, C, T) with N={len(dataset)}")
     if x_cont.shape[0] != len(dataset) or x_disc.shape[0] != len(dataset):
         raise ValueError("处理后的标量特征维度与样本数不匹配")
-    if np.isnan(x_acc_processed).any() or np.isnan(x_cont).any():
-        raise ValueError("处理后数据包含 NaN —— 请检查原始数据与 normalization_config.json 的一致性。")
-
     # 填回 dataset
     dataset.x_acc = x_acc_processed.astype(np.float32)
     dataset.x_att_continuous = x_cont.astype(np.float32)
-    dataset.x_att_discrete = x_disc.astype(np.int64)
-    dataset.num_classes_of_discrete = processor.get_discrete_num_classes()
+    dataset.x_att_discrete = x_disc.astype(np.int32)
+    # 将离散特征类别数从 dict 转为按 processor 内部离散特征顺序的 list，
+    # 以便后续构建 nn.Embedding 时能按位置索引使用（如: 期望形式: [is_driver_side_num, OT_num]）
+    discrete_map = processor.get_discrete_num_classes()
+    dataset.num_classes_of_discrete = [int(discrete_map[name]) for name in processor.discrete_feature_names]
 
     # 6) 基于索引构造 Subset 并保存为 .pt
     train_subset = Subset(dataset, train_idx.tolist())
@@ -204,19 +204,33 @@ def _compute_and_save_statistics(dataset: InjuryPackedDataset, train_idx, val_id
     """打印并保存若干常用统计与散点图（velocity vs HIC/Dmax/Nij，AIS 分布）。"""
     os.makedirs(figs_dir, exist_ok=True)
 
-    # 从原始未归一化的数据中读取用于工程统计的原始量
-    raw_params = dataset.x_att_raw  # [N, D]
+    # 从原始未归一化的数据中读取用于工程统计的原始量（仅使用 train/val/test 并集，排除无效 case）
+    raw_params_all = dataset.x_att_raw  # [N, D]
+    # 使用 train/val/test 的并集作为有效样本集合
+    union_idx = np.unique(np.concatenate([np.asarray(train_idx), np.asarray(val_idx), np.asarray(test_idx)]))
+    raw_params = raw_params_all[union_idx]
     vel = raw_params[:, 0]
 
-    hic = dataset.y_HIC
-    dmax = dataset.y_Dmax
-    nij = dataset.y_Nij
-    ot = dataset.OT_raw
+    # 只取并集对应的标签/波形/OT
+    hic_all = dataset.y_HIC
+    dmax_all = dataset.y_Dmax
+    nij_all = dataset.y_Nij
+    ot_all = dataset.OT_raw
 
-    # 确保 AIS 已计算（优先使用已有，否则用函数计算）
-    ais_head = dataset.ais_head
-    ais_chest = dataset.ais_chest
-    ais_neck = dataset.ais_neck
+    hic = hic_all[union_idx]
+    dmax = dmax_all[union_idx]
+    nij = nij_all[union_idx]
+    ot = ot_all[union_idx]
+
+    # AIS（优先使用打包时已有值，否则基于子集重新计算）
+    ais_head_all = dataset.ais_head
+    ais_chest_all = dataset.ais_chest
+    ais_neck_all = dataset.ais_neck
+
+    ais_head = ais_head_all[union_idx]
+    ais_chest = ais_chest_all[union_idx]
+    ais_neck = ais_neck_all[union_idx]
+
     if ais_head.min() < 0:
         ais_head = AIS_cal_head(hic)
     if ais_chest.min() < 0:
@@ -225,53 +239,76 @@ def _compute_and_save_statistics(dataset: InjuryPackedDataset, train_idx, val_id
         ais_neck = AIS_cal_neck(nij)
     mais = np.maximum.reduce([ais_head, ais_chest, ais_neck])
 
-    def _save_bar(counts, name):
-        fig, ax = plt.subplots(figsize=(6, 4))
-        keys = sorted(list(counts.keys()))
-        vals = [counts[k] for k in keys]
-        ax.bar([str(k) for k in keys], vals, color="C0", alpha=0.8)
-        ax.set_title(name)
-        ax.set_xlabel("AIS")
-        ax.set_ylabel("count")
-        p = figs_dir / f"{name.replace(' ', '_')}.png"
-        fig.savefig(p, dpi=200, bbox_inches="tight")
-        plt.close(fig)
-        return p
-
-    # AIS distributions (overall + by OT for chest)
+    # 将 AIS 等级计数写入 summary
     unique, counts = np.unique(ais_head, return_counts=True)
     head_counts = dict(zip(unique.tolist(), counts.tolist()))
-    _save_bar(head_counts, "AIS_head_distribution")
-
+    unique, counts = np.unique(ais_chest, return_counts=True)
+    chest_counts = dict(zip(unique.tolist(), counts.tolist()))
+    unique, counts = np.unique(ais_neck, return_counts=True)
+    neck_counts = dict(zip(unique.tolist(), counts.tolist()))
     unique, counts = np.unique(mais, return_counts=True)
     mais_counts = dict(zip(unique.tolist(), counts.tolist()))
-    _save_bar(mais_counts, "MAIS_distribution")
 
-    # velocity vs HIC/Dmax/Nij scatter (colored by MAIS)
-    def _scatter(x, y, color_lbl, fname, xlabel, ylabel):
+    # velocity vs HIC / Nij （使用 train/val/test 并集）
+    def _scatter(x, y, color_lbl, fname, xlabel, ylabel, legend_label: str = "MAIS"):
+        """散点图：当 color_lbl 为整数 AIS 值（例如 AIS0..AIS5）时使用离散配色并绘制图例，
+        否则退回连续 colormap。`legend_label` 用于图例/颜色条标签。
+        """
         fig, ax = plt.subplots(figsize=(8, 6))
-        sc = ax.scatter(x, y, c=color_lbl, cmap="viridis", alpha=0.7, s=40)
+        # 尝试将 color_lbl 转为 numpy 数组并判定是否为整数标签序列
+        try:
+            vals = np.asarray(color_lbl)
+            is_integer_labels = np.issubdtype(vals.dtype, np.integer)
+            unique_vals = np.unique(vals)
+        except Exception:
+            is_integer_labels = False
+            unique_vals = []
+
+        if is_integer_labels and np.all((unique_vals >= 0) & (unique_vals <= 5)):
+            # 离散颜色表（AIS0..AIS5）
+            ais_colors = ['#1f77b4', '#2ca02c', '#fff7a3', '#ff7f0e', '#d62728', '#8c564b']
+            mapped = [ais_colors[int(v)] if (0 <= int(v) <= 5) else '#777777' for v in vals]
+            sc = ax.scatter(x, y, c=mapped, alpha=0.85, s=40, edgecolor='k', linewidth=0.2)
+            # 添加图例（AIS 标签）
+            from matplotlib.patches import Patch
+            legend_elems = [Patch(facecolor=ais_colors[i], edgecolor='k', label=f'AIS{i}') for i in range(6)]
+            ax.legend(handles=legend_elems, title=legend_label, bbox_to_anchor=(1.02, 1), loc='upper left')
+        else:
+            sc = ax.scatter(x, y, c=color_lbl, cmap='viridis', alpha=0.7, s=40)
+            cbar = fig.colorbar(sc, ax=ax)
+            cbar.set_label(legend_label)
+
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
-        ax.grid(True, linestyle="--", alpha=0.3)
-        cbar = fig.colorbar(sc, ax=ax)
-        cbar.set_label("MAIS")
+        ax.grid(True, linestyle='--', alpha=0.3)
         p = figs_dir / fname
-        fig.savefig(p, dpi=200, bbox_inches="tight")
+        fig.savefig(p, dpi=200, bbox_inches='tight')
         plt.close(fig)
         return p
 
-    _scatter(vel, hic, mais, "vel_vs_HIC.png", "impact_velocity (km/h)", "HIC15")
-    _scatter(vel, dmax, mais, "vel_vs_Dmax.png", "impact_velocity (km/h)", "Dmax (mm)")
-    _scatter(vel, nij, mais, "vel_vs_Nij.png", "impact_velocity (km/h)", "Nij")
+    # 按部位 AIS 着色：HIC -> 头部 AIS；Nij -> 颈部 AIS；Dmax -> 胸部 AIS
+    _scatter(vel, hic, ais_head, "vel_vs_HIC.png", "impact_velocity (km/h)", "HIC15", legend_label="AIS (head)")
+    _scatter(vel, nij, ais_neck, "vel_vs_Nij.png", "impact_velocity (km/h)", "Nij", legend_label="AIS (neck)")
+
+    # velocity vs Dmax: overall + 按 OT 值分别绘图（仅并集样本），按胸部 AIS 着色
+    _scatter(vel, dmax, ais_chest, "vel_vs_Dmax_all.png", "impact_velocity (km/h)", "Dmax (mm)", legend_label="AIS (chest)")
+    ot_values = np.unique(ot)
+    for ot_val in ot_values:
+        mask = (ot == ot_val)
+        if np.sum(mask) == 0:
+            continue
+        fname = f"vel_vs_Dmax_OT_{int(ot_val)}.png"
+        _scatter(vel[mask], dmax[mask], ais_chest[mask], fname, "impact_velocity (km/h)", f"Dmax (mm) — OT={int(ot_val)}", legend_label=f"AIS (chest) OT={int(ot_val)}")
 
     summary = {
-        "n_total": int(len(dataset)),
+        "n_total": int(len(union_idx)),
         "train_count": int(len(train_idx)),
         "val_count": int(len(val_idx)),
         "test_count": int(len(test_idx)),
         "mais_counts": convert_numpy_for_json(mais_counts),
-        "head_counts": convert_numpy_for_json(head_counts),
+        "ais_head_counts": convert_numpy_for_json(head_counts),
+        "ais_chest_counts": convert_numpy_for_json(chest_counts),
+        "ais_neck_counts": convert_numpy_for_json(neck_counts),
     }
     return summary
 
@@ -283,7 +320,7 @@ def convert_numpy_for_json(obj):
 
 
 # --------------------- CLI ---------------------
-def cli_main(argv=None):
+def main(argv=None):
     p = argparse.ArgumentParser(description="生成 InjuryPredict 所需的 .pt 数据集并输出统计图（使用 common.UnifiedDataProcessor）。\n注意：此脚本严格依赖由根目录的 prepare_data.py 预先生成的 raw_packed、split_indices 与 normalization_config.json；若缺失将直接报错。")
     p.add_argument("--raw-npz", default=(RAW_DATA_DIR / "raw_data_packed.npz"), type=Path,
                    help="由 prepare_data.py 生成的原始打包文件（默认来自 common settings）")
@@ -305,4 +342,4 @@ def cli_main(argv=None):
 
 
 if __name__ == '__main__':
-    cli_main()
+    main()

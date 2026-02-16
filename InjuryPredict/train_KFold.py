@@ -30,6 +30,7 @@ from common.utils.seeding import GLOBAL_SEED, set_random_seed
 from common.settings import INJURY_PROCESSED_DIR
 
 from InjuryPredict.utils import models
+from InjuryPredict.Injurydata_prepare import InjuryPackedDataset
 from InjuryPredict.utils.weighted_loss import weighted_loss
 from InjuryPredict.utils.optimizer_utils import get_parameter_groups
 from InjuryPredict.config import RUNS_DIR, training_params, loss_params, model_params, kfold_params

@@ -2,7 +2,6 @@
 
 import torch
 import torch.nn as nn
-# from torch_geometric.nn import MLP as PygMLP # 直接用PyG的MLP模块
 
 class FeatureSELayer(nn.Module):
     """ 
@@ -328,6 +327,7 @@ class TemporalConvNet(nn.Module):
         x = self.fc(x)  # (B, C_out) -> (B, hidden)
         
         return x
+
 class DiscreteFeatureEmbedding(nn.Module):
     """
     对离散特征进行嵌入处理, 用于损伤预测模型的encoder
@@ -342,17 +342,20 @@ class DiscreteFeatureEmbedding(nn.Module):
         super(DiscreteFeatureEmbedding, self).__init__()
         
         # --- 定义每个特征的 Embedding 维度 ---
-        # 1. OT(3类)->8维: 赋予足够容量以解耦隐含的物理属性(质量/身高/刚度等), 并保证在MLP输入端的信号强度。
-        # 2. is_driver_side(2类)->4维: 提升全局状态变量的表达能力, 且4/8均为2的幂次, 符合GPU内存对齐效率。
-        target_dims = [4, 8]
+        # is_driver_side(2类)->4维: 提升全局状态变量的表达能力, 且4/8均为2的幂次, 符合GPU内存对齐效率。
+        # OT(3类)->8维: 赋予足够容量以解耦隐含的物理属性(质量/身高/刚度等), 并保证在MLP输入端的信号强度。
         
+        # 检查num_classes_of_discrete中的元素是否均为正整数
+        if not all(isinstance(n, int) and n > 0 for n in num_classes_of_discrete):
+            raise ValueError("num_classes_of_discrete 中的每个元素都必须是正整数")
+
         # 为每个离散特征创建嵌入层
         self.embedding_layers = nn.ModuleList()
         self.output_dim = 0 # 记录总输出维度供外部使用
         
         for i, num_classes in enumerate(num_classes_of_discrete):
-            # 优先使用预设维度，若越界则回退到 num_classes - 1 (最低为1)
-            dim = target_dims[i] if i < len(target_dims) else max(1, num_classes - 1)
+            # dim 优先使用2的幂次; 也可以用 num_classes - 1 (最低为1)
+            dim = 2 ** num_classes # 即 embedding_dim = 2^num_classes, 例如 2类->4维, 3类->8维
             
             self.embedding_layers.append(nn.Embedding(num_classes, dim))
             self.output_dim += dim
@@ -362,21 +365,21 @@ class DiscreteFeatureEmbedding(nn.Module):
         对离散特征进行嵌入并拼接。
 
         参数:
-            x_att_discrete (torch.Tensor): 离散特征张量,形状为 (B, num_discrete_features),B 是 batch size。
+            x_att_discrete (torch.Tensor): 离散特征张量,形状为 (B, num_discrete_features), 其中 num_discrete_features = len(num_classes_of_discrete)。
         
         返回:
-            torch.Tensor: 嵌入后的特征向量,形状为 (B, sum(num_classes_of_discrete) - len(num_classes_of_discrete))。
+            torch.Tensor: 嵌入后的特征向量,形状为 (B, sum(embedding_dims))，其中 embedding_dims 是每个离散特征的嵌入维度列表。
         """
         embedded_features = []
         
         # 对每个离散特征进行嵌入
         for i, embedding_layer in enumerate(self.embedding_layers):
-            # 提取第 i 个离散特征 (B, ) -> (B, num_classes - 1)
+            # 提取第 i 个离散特征 (B, )
             feature = x_att_discrete[:, i]
-            embedded_feature = embedding_layer(feature)
+            embedded_feature = embedding_layer(feature) # (B, embedding_dim_i)
             embedded_features.append(embedded_feature)
         
-        # 拼接所有嵌入后的特征 (B, sum(num_classes_of_discrete) - len(num_classes_of_discrete))
+        # 拼接所有嵌入后的特征 (B, sum(embedding_dims))
         output = torch.cat(embedded_features, dim=1)
         return output
 

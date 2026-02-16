@@ -10,6 +10,7 @@ import numpy as np
 from torch.utils.data import DataLoader, ConcatDataset
 
 from common.utils.seeding import set_random_seed
+from InjuryPredict.Injurydata_prepare import InjuryPackedDataset
 from InjuryPredict.utils import models
 from common.settings import INJURY_PROCESSED_DIR
 

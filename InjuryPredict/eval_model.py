@@ -21,6 +21,7 @@ from imblearn.metrics import geometric_mean_score, classification_report_imbalan
 from sklearn.metrics import confusion_matrix, r2_score, accuracy_score
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 
+from InjuryPredict.Injurydata_prepare import InjuryPackedDataset
 from InjuryPredict.utils import models
 
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
@@ -181,7 +182,7 @@ if __name__ == "__main__":
     from dataclasses import dataclass
     @dataclass
     class args:
-        run_dir: str = r'E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_model_injurypredict\runs\InjuryPredictModel_01281059'
+        run_dir: str = r".\InjuryPredict\runs\InjuryPredictModel_02151111"
         weight_file: str = 'best_val_loss.pth'
 
     # --- 1. 加载模型和数据 ---
@@ -237,9 +238,13 @@ if __name__ == "__main__":
     AIS_head = AIS_cal_head(pred_hic)
     AIS_chest = AIS_cal_chest(pred_dmax, ot)
     AIS_neck = AIS_cal_neck(pred_nij)
+    print(f"processed {len(pred_hic)} samples for classification metrics.")
     cls_metrics_head = get_classification_metrics(ground_truths['ais_head'], AIS_head,  list(range(6)))
+    print(f"Head metrics: {cls_metrics_head['accuracy']:.2f}%")
     cls_metrics_chest = get_classification_metrics(ground_truths['ais_chest'], AIS_chest, list(range(6)))
+    print(f"Chest metrics: {cls_metrics_chest['accuracy']:.2f}%")
     cls_metrics_neck = get_classification_metrics(ground_truths['ais_neck'], AIS_neck, list(range(6)))
+    print(f"Neck metrics: {cls_metrics_neck['accuracy']:.2f}%")
 
     # MAIS 指标
     mais_pred = np.maximum.reduce([AIS_head, AIS_chest, AIS_neck])

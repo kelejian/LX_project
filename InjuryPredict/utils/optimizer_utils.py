@@ -1,5 +1,3 @@
-import torch
-import torch.nn as nn
 
 def get_parameter_groups(model, weight_decay=1e-2, head_decay_ratio=0.1, head_keywords=('head',), verbose=True):
     """

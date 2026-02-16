@@ -1,7 +1,8 @@
 ARS.md
 check_raw_packed_consistency.py
-# .data/raw_packed/
-# .data/split_indices/
+# data/raw_packed/
+# data/split_indices/
+data/processed/
 .vscode/
 __pycache__/
 *.pyc

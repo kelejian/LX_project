@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-加载一个已训练好的模型（教师或学生），在【完整】的数据集上运行预测，
+加载一个已训练好的模型，在【完整】的数据集上运行预测，
 并将预测结果、真实标签、误差、数据集划分（train/valid/test）、
 以及原始的13个标量工况特征合并到一个CSV文件中，保存到该模型的 run 目录下。
 
@@ -21,12 +21,13 @@ from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from common.utils.seeding import set_random_seed
 
 from InjuryPredict.utils import models
+from InjuryPredict.Injurydata_prepare import InjuryPackedDataset
 from InjuryPredict.config import RUNS_DIR
 
 # --- 1. 配置区：请在此处设置您的路径 ---
 
 # 1.1) 要评估的模型所在的运行目录
-RUN_DIR = os.path.join(RUNS_DIR, "InjuryPredictModel_01281059")  # 示例: "./runs/InjuryPredictModel_XXXXXXXX" 或 "./runs/StudentModel_XXXXXX"
+RUN_DIR = os.path.join(RUNS_DIR, "InjuryPredictModel_02151111")  # 示例: "./runs/InjuryPredictModel_XXXXXXXX" 或 "./runs/StudentModel_XXXXXX"
 
 # 1.2) 要加载的模型权重文件名
 WEIGHT_FILE = "best_val_loss.pth"
@@ -93,9 +94,9 @@ def load_model_and_data(run_dir, weight_file, data_dir=DATA_DIR):
     val_subset = torch.load(val_pt_path)
     test_subset = torch.load(test_pt_path)
     
-    # 获取底层的 InjuryPackedDataset 实例（通过 Subset.dataset 可访问底层原始 arrays）
-    full_dataset = train_subset.dataset
-    all_case_ids = full_dataset.case_ids # 获取所有 case_id 的顺序
+    # 拼接 Subset 作为完整的数据集
+    full_dataset = torch.utils.data.ConcatDataset([train_subset, val_subset, test_subset])
+    all_case_ids = train_subset.dataset.case_ids # 获取所有 case_id 的顺序
     
     print(f"成功加载完整数据集，共 {len(full_dataset)} 个样本。")
     
@@ -163,16 +164,63 @@ def create_results_dataframe(dataset, predictions_np, original_features_df, case
     print("正在创建和合并结果 DataFrame...")
     
     # 1. 从数据集中提取 case_id 和真实标签
-    # 由于 DataLoader(shuffle=False)，顺序是完全一致的
+    # 支持两种输入类型：
+    # - 单一底层 InjuryPackedDataset（具有 .case_ids 等属性）
+    # - ConcatDataset([...])（通常由 train/val/test 的 Subset 拼接而成）
+    if hasattr(dataset, 'datasets'):
+        # dataset 是 ConcatDataset：按传入的子集顺序拼接底层数据
+        parts_case, parts_hic, parts_dmax, parts_nij = [], [], [], []
+        parts_ais_h, parts_ais_c, parts_ais_n, parts_mais, parts_ot = [], [], [], [], []
+        for sub in dataset.datasets:
+            # 每个 sub 可能是 Subset（常见）或直接为底层 Dataset
+            if isinstance(sub, torch.utils.data.Subset):
+                base = sub.dataset
+                idxs = np.asarray(sub.indices, dtype=np.int64)
+            else:
+                base = sub
+                idxs = np.arange(len(base), dtype=np.int64)
+
+            parts_case.append(base.case_ids[idxs])
+            parts_hic.append(base.y_HIC[idxs])
+            parts_dmax.append(base.y_Dmax[idxs])
+            parts_nij.append(base.y_Nij[idxs])
+            parts_ais_h.append(base.ais_head[idxs])
+            parts_ais_c.append(base.ais_chest[idxs])
+            parts_ais_n.append(base.ais_neck[idxs])
+            parts_mais.append(base.mais[idxs])
+            parts_ot.append(base.OT_raw[idxs])
+
+        case_ids = np.concatenate(parts_case)
+        hic_true = np.concatenate(parts_hic)
+        dmax_true = np.concatenate(parts_dmax)
+        nij_true = np.concatenate(parts_nij)
+        ais_head_true = np.concatenate(parts_ais_h)
+        ais_chest_true = np.concatenate(parts_ais_c)
+        ais_neck_true = np.concatenate(parts_ais_n)
+        mais_true = np.concatenate(parts_mais)
+        ot_raw = np.concatenate(parts_ot)
+    else:
+        # 直接使用单个 Dataset 的属性
+        case_ids = np.asarray(dataset.case_ids)
+        hic_true = np.asarray(dataset.y_HIC)
+        dmax_true = np.asarray(dataset.y_Dmax)
+        nij_true = np.asarray(dataset.y_Nij)
+        ais_head_true = np.asarray(dataset.ais_head)
+        ais_chest_true = np.asarray(dataset.ais_chest)
+        ais_neck_true = np.asarray(dataset.ais_neck)
+        mais_true = np.asarray(dataset.mais)
+        ot_raw = np.asarray(dataset.OT_raw)
+
+    # 构建基础 DataFrame（顺序与 predictions_np 一致）
     results_df = pd.DataFrame({
-        'case_id': dataset.case_ids,
-        'HIC_true': dataset.y_HIC,
-        'Dmax_true': dataset.y_Dmax,
-        'Nij_true': dataset.y_Nij,
-        'AIS_head_true_raw': dataset.ais_head,
-        'AIS_chest_true_raw': dataset.ais_chest,
-        'AIS_neck_true_raw': dataset.ais_neck,
-        'MAIS_true_raw': dataset.mais, # MAIS 真值
+        'case_id': case_ids,
+        'HIC_true': hic_true,
+        'Dmax_true': dmax_true,
+        'Nij_true': nij_true,
+        'AIS_head_true_raw': ais_head_true,
+        'AIS_chest_true_raw': ais_chest_true,
+        'AIS_neck_true_raw': ais_neck_true,
+        'MAIS_true_raw': mais_true,
     })
     
     # 2. 添加模型预测值
@@ -182,7 +230,8 @@ def create_results_dataframe(dataset, predictions_np, original_features_df, case
     
     # 3. 计算预测的AIS等级 (确保返回整数类型)
     results_df['AIS_head_pred'] = AIS_cal_head(results_df['HIC_pred']).astype(int)
-    results_df['AIS_chest_pred'] = AIS_cal_chest(results_df['Dmax_pred'], dataset.OT_raw).astype(int)
+    # 使用拼接得到的 OT 值进行胸部 AIS 计算
+    results_df['AIS_chest_pred'] = AIS_cal_chest(results_df['Dmax_pred'], ot_raw).astype(int)
     results_df['AIS_neck_pred'] = AIS_cal_neck(results_df['Nij_pred']).astype(int)
     
     # 4. 计算预测的 MAIS 等级 (确保整数)

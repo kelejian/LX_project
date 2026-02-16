@@ -2,10 +2,8 @@
 import torch
 import torch.nn as nn
 import numpy as np
-try:
-    from utils.AIS_cal import AIS_cal_head, AIS_cal_chest, AIS_cal_neck  # 作为包导入时使用
-except ImportError:
-    from AIS_cal import AIS_cal_head, AIS_cal_chest, AIS_cal_neck   # 直接运行时使用
+
+from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 
 def Piecewise_linear(y_true, y_pred, params, weight_add_mid=1.0):
     """

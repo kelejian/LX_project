@@ -18,9 +18,9 @@ MINMAX_INDICES_IN_CONTINUOUS = [0, 3, 4, 5, 6, 7, 8, 9, 10] # 在连续子向量
 
 DISCRETE_INDICES = [11, 12] # 在特征向量中的索引（对应 is_driver_side, OT）
 
-DISCRETE_VALUE_TO_INDEX = {
-    "is_driver_side": {"0": 0, "1": 1},
-    "OT": {"1": 0, "2": 1, "3": 2}
+DISCRETE_VALUE_TO_INDEX = { # 按照 FEATURE_ORDER 中离散特征的顺序，定义每个离散特征的取值到索引的映射（从0开始）
+    FEATURE_ORDER[DISCRETE_INDICES[0]]: {"0": 0, "1": 1}, # is_driver_side: 0=副驾, 1=主驾
+    FEATURE_ORDER[DISCRETE_INDICES[1]]: {"1": 0, "2": 1, "3": 2} # OT: 1,2,3 分别映射为 0,1,2（共3类）
 } # 固定离散映射（等价于LabelEncoder在这些取值上的编码）
 
 REQUIRED_COLUMNS_FOR_PACKING = set(FEATURE_ORDER + [

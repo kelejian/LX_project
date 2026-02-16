@@ -66,7 +66,7 @@ class UnifiedDataProcessor:
         self.discrete_num_classes = {
             name: len(DISCRETE_VALUE_TO_INDEX[name])
             for name in self.discrete_feature_names
-        }
+        } # 已经安装FEATURE_ORDER中离散特征的顺序构建离散特征类别数的字典，确保与 DISCRETE_INDICES 的顺序一致
         
         # 缓存：加载配置后构建的查找表（避免重复解析）
         self._minmax_params: Dict[str, Tuple[float, float]] = {}  # name -> (min, max)
@@ -261,7 +261,7 @@ class UnifiedDataProcessor:
         """
         self._ensure_config()
         
-        data = np.atleast_2d(np.asarray(data, dtype=np.int64))
+        data = np.atleast_2d(np.asarray(data, dtype=np.int32))
         n_samples, n_cols = data.shape
         
         if feature_names is None:
@@ -279,12 +279,27 @@ class UnifiedDataProcessor:
             
             mapping = self._discrete_inv_mappings[name] if inverse else self._discrete_mappings[name]
             
-            for row_idx in range(n_samples):
-                val = int(result[row_idx, col_idx])
-                if val in mapping:
-                    result[row_idx, col_idx] = mapping[val]
-                else:
-                    raise ValueError(f"离散特征 '{name}' 存在非法值: {val}，允许值: {list(mapping.keys())}")
+            # 向量化映射：避免对每个样本的 Python 层循环，使用 NumPy 操作批量替换
+            col = result[:, col_idx].astype(np.int32)  # (n_samples,)
+
+            # 将 mapping 转为排序的 keys/values 数组，便于使用 searchsorted 进行向量化查找
+            keys = np.fromiter(mapping.keys(), dtype=np.int32) # (n_classes,)
+            vals = np.fromiter(mapping.values(), dtype=np.int32) # (n_classes,)
+            order = np.argsort(keys) # keys 的排序索引
+            keys_s = keys[order] # 排序后的 keys
+            vals_s = vals[order] # 对应的 values 已经按照 keys 排序
+
+            # 查找每个输入值在 keys_s 中的位置，并验证是否匹配
+            idxs = np.searchsorted(keys_s, col) # 在“有序”数组中查找每个元素应插入的位置（保持有序性）; 默认是左侧插入
+            valid_mask = (idxs < keys_s.size) & (keys_s[idxs] == col) # 排除那些插入位置等于 len(keys_s)（即 value 比所有 keys 都大）的情况，防止后面 keys_s[idxs] 越界索引 且 确保找到的 keys_s[idxs] 与 col 完全匹配（即确实存在于 keys 中）
+            if not np.all(valid_mask):
+                bad_vals = np.unique(col[~valid_mask]).tolist()
+                raise ValueError(
+                    f"离散特征 '{name}' 存在非法值: {bad_vals}，允许值: {sorted(keys_s.tolist())}"
+                )
+
+            # 使用索引批量替换（向量化）
+            result[:, col_idx] = vals_s[idxs]
         
         return result.squeeze() if n_samples == 1 and data.ndim == 1 else result
     
@@ -341,7 +356,7 @@ class UnifiedDataProcessor:
         
         # 处理离散特征
         if disc_indices:
-            disc_data = result[:, disc_indices].astype(np.int64)
+            disc_data = result[:, disc_indices].astype(np.int32)
             disc_processed = self.process_discrete(disc_data, disc_names, inverse=inverse)
             result[:, disc_indices] = disc_processed.astype(np.float64)
         
@@ -361,7 +376,7 @@ class UnifiedDataProcessor:
         Returns:
             (x_continuous, x_discrete): 
                 - x_continuous: 归一化后的连续特征 [N, n_continuous], float64
-                - x_discrete: 编码后的离散特征 [N, n_discrete], int64
+                - x_discrete: 编码后的离散特征 [N, n_discrete], int32
         """
         self._ensure_config()
         
@@ -370,8 +385,8 @@ class UnifiedDataProcessor:
             raise ValueError(f"输入特征维度 ({x_raw.shape[1]}) 与预期 ({self.n_features}) 不匹配")
         
         # 分离连续和离散
-        x_cont = x_raw[:, CONTINUOUS_INDICES].astype(np.float64)
-        x_disc = x_raw[:, DISCRETE_INDICES].astype(np.int64)
+        x_cont = x_raw[:, CONTINUOUS_INDICES].astype(np.float64) # 形状 [N, n_continuous]
+        x_disc = x_raw[:, DISCRETE_INDICES].astype(np.int32) # 形状 [N, n_discrete]
         
         # 处理
         x_cont_processed = self.process_continuous(x_cont, CONTINUOUS_FEATURE_NAMES, inverse=inverse)
