@@ -1,174 +1,165 @@
-# run_evaluation.py
-
-import argparse
 import os
 import yaml
-import json
 import torch
 import pandas as pd
-import numpy as np
+import logging
 from tqdm import tqdm
-from datetime import datetime
+from pathlib import Path
 
-# 导入项目组件
-from src.utils.logger import setup_logger
-from src.interface.data_loader import ARSDataLoader
-from src.core.optimizer import ARS_Optimizer
-from src.utils.metrics import MetricsTracker
+# 引入项目全局依赖
+from common.settings import NORMALIZATION_CONFIG_PATH
+from common.data_utils.processor import UnifiedDataProcessor
 
-logger = setup_logger("RunEval")
+# 引入子项目核心模块
+from ARS_optim.src.core.param_manager import ParamManager
+from ARS_optim.src.core.constraints import PhysicalConstraintManager
+from ARS_optim.src.core.optimizer import ARSLocalOptimizer
+from ARS_optim.src.interface.surrogate_adapter import SurrogateAdapter
+from ARS_optim.src.models.strategy_net import StrategyNet
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="ARS 在线寻优与评估脚本")
-    parser.add_argument("--config", type=str, default="configs/default_config.yaml", help="配置文件路径")
-    parser.add_argument("--split", type=str, default="test", choices=['train', 'val', 'test', 'all'], help="评估数据集划分")
-    parser.add_argument("--output_dir", type=str, default=None, help="结果输出目录 (默认使用 config 中定义的路径)")
-    parser.add_argument("--max_samples", type=int, default=None, help="仅评估前N个样本 (用于快速调试)")
-    return parser.parse_args()
+# TODO: [需确认] 替换为您实际的模型类
+from PulsePredict.model.model import HybridPulseCNN 
+from InjuryPredict.utils.models import InjuryPredictModel  
+
+def setup_logger():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    return logging.getLogger("EvaluateARS")
 
 def main():
-    args = parse_args()
+    logger = setup_logger()
+    logger.info("="*60)
+    logger.info("启动 ARS_optim 在线评估流水线 (Evaluation Pipeline)")
+    logger.info("="*60)
 
-    # 1. 加载配置
-    if not os.path.exists(args.config):
-        raise FileNotFoundError(f"Config file not found: {args.config}")
-        
-    with open(args.config, 'r', encoding='utf-8') as f:
+    # 1. 路径与输入文件配置
+    # TODO: [假设] 用户提供需要被评估的工况数据 (仅含状态参数)
+    input_csv_path = "ARS_optim/input_cases.csv" 
+    output_csv_path = "ARS_optim/output_results.csv"
+    
+    if not os.path.exists(input_csv_path):
+        raise FileNotFoundError(f"[致命错误] 找不到输入数据文件: {input_csv_path}")
+
+    config_path = Path("ARS_optim/configs/default_config.yaml")
+    with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-
-    # 2. 准备输出环境
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_out_dir = args.output_dir if args.output_dir else config['paths']['output_dir']
-    run_out_dir = os.path.join(base_out_dir, f"eval_{args.split}_{timestamp}")
-    
-    os.makedirs(run_out_dir, exist_ok=True)
-    
-    # 备份本次运行配置，保证实验可复现
-    with open(os.path.join(run_out_dir, "run_config.yaml"), 'w', encoding='utf-8') as f:
-        yaml.dump(config, f)
-    
-    logger.info(f"Evaluation outputs will be saved to: {run_out_dir}")
-
-    # 3. 初始化核心组件
-    logger.info("Initializing system components...")
-    
-    # (A) 数据加载
-    try:
-        data_loader = ARSDataLoader(config, split=args.split)
-    except Exception as e:
-        logger.error(f"Failed to initialize DataLoader: {e}")
-        return
-
-    # (B) 优化器 (包含 ParamManager, StrategyNet, SurrogateAdapter)
-    try:
-        optimizer = ARS_Optimizer(config)
-    except Exception as e:
-        logger.error(f"Failed to initialize Optimizer: {e}")
-        return
-    
-    # (C) 指标跟踪
-    tracker = MetricsTracker()
-
-    # 4. 执行评估循环
-    total_samples = len(data_loader)
-    if args.max_samples:
-        total_samples = min(total_samples, args.max_samples)
-        logger.info(f"DEBUG MODE: Limiting evaluation to first {total_samples} samples.")
-
-    logger.info(f"Starting evaluation loop on '{args.split}' set ({total_samples} cases)...")
-    
-    results_list = []
-    
-    # TODO: [需确认] 当前为串行单样本评估。如果数据集极大(>10W)，可能需要重构 optimizer.optimize 以支持 Batch 并行寻优。
-    # 考虑到 ARS 是针对每个事故工况的个性化寻优，串行模拟更符合实际车载 ECU 的处理逻辑。
-    
-    for i in tqdm(range(total_samples), desc="Optimizing"):
-        # 获取单个工况数据
-        try:
-            case_data = data_loader[i]
-        except Exception as e:
-            logger.warning(f"Skipping sample index {i} due to loading error: {e}")
-            continue
-            
-        case_id = case_data['case_id']
-        state_dict = case_data['state_dict']
-        waveform = case_data['waveform'] # (1, 2, 150)
-        ground_truth = case_data['ground_truth']
-
-        try:
-            # --- 核心调用：执行寻优 ---
-            # result 结构: { 'initial': ..., 'optimized': ..., 'trajectory': ..., 'time_cost': ... }
-            opt_result = optimizer.optimize(state_dict, waveform)
-            
-            # --- 更新统计指标 ---
-            tracker.update(opt_result, case_id)
-            
-            # --- 记录详细报表 ---
-            # WARNING: [假设] 假设 optimizer.optimize 返回的 action_phys 列表顺序与 param_manager.control_names 严格一致。
-            # 这是基于 ParamManager 内部实现逻辑的推断，若 ParamManager 变更需同步修改此处。
-            ctrl_names = optimizer.param_manager.control_names
-            opt_actions = opt_result['optimized']['action_phys']
-            init_actions = opt_result['initial']['action_phys']
-            
-            record = {
-                "case_id": case_id,
-                # 性能指标
-                "loss_init": opt_result['initial']['loss'],
-                "loss_opt": opt_result['optimized']['loss'],
-                "improvement": tracker.history["improvement_rate"][-1],
-                "time_ms": opt_result['time_cost'] * 1000,
-                "steps": len(opt_result['trajectory']),
-                
-                # 参考真值 (注意：优化目标是 Surrogate Loss，不是 GT MAIS，此项仅供离线参考)
-                "gt_MAIS": ground_truth.get('MAIS', -1),
-                
-                # 参数详情 (Flattened)
-                **{f"opt_{name}": val for name, val in zip(ctrl_names, opt_actions)},
-                **{f"init_{name}": val for name, val in zip(ctrl_names, init_actions)}
-            }
-            results_list.append(record)
-            
-        except Exception as e:
-            # 捕获优化过程中的计算错误 (如梯度爆炸、Surrogate 报错)
-            logger.error(f"Optimization failed for Case {case_id}: {e}")
-            # TODO: [需确认] 错误处理策略：当前策略为跳过并继续。
-            # 是否需要将失败案例 ID 记录到单独的 error_log.txt 中以便后续排查？
-            continue
-
-    # 5. 生成最终报告
-    if not results_list:
-        logger.warning("No results generated. Please check dataset or optimizer configuration.")
-        return
-
-    logger.info("Generating evaluation reports...")
-    
-    # (A) 打印摘要到控制台
-    tracker.log_summary()
-    
-    # (B) 保存 CSV 明细表
-    try:
-        df = pd.DataFrame(results_list)
-        csv_path = os.path.join(run_out_dir, "eval_details.csv")
-        df.to_csv(csv_path, index=False)
-        logger.info(f"Detailed CSV report saved: {csv_path}")
-    except Exception as e:
-        logger.error(f"Failed to save CSV report: {e}")
-
-    # (C) 保存 Metrics 摘要 JSON
-    try:
-        summary_dict = tracker.compute_summary()
-        # 确保 numpy 类型转为 python native，否则 json dump 会报错
-        summary_safe = {k: float(v) if isinstance(v, (np.float32, np.float64)) else v 
-                        for k, v in summary_dict.items()}
         
-        json_path = os.path.join(run_out_dir, "metrics_summary.json")
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(summary_safe, f, indent=4)
-        logger.info(f"Metrics summary saved: {json_path}")
-    except Exception as e:
-        logger.error(f"Failed to save JSON summary: {e}")
+    device = torch.device(config.get("device", "cpu"))
+    
+    # 2. 初始化底层基建
+    param_manager = ParamManager(
+        param_space_path="ARS_optim/configs/param_space.yaml",
+        norm_config_path=NORMALIZATION_CONFIG_PATH
+    )
+    constraint_manager = PhysicalConstraintManager(param_manager)
+    processor = UnifiedDataProcessor(config_path=NORMALIZATION_CONFIG_PATH)
+    processor.load_config()
 
-    logger.info("Evaluation Process Finished.")
+    # 3. 加载代理模型环境
+    # TODO: [需确认] 请加入您真实的权重加载逻辑
+    pulse_model = HybridPulseCNN().to(device) 
+    injury_model = InjuryPredictModel(num_classes_of_discrete=[2, 3]).to(device)
+    
+    surrogate_env = SurrogateAdapter(
+        pulse_model=pulse_model, injury_model=injury_model,
+        param_manager=param_manager, config=config, data_processor=processor
+    ).to(device)
+
+    # 4. 根据 direct_inference 加载策略网络
+    is_direct_infer = config['optimization'].get('direct_inference', False)
+    strategy_net = None
+    if is_direct_infer:
+        logger.info("[模式] 开启 StrategyNet 直推 + 局部精调")
+        strategy_net = StrategyNet(
+            param_manager=param_manager, constraint_manager=constraint_manager,
+            hidden_dims=config['strategy_net']['hidden_dims']
+        ).to(device)
+        # TODO: 加载训练好的权重
+        # weight_path = "ARS_optim/saved_models/strategy_net_best.pth"
+        # strategy_net.load_state_dict(torch.load(weight_path, map_location=device)['state_dict'])
+        strategy_net.eval()
+    else:
+        logger.info("[模式] 关闭 StrategyNet，仅使用 Default 起点执行局部精调")
+
+    # 初始化寻优引擎
+    optimizer = ARSLocalOptimizer(
+        config=config, param_manager=param_manager, 
+        constraint_manager=constraint_manager, 
+        surrogate=surrogate_env, strategy_net=strategy_net
+    )
+
+    # 5. 读取数据并校验列名
+    df_input = pd.read_csv(input_csv_path)
+    state_names = [p['name'] for p in param_manager.state_params]
+    missing_cols = [col for col in state_names if col not in df_input.columns]
+    if missing_cols:
+        raise ValueError(f"输入 CSV 缺失必需的状态参数列: {missing_cols}")
+
+    # 将工况参数转换为 Tensor
+    state_tensor = torch.tensor(df_input[state_names].values, dtype=torch.float32, device=device)
+    batch_size = state_tensor.shape[0]
+    
+    logger.info(f"成功读取待优化工况: {batch_size} 条")
+
+    # ==========================================
+    # 6. 计算 Baseline (优化前：输入Default动作)
+    # ==========================================
+    logger.info(">>> 正在计算 Baseline (未经优化的默认损伤)...")
+    trainable_defaults = [p['default'] for p in param_manager.control_trainable_params]
+    base_actions = torch.tensor(trainable_defaults, dtype=torch.float32, device=device).unsqueeze(0).expand(batch_size, -1)
+    
+    with torch.no_grad():
+        base_loss, base_preds_phys, base_info = surrogate_env(state_tensor, base_actions)
+
+    # ==========================================
+    # 7. 计算 Optimized (执行在线寻优)
+    # ==========================================
+    logger.info(f">>> 正在执行 ARS 在线寻优 (精调步数={optimizer.refine_steps})...")
+    opt_actions, opt_preds_phys, opt_info = optimizer.optimize(state_tensor)
+
+    # ==========================================
+    # 8. 组装结果并保存
+    # ==========================================
+    trainable_names = [p['name'] for p in param_manager.control_trainable_params]
+    
+    # 提取评估数据并转为 numpy
+    base_act_np = base_actions.cpu().numpy()
+    opt_act_np = opt_actions.cpu().numpy()
+    base_inj_np = base_preds_phys.cpu().numpy()
+    opt_inj_np = opt_preds_phys.cpu().numpy()
+    
+    # 构建对比结果字典
+    results_dict = {}
+    # 1. 填入环境状态
+    for i, name in enumerate(state_names):
+        results_dict[name] = df_input[name].values
+        
+    # 2. 填入动作对比
+    for i, name in enumerate(trainable_names):
+        results_dict[f"Baseline_{name}"] = base_act_np[:, i]
+        results_dict[f"Optimized_{name}"] = opt_act_np[:, i]
+        
+    # 3. 填入损伤对比 (0:HIC, 1:Dmax, 2:Nij)
+    results_dict["Baseline_HIC15"] = base_inj_np[:, 0]
+    results_dict["Optimized_HIC15"] = opt_inj_np[:, 0]
+    results_dict["Baseline_Dmax"] = base_inj_np[:, 1]
+    results_dict["Optimized_Dmax"] = opt_inj_np[:, 1]
+    results_dict["Baseline_Nij"] = base_inj_np[:, 2]
+    results_dict["Optimized_Nij"] = opt_inj_np[:, 2]
+    
+    # 计算综合风险下降率
+    base_risk = base_info['loss_risk'].cpu().numpy()
+    opt_risk = opt_info['loss_risk'].cpu().numpy()
+    results_dict["Baseline_TotalRisk"] = base_risk
+    results_dict["Optimized_TotalRisk"] = opt_risk
+    results_dict["Risk_Reduction(%)"] = (base_risk - opt_risk) / (base_risk + 1e-8) * 100.0
+
+    df_output = pd.DataFrame(results_dict)
+    df_output.to_csv(output_csv_path, index=False)
+    
+    logger.info("="*60)
+    logger.info(f"评估完成！结果已保存至: {output_csv_path}")
+    logger.info(f"平均综合风险: 优化前={base_risk.mean():.4f} -> 优化后={opt_risk.mean():.4f}")
+    logger.info("="*60)
 
 if __name__ == "__main__":
     main()

@@ -1,116 +1,111 @@
-# src/models/strategy_net.py
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import List, Dict, Any
-from src.utils.logger import setup_logger
+import logging
+from typing import List
 
-logger = setup_logger(__name__)
+from src.core.param_manager import ParamManager
+from src.core.constraints import PhysicalConstraintManager
 
 class StrategyNet(nn.Module):
     """
-    策略网络 A_theta(s) -> a
+    自适应寻优策略网络 (Adaptive Optimization Strategy Network)
     
-    功能：
-    接收工况状态 (State)，直接输出接近全局最优的控制参数 (Action)。
-    该网络作为“摊销优化”(Amortized Optimization) 的载体。
-    
-    输入:
-        x_continuous: (B, N_cont) 归一化的连续特征
-        x_discrete: (B, N_disc) 离散特征索引
-    
-    输出:
-        action: (B, N_ctrl) 归一化到 [-1, 1] 的控制参数
+    架构特征:
+    1. 接收不可控的状态特征 (State Params) 作为输入。
+    2. 使用多层 MLP 提取高阶非线性环境表征。
+    3. 输出层执行强有界激活 (Sigmoid)，逆映射到各可调参数的真实物理区间。
+    4. 执行硬投影截断 (Hard Projection)，确保相对耦合物理法则被严格遵守。
     """
-    
-    def __init__(self, 
-                 continuous_dim: int, 
-                 discrete_dims: List[int],
-                 action_dim: int, 
-                 hidden_dims: List[int] = [128, 128],
-                 dropout: float = 0.0):
-        """
-        Args:
-            continuous_dim: 连续状态特征数量 (e.g. 11)
-            discrete_dims: 离散特征的类别数列表 (e.g. [2, 4] for is_driver, OT)
-            action_dim: 输出动作维度 (e.g. 5)
-            hidden_dims: 隐藏层维度列表
-            dropout: Dropout概率
-        """
-        super(StrategyNet, self).__init__()
+    def __init__(
+        self, 
+        param_manager: ParamManager, 
+        constraint_manager: PhysicalConstraintManager,
+        hidden_dims: List[int] = [128, 256, 128],
+        activation: str = "LeakyReLU",
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.param_manager = param_manager
+        self.constraint_manager = constraint_manager
         
-        # 1. 离散特征嵌入 (Embeddings)
-        # 为每个离散特征建立 Embedding，维度设为 min(num_classes, 8)
-        self.embeddings = nn.ModuleList([
-            nn.Embedding(num_classes, min(num_classes, 8)) 
-            for num_classes in discrete_dims
-        ])
+        # 确定输入与输出维度
+        self.input_dim = self.param_manager.get_state_dim()
+        self.output_dim = self.param_manager.get_trainable_dim()
         
-        # 计算嵌入后的总维度
-        # embedding_dim_sum = sum(min(c, 8))
-        self.emb_out_dim = sum([e.embedding_dim for e in self.embeddings])
-        
-        # 2. MLP 主干
-        input_dim = continuous_dim + self.emb_out_dim
+        # 严苛校验：若无任何参数需要寻优，则报错
+        if self.output_dim == 0:
+            raise ValueError("[致命错误] 策略网络初始化失败：没有设置任何 trainable=True 的可调参数！")
+
+        # ---------------------------------------------------------
+        # 1. 构建 MLP 骨干网络 (Backbone)
+        # ---------------------------------------------------------
         layers = []
-        curr_dim = input_dim
+        in_features = self.input_dim
+        
+        # 动态解析激活函数
+        act_layer = getattr(nn, activation)(inplace=True) if hasattr(nn, activation) else nn.ReLU(inplace=True)
         
         for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(curr_dim, hidden_dim))
+            layers.append(nn.Linear(in_features, hidden_dim, bias=False)) # BN前无需Bias
             layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.LeakyReLU(negative_slope=0.01, inplace=True))
+            layers.append(act_layer)
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
-            curr_dim = hidden_dim
+            in_features = hidden_dim
             
-        self.backbone = nn.Sequential(*layers)
+        # 最后一层映射到可调参数维度 (Plain Linear)
+        layers.append(nn.Linear(in_features, self.output_dim))
         
-        # 3. 输出头 (Action Head)
-        # 输出范围 [-1, 1]，对应 ParamManager 的 Optimization Space
-        self.action_head = nn.Sequential(
-            nn.Linear(curr_dim, action_dim),
-            nn.Tanh() 
-        )
+        self.mlp = nn.Sequential(*layers)
         
-        # 4. 初始化权重
-        self._init_weights()
+        # ---------------------------------------------------------
+        # 2. 注册物理边界缓冲 (Buffers)
+        # ---------------------------------------------------------
+        # 从 param_manager 获取绝对上下限。
+        # 使用 register_buffer 能够让这些张量随着模型 .to(device) 自动转移到 GPU/CPU，
+        # 且不会被 Optimizer 错误当成网络权重去更新。
+        min_b, max_b = self.param_manager.get_trainable_bounds()
+        self.register_buffer("min_bounds", min_b)
+        self.register_buffer("max_bounds", max_b)
         
-        logger.info(f"StrategyNet initialized. "
-                    f"Input: [Cont={continuous_dim}, Disc={discrete_dims} -> Emb={self.emb_out_dim}], "
-                    f"Output: {action_dim}, Hidden: {hidden_dims}")
+        # 权重初始化
+        self._initialize_weights()
 
-    def _init_weights(self):
+    def _initialize_weights(self):
+        """Kaiming 正态初始化，适配 ReLU/LeakyReLU 体系"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def forward(self, x_continuous: torch.Tensor, x_discrete: torch.Tensor) -> torch.Tensor:
+    def forward(self, state_features: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            x_continuous: (B, 11)
-            x_discrete: (B, 2) Int64 Tensor
-        Returns:
-            action: (B, 5) Range [-1, 1]
+        前向推理过程，融合了深度网络特征提取与严格的物理边界约束。
+        
+        参数:
+            state_features: [Batch, D_state] 物理尺度的环境工况参数
+            
+        返回:
+            actions: [Batch, D_trainable] 绝对合法的物理决策参数，并保留完整的梯度传播链
         """
-        # 1. 处理离散特征
-        emb_list = []
-        for i, emb_layer in enumerate(self.embeddings):
-            # x_discrete[:, i] shape: (B,)
-            emb = emb_layer(x_discrete[:, i]) # (B, emb_dim)
-            emb_list.append(emb)
+        # 1. 骨干网络特征提取
+        # [Batch, D_state] -> [Batch, D_trainable]
+        raw_output = self.mlp(state_features)
         
-        x_emb = torch.cat(emb_list, dim=1) # (B, total_emb_dim)
+        # 2. 绝对极值范围逆映射 (Sigmoid + Affine Transform)
+        # 利用 Sigmoid 将输出强制压入 (0, 1) 区间，随后按对应参数的 Min-Max 拉伸
+        # [Batch, D_trainable] -> [Batch, D_trainable]
+        norm_actions = torch.sigmoid(raw_output)
+        range_span = self.max_bounds - self.min_bounds
         
-        # 2. 拼接输入
-        x = torch.cat([x_continuous, x_emb], dim=1)
+        abs_actions = norm_actions * range_span.unsqueeze(0) + self.min_bounds.unsqueeze(0)
         
-        # 3. MLP
-        feat = self.backbone(x)
+        # 3. 相对耦合物理法则硬投影 (Hard Constraint Projection)
+        # 依赖于 PhysicalConstraintManager，调用诸如 torch.min 等可微算子
+        # 确保诸如 AFT < BTF + 25 等物理依赖在网络输出端被 100% 严格执行
+        # [Batch, D_trainable] -> [Batch, D_trainable]
+        final_actions = self.constraint_manager.project_forward(abs_actions)
         
-        # 4. 输出
-        action = self.action_head(feat)
-        
-        return action
+        return final_actions

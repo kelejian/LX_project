@@ -1,164 +1,141 @@
-# src/interface/data_loader.py
-
-import sys
-import os
 import torch
-import numpy as np
-import yaml
-from typing import Dict, Any, Tuple, Optional
+import logging
+from typing import Iterator
 
-from src.utils.logger import setup_logger
+from src.core.param_manager import ParamManager
 
-logger = setup_logger(__name__)
+# 严格复刻 step0_params_sample_1220.py 中的多边形顶点约束与离散特征映射
+SEAT_CONSTRAINTS = {
+    (1, 1): [(40, 0), (110, 5.5), (110, 60), (80, 60), (80, 30), (40, 30)], 
+    (1, 2): [(-40, -40/18), (60, 60/18), (60, 60), (-40, 60)], 
+    (1, 3): [(-60, -60/18), (30, 30/18), (30, 60), (-60, 60)],  
+    (0, 1): [(-110, -10), (110, -10), (110, 70), (-110, 70)],  
+    (0, 2): [(-110, -10), (110, -10), (110, 70), (-110, 70)], 
+    (0, 3): [(-110, -10), (49, -10), (49, 70), (-110, 70)],    
+}
 
-class ARSDataLoader:
+RA_VALUES = {
+    (1, 1): [15, 20, 25], 
+    (1, 2): [15, 20, 25, 30], 
+    (1, 3): [15, 20, 25, 30],   
+    (0, 1): [20, 25, 30, 35, 40],  
+    (0, 2): [20, 25, 30, 35, 40], 
+    (0, 3): [20, 25, 30, 35, 40],    
+}
+
+def point_in_polygon_torch(x: torch.Tensor, y: torch.Tensor, poly_pts: torch.Tensor) -> torch.Tensor:
+    """基于纯 PyTorch 张量操作的射线法 (Ray-Casting) 多边形内外判定"""
+    num_pts = poly_pts.shape[0]
+    inside = torch.zeros_like(x, dtype=torch.bool)
+    p1x, p1y = poly_pts[0]
+    for i in range(1, num_pts + 1):
+        p2x, p2y = poly_pts[i % num_pts]
+        # 判断射线是否穿过边
+        intersect = ((p1y > y) != (p2y > y)) & (x < (p2x - p1x) * (y - p1y) / (p2y - p1y + 1e-8) + p1x)
+        inside ^= intersect
+        p1x, p1y = p2x, p2y
+    return inside
+
+class StateDataLoaderManager:
     """
-    ARS 数据加载器 (Data Loader)
+    状态数据无限生成器 (Infinite State Stream Generator) - 精确约束版
     
-    职责：
-    1. 加载原始的测试/验证数据集（使用 InjuryPredict 的 InjuryPackedDataset / processed .pt）。
-    2. 提取"物理空间"的原始波形和工况参数。
-    3. 将数据打包成 Optimizer 需要的格式 (state_dict, waveform)。
+    使用 PyTorch 向量化算子，在 GPU/CPU 内存中极速生成满足所有碰撞耦合与几何多边形约束的数据流。
     """
-
-    def __init__(self, config: Dict[str, Any], split: str = 'val'):
-        """
-        Args:
-            config: 全局配置字典
-            split: 数据集划分 ('val', 'test', 'train' or 'all')
-                   注意：'all' 会直接从 .npz 加载所有数据，忽略划分。
-        """
-        self.config = config
-        self.device = torch.device(config.get("device", "cpu"))
-        self.split = split
+    def __init__(self, param_manager: ParamManager, batch_size: int, device: torch.device = torch.device('cpu')):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.param_manager = param_manager
+        self.batch_size = batch_size
+        self.device = device
         
-        # 1. 路径准备
-        self.surrogate_dir = config['paths']['surrogate_project_dir']
-        self._setup_imports()
+        self.total_dim = self.param_manager.get_total_feature_dim()
+        self.state_indices = self.param_manager.get_state_indices()
+        self.idx_map = {p['name']: p['index'] for p in self.param_manager.state_params}
         
-        # 2. 加载参数定义 (用于解析 raw 数组到 dict)
-        self.param_def = self._load_param_definitions()
+    def _generate_batch(self) -> torch.Tensor:
+        B = self.batch_size
+        D = self.total_dim
+        batch_phys = torch.zeros((B, D), device=self.device, dtype=torch.float32)
         
-        # 3. 加载数据集
-        self.dataset = self._load_dataset()
-        self.indices = self._get_split_indices()
+        # 1. 速度: [25, 65]
+        batch_phys[:, self.idx_map['impact_velocity']] = torch.rand(B, device=self.device) * 40.0 + 25.0
         
-        logger.info(f"ARSDataLoader initialized. Mode: {split}, Samples: {len(self.indices)}")
-
-    def _setup_imports(self):
-        """导入 InjuryPredict 的数据类（不再通过修改 sys.path）。"""
-        try:
-            from InjuryPredict.Injurydata_prepare import InjuryPackedDataset
-            self.dataset_cls = InjuryPackedDataset
-        except Exception as e:
-            raise ImportError(f"Failed to import InjuryPackedDataset from InjuryPredict: {e}")
-
-    def _load_param_definitions(self) -> list:
-        """加载 param_space.yaml 以获取参数名称和索引"""
-        path = os.path.join("configs", "param_space.yaml")
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Param space config not found at {path}")
-            
-        with open(path, 'r', encoding='utf-8') as f:
-            cfg = yaml.safe_load(f)
-        return cfg['parameters'] # 类型: list of dict
-
-    def _load_dataset(self):
-        """实例化 InjuryPackedDataset（或直接从 npz 加载原始 arrays）"""
-        # 构造 npz 的绝对路径
-        data_input_path = os.path.abspath(self.config['paths']['data_input'])
-        data_labels_path = os.path.abspath(self.config['paths']['data_labels'])
+        # 2. 重叠率 & 角度
+        # 重叠率 (-1, -0.25] ∪ [0.25, 1.0]
+        u_ov = torch.rand(B, device=self.device)
+        overlap = torch.where(u_ov < 0.5, torch.rand(B, device=self.device) * 0.75 - 1.0, torch.rand(B, device=self.device) * 0.75 + 0.25)
+        batch_phys[:, self.idx_map['overlap']] = overlap
         
-        logger.info(f"Loading raw data from {data_input_path}...")
+        # 初始角度 [-45, 45]
+        angle = torch.rand(B, device=self.device) * 90.0 - 45.0
         
-        # 实例化InjuryPredict项目的 Dataset 类; 它会自动读取 npz 并存储在 self.x_att_raw, self.x_acc_raw 等属性中
-        ds = self.dataset_cls(input_file=data_input_path, label_file=data_labels_path)
-        return ds
-
-    def _get_split_indices(self) -> np.ndarray:
-        """获取指定划分的索引列表"""
-        if self.split == 'all':
-            return np.arange(len(self.dataset))
-            
-        # 尝试加载划分文件 (train_dataset.pt 等)
-        # 注意：这些 .pt 文件是 torch.utils.data.Subset 对象，包含 indices
-        filename = f"{self.split}_dataset.pt"
-        # 设 .pt 文件在 surrogate_project/data/ 目录下
-        pt_path = os.path.join(self.surrogate_dir, "data", filename)
+        # 极速角度纠正：重叠率绝对值在 0.25~0.3 时，角度需异号且绝对值 > 30
+        mask_coup = (overlap.abs() >= 0.25) & (overlap.abs() < 0.3)
+        num_coup = mask_coup.sum().item()
+        if num_coup > 0:
+            ang_sign = -torch.sign(overlap[mask_coup])
+            # 重新采样在 [30, 45] 的绝对值
+            ang_corrected = ang_sign * (torch.rand(num_coup, device=self.device) * 15.0 + 30.0)
+            angle[mask_coup] = ang_corrected
+        batch_phys[:, self.idx_map['impact_angle']] = angle
         
-        if not os.path.exists(pt_path):
-            logger.warning(f"Split file {pt_path} not found. Fallback to loading ALL data.")
-            return np.arange(len(self.dataset))
-            
-        try:
-            subset = torch.load(pt_path, weights_only=False) # weights_only=False 因包含自定义类
-            logger.info(f"Loaded split indices from {filename}")
-            return np.array(subset.indices)
-        except Exception as e:
-            logger.error(f"Failed to load {pt_path}: {e}")
-            raise e
-
-    def __len__(self):
-        return len(self.indices)
-
-    def get_data_by_index(self, idx: int) -> Dict[str, Any]:
-        """
-        根据数据集的全局索引获取数据 (Raw Physical Values)
+        # 3. 离散类别
+        # OT: [1, 2, 3] 均匀生成
+        ot = torch.randint(1, 4, (B,), device=self.device, dtype=torch.float32)
+        batch_phys[:, self.idx_map['OT']] = ot
         
-        Args:
-            idx: 在 dataset 中的全局索引 (注意区分 Subset 的相对索引)
+        # 侧位: [0, 1] 均匀生成
+        is_driver = torch.randint(0, 2, (B,), device=self.device, dtype=torch.float32)
+        batch_phys[:, self.idx_map['is_driver_side']] = is_driver
         
-        Returns:
-            Dict: {
-                "case_id": int,
-                "state_dict": Dict[str, float],      # 包含所有13个参数的物理值
-                "waveform": Tensor (1, 2, 150),      # 原始物理尺度碰撞波形(x,y方向加速度)
-                "ground_truth": Dict[str, float]     # 真实损伤值 (HIC, Dmax, Nij, AIS_head, AIS_chest, AIS_neck, MAIS)
-            }
-        """
-        # 1. 获取 Case ID
-        case_id = int(self.dataset.case_ids[idx])
+        # 4. 基于类别的几何约束采样 (SP, SH, RA)
+        ra_tensor = torch.zeros(B, device=self.device, dtype=torch.float32)
+        sp_tensor = torch.zeros(B, device=self.device, dtype=torch.float32)
+        sh_tensor = torch.zeros(B, device=self.device, dtype=torch.float32)
         
-        # 2. 获取原始波形 (2, 150) -> (1, 2, 150)
-        # 注意：底层 InjuryPackedDataset 保留原始 numpy arrays（x_acc_raw）
-        wave_np = self.dataset.x_acc_raw[idx]
-        waveform = torch.tensor(wave_np, dtype=torch.float32).unsqueeze(0).to(self.device)
-        
-        # 3. 获取原始参数并解析为 state_dict
-        # x_att_raw shape: (13,)
-        params_np = self.dataset.x_att_raw[idx]
-        state_dict = {}
-        
-        for p in self.param_def:
-            p_idx = p['index']
-            p_name = p['name']
-            val = float(params_np[p_idx])
-            
-            # 如果是离散参数，确保转换为 int
-            if p['type'] == 'discrete':
-                state_dict[p_name] = int(val)
-            else:
-                state_dict[p_name] = val
+        # 遍历 6 种状态组合，进行并行约束映射
+        for drv_val in [0, 1]:
+            for ot_val in [1, 2, 3]:
+                mask = (is_driver == drv_val) & (ot == ot_val)
+                num_in_group = mask.sum().item()
+                if num_in_group == 0:
+                    continue
                 
-        # 4. 获取 Ground Truth (用于评估对比)
-        gt = {
-            "HIC": float(self.dataset.y_HIC[idx]),
-            "Dmax": float(self.dataset.y_Dmax[idx]),
-            "Nij": float(self.dataset.y_Nij[idx]),
-            "AIS_head": int(self.dataset.ais_head[idx]),
-            "AIS_chest": int(self.dataset.ais_chest[idx]),
-            "AIS_neck": int(self.dataset.ais_neck[idx]),
-            "MAIS": int(self.dataset.mais[idx])
-        }
+                # A. 靠背角 RA 映射
+                ra_opts = torch.tensor(RA_VALUES[(drv_val, ot_val)], device=self.device, dtype=torch.float32)
+                ra_idx = torch.randint(0, len(ra_opts), (num_in_group,), device=self.device)
+                ra_tensor[mask] = ra_opts[ra_idx]
+                
+                # B. 座椅位置 SP/SH 向量化拒绝采样
+                poly_pts = torch.tensor(SEAT_CONSTRAINTS[(drv_val, ot_val)], device=self.device, dtype=torch.float32)
+                sp_min, sh_min = poly_pts.min(dim=0)[0]
+                sp_max, sh_max = poly_pts.max(dim=0)[0]
+                
+                sub_mask_valid = torch.zeros(num_in_group, dtype=torch.bool, device=self.device)
+                sub_sp = torch.zeros_like(sub_mask_valid, dtype=torch.float32)
+                sub_sh = torch.zeros_like(sub_mask_valid, dtype=torch.float32)
+                
+                # 循环直至少数不合规点全部被重新采样进多边形内部
+                while not sub_mask_valid.all():
+                    num_invalid = (~sub_mask_valid).sum().item()
+                    gen_sp = torch.rand(num_invalid, device=self.device) * (sp_max - sp_min) + sp_min
+                    gen_sh = torch.rand(num_invalid, device=self.device) * (sh_max - sh_min) + sh_min
+                    
+                    inside = point_in_polygon_torch(gen_sp, gen_sh, poly_pts)
+                    
+                    sub_sp[~sub_mask_valid] = torch.where(inside, gen_sp, sub_sp[~sub_mask_valid])
+                    sub_sh[~sub_mask_valid] = torch.where(inside, gen_sh, sub_sh[~sub_mask_valid])
+                    sub_mask_valid[~sub_mask_valid] = inside
+                
+                sp_tensor[mask] = sub_sp
+                sh_tensor[mask] = sub_sh
+                
+        batch_phys[:, self.idx_map['RA']] = ra_tensor
+        batch_phys[:, self.idx_map['SP']] = sp_tensor
+        batch_phys[:, self.idx_map['SH']] = sh_tensor
         
-        return {
-            "case_id": case_id,
-            "state_dict": state_dict,
-            "waveform": waveform,
-            "ground_truth": gt
-        }
+        return batch_phys[:, self.state_indices]
 
-    def __getitem__(self, item):
-        """支持 loader[i] 访问，自动映射 Subset 索引到 Global 索引"""
-        global_idx = self.indices[item]
-        return self.get_data_by_index(global_idx)
+    def get_infinite_generator(self) -> Iterator[torch.Tensor]:
+        while True:
+            yield self._generate_batch()
