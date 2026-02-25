@@ -107,7 +107,7 @@ def AIS_cal_chest(
     Dmax_proc = _to_tensor_or_array(Dmax, backend)
     OT_proc = _to_tensor_or_array(OT, backend)
     
-    Dmax_proc = _clip(Dmax_proc, 0.0, 500.0, backend)
+    Dmax_proc = _clip(Dmax_proc, 0.001, 500.0, backend)
 
     # OT=1: 221/182.9; OT=2: 1.0; OT=3: 221/246.38
     # 使用具体数值以避免 tensor 操作中的除法问题（如果需要），但直接除法通常也是行的
@@ -155,6 +155,7 @@ def AIS_cal_neck(
     """
     backend = 'torch' if isinstance(Nij, torch.Tensor) else 'numpy'
     Nij_proc = _to_tensor_or_array(Nij, backend)
+    Nij_proc = _clip(Nij_proc, 0, 10.0, backend)
     
     prob = 1.0 / (1.0 + _exp(3.2269 - 1.9688 * Nij_proc, backend))
 
@@ -170,3 +171,82 @@ def AIS_cal_neck(
     if np.isscalar(Nij) and backend == 'numpy':
         return AIS.item()
     return AIS
+
+def Injury_prob_cal_head(
+    HIC15: Union[float, np.ndarray, torch.Tensor]
+) -> Union[float, np.ndarray, torch.Tensor]:
+    """
+    根据 HIC15 计算头部 AIS3+ 损伤概率。
+    基于已有 AIS_cal_head 逻辑剥离，保留全流程可导性，供代理寻优模型使用。
+    """
+    backend = 'torch' if isinstance(HIC15, torch.Tensor) else 'numpy'
+    HIC_proc = _to_tensor_or_array(HIC15, backend)
+    
+    # 截断至有效范围以避免对数计算无意义导致梯度崩溃 (NaN)
+    HIC_proc = _clip(HIC_proc, 1.0, 2500.0, backend)
+
+    # P_head(AIS3+) = Φ((ln(HIC15) - 7.45231) / 0.73998)
+    z = (_log(HIC_proc, backend) - 7.45231) / 0.73998
+    prob = _norm_cdf(z, backend)
+    
+    if np.isscalar(HIC15) and backend == 'numpy':
+        return prob.item()
+    return prob
+
+
+def Injury_prob_cal_chest(
+    Dmax: Union[float, np.ndarray, torch.Tensor],
+    OT: Union[int, np.ndarray, torch.Tensor] = 2
+) -> Union[float, np.ndarray, torch.Tensor]:
+    """
+    根据 Dmax (mm) 计算胸部 AIS3+ 损伤概率。
+    基于已有 AIS_cal_chest 逻辑剥离，保留全流程可导性，供代理寻优模型使用。
+    """
+    backend = 'torch' if isinstance(Dmax, torch.Tensor) else 'numpy'
+    Dmax_proc = _to_tensor_or_array(Dmax, backend)
+    OT_proc = _to_tensor_or_array(OT, backend)
+
+    Dmax_proc = _clip(Dmax_proc, 1e-4, 500.0, backend)
+
+    sf_1 = 221.0 / 182.9
+    sf_2 = 1.0
+    sf_3 = 221.0 / 246.38
+    
+    # 维持纯张量计算图处理不同假人体型(OT)的特征缩放
+    if backend == 'torch':
+        Scaling_Factor = torch.ones_like(Dmax_proc)
+        Scaling_Factor = torch.where(OT_proc == 1, torch.tensor(sf_1, device=Dmax_proc.device), Scaling_Factor)
+        Scaling_Factor = torch.where(OT_proc == 3, torch.tensor(sf_3, device=Dmax_proc.device), Scaling_Factor)
+    else:
+        Scaling_Factor = np.where(OT_proc == 1, sf_1, 
+                               np.where(OT_proc == 2, sf_2,
+                                        np.where(OT_proc == 3, sf_3, 1.0)))
+
+    Dmax_eq = Dmax_proc * Scaling_Factor
+        
+    # P_chest_defl(AIS3+) = 1 / (1 + e^(10.5456 - 1.568 * ChestDefl^0.4612))
+    exponent = 10.5456 - 1.568 * _power(Dmax_eq, 0.4612, backend)
+    prob = 1.0 / (1.0 + _exp(exponent, backend))
+    
+    if np.isscalar(Dmax) and backend == 'numpy':
+        return prob.item()
+    return prob
+
+
+def Injury_prob_cal_neck(
+    Nij: Union[float, np.ndarray, torch.Tensor]
+) -> Union[float, np.ndarray, torch.Tensor]:
+    """
+    根据 Nij 计算颈部 AIS3+ 损伤概率。
+    基于已有 AIS_cal_neck 逻辑剥离，保留全流程可导性，供代理寻优模型使用。
+    """
+    backend = 'torch' if isinstance(Nij, torch.Tensor) else 'numpy'
+    Nij_proc = _to_tensor_or_array(Nij, backend)
+    Nij_proc = _clip(Nij_proc, 0, 10.0, backend)
+
+    # 公式: P_neck_Nij(AIS3+) = 1 / (1 + e^(3.2269 - 1.9688 * Nij))
+    prob = 1.0 / (1.0 + _exp(3.2269 - 1.9688 * Nij_proc, backend))
+
+    if np.isscalar(Nij) and backend == 'numpy':
+        return prob.item()
+    return prob

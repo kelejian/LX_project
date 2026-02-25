@@ -1,62 +1,47 @@
-# configs/default_config.yaml
+# ARS_optim/configs/default_config.yaml
 
 # ===========================
-# 项目基础设置
+# 1. 项目基础设置
 # ===========================
 project_name: "LX-ARS-optim"
 version: "1.0.0"
 seed: 42
-device: "cuda" # or "cpu"
+device: "cuda" # 或 "cpu"
 
 # ===========================
-# 路径配置
+# 2. 外部依赖配置 (与环境解耦)
 # ===========================
-paths:
-  # 引用已有的损伤预测项目
-  surrogate_project_dir: "../LX_model_injurypredict"
-  # 代理模型权重文件 (确保路径正确)
-  surrogate_checkpoint: "../LX_model_injurypredict/runs/InjuryPredictModel_01281059/best_val_loss.pth" 
-  
-  # 数据集路径
-  data_input: "../LX_model_injurypredict/data/data_input.npz"
-  data_labels: "../LX_model_injurypredict/data/data_labels.npz"
-  preprocessors_path: "../../data/normalization_config.json"  # now uses common normalization_config.json (UnifiedDataProcessor)
-  
-  # 本项目输出
-  output_dir: "./outputs"
-  strategy_model_save_path: "./weights/strategy_net_v1.pth"
+# 仅指定代理模型权重的相对位置，根路径将由代码从 common.settings.INJURY_PREDICT_DIR 获取
+surrogate:
+  checkpoint_rel_path: "runs/InjuryPredictModel_01281059/best_val_loss.pth"
 
 # ===========================
-# 步骤三：策略网络 (Strategy Net) - 摊销优化
+# 3. 策略网络(Strategy Net)训练 - 摊销优化超参
 # ===========================
 strategy_net:
-  # 网络架构
-  hidden_dims: [128, 256, 128] # MLP 隐藏层
+  hidden_dims: [128, 256, 128] # MLP 隐藏层架构
   activation: "LeakyReLU"
   dropout: 0.1
   
-  # 离线训练超参 (用于训练 Strategy Net 模仿全局最优)
   train:
     batch_size: 256
-    epochs: 100
+    max_iterations: 50000  # 放弃 Epoch 概念，使用最大迭代步数控制无标签自监督数据流
     lr: 0.001
     weight_decay: 1e-4
 
 # ===========================
-# 步骤四：在线寻优 (Online Optimization) - 局部精调
+# 4. 在线寻优(Online Optimization) - 策略网络直推和局部精调超参
 # ===========================
 optimization:
-  # 精调迭代参数
-  refine_steps: 50         # 局部精调迭代次数 k. 若为0，则仅进行推理
-  lr: 0.05                 # 梯度下降步长 (针对归一化后的参数)
+  # 是否直推
+  direct_inference: False # True: 需要进行策略网络直推；False: 使用默认参数作为初始解进行局部精调，不进行策略网络直推
+  # 直推后的精调迭代参数
+  refine_steps: 50         # 局部精调迭代次数 k. 若为0，则仅依赖策略网络直接推理
+  lr: 0.05                 # 代理模型梯度下降步长 (针对归一化后的参数)
   
-  # 目标函数权重 (Surrogate Model 输出的加权和)
-  # Minimize Loss = w_hic * HIC_norm + w_dmax * Dmax_norm + ...
+  # 综合目标函数(Loss)各部位风险权重
+  # Loss = w_hic * P(HIC) + w_dmax * P(Dmax) + w_nij * P(Nij)
   objectives:
     weight_hic: 1.0
     weight_dmax: 1.0
     weight_nij: 0.5
-
-  # 物理约束处理
-  constraints:
-    use_clamp: True # 每次更新后强制截断到 [min, max]

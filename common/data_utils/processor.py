@@ -180,29 +180,30 @@ class UnifiedDataProcessor:
         else:
             return data / scale_factor
     
+    # ========================================================================
+    # 核心归一化/反归一化方法 (现已兼容 numpy.ndarray 与 torch.Tensor)
+    # ========================================================================
+    
     def process_continuous(
         self,
-        data: np.ndarray,
+        data: Union[np.ndarray, Any], # Any 用于兼容 torch.Tensor 避免硬导入
         feature_names: Optional[List[str]] = None,
         inverse: bool = False
-    ) -> np.ndarray:
-        """连续特征归一化/反归一化。
-        
-        MinMax 特征: x' = (x - min) / (max - min) → [0, 1]
-        MaxAbs 特征: x' = x / abs_max → [-1, 1]
-        
-        Args:
-            data: 连续特征数组，形状 [N, D] 或 [D,]
-            feature_names: 特征名列表，长度必须等于 D。若为 None，则使用全部 n_continuous 个连续特征
-            inverse: False=归一化, True=反归一化
-        
-        Returns:
-            处理后的数组，形状与输入相同
-        """
+    ) -> Union[np.ndarray, Any]:
+        """连续特征归一化/反归一化 (兼容 NumPy 和 PyTorch Tensor 以支持计算图)。"""
         self._ensure_config()
         
-        data = np.atleast_2d(np.asarray(data, dtype=np.float64))
-        n_samples, n_cols = data.shape
+        # 动态检测是否为 PyTorch 张量
+        is_tensor = 'Tensor' in type(data).__name__
+        if is_tensor:
+            import torch
+            data_2d = data if data.dim() >= 2 else data.unsqueeze(0)
+            result = data_2d.clone() # 必须 clone() 以防原地修改破坏梯度边界
+        else:
+            data_2d = np.atleast_2d(np.asarray(data, dtype=np.float64))
+            result = data_2d.copy()
+            
+        n_samples, n_cols = data_2d.shape
         
         if feature_names is None:
             feature_names = CONTINUOUS_FEATURE_NAMES
@@ -210,19 +211,15 @@ class UnifiedDataProcessor:
         if len(feature_names) != n_cols:
             raise ValueError(f"feature_names 长度 ({len(feature_names)}) 与数据列数 ({n_cols}) 不匹配")
         
-        result = data.copy()
-        
         for col_idx, name in enumerate(feature_names):
             if name in self._minmax_params:
                 min_val, max_val = self._minmax_params[name]
                 range_val = max_val - min_val
                 if range_val < 1e-9:
-                    range_val = 1.0  # 防止除零（如 SH 的 min=max=0）
+                    range_val = 1.0  # 防止除零
                 if inverse:
-                    # 反归一化: x = x' * range + min
                     result[:, col_idx] = result[:, col_idx] * range_val + min_val
                 else:
-                    # 归一化: x' = (x - min) / range
                     result[:, col_idx] = (result[:, col_idx] - min_val) / range_val
             
             elif name in self._maxabs_params:
@@ -233,44 +230,39 @@ class UnifiedDataProcessor:
                     result[:, col_idx] = result[:, col_idx] * abs_max
                 else:
                     result[:, col_idx] = result[:, col_idx] / abs_max
-            
             else:
-                # 未知特征名：不处理，保持原值（并发出警告）
                 print(f"[Processor] 警告: 连续特征 '{name}' 未在配置中找到归一化参数，保持原值")
         
-        return result.squeeze() if n_samples == 1 and data.ndim == 1 else result
+        if is_tensor:
+            return result.squeeze(0) if n_samples == 1 and data.dim() == 1 else result
+        else:
+            return result.squeeze() if n_samples == 1 and data.ndim == 1 else result
     
     def process_discrete(
         self,
-        data: np.ndarray,
+        data: Union[np.ndarray, Any],
         feature_names: Optional[List[str]] = None,
         inverse: bool = False
-    ) -> np.ndarray:
-        """离散特征编码/解码。
-        
-        编码: 原始值 → 索引（如 OT: 1→0, 2→1, 3→2）
-        解码: 索引 → 原始值
-        
-        Args:
-            data: 离散特征数组，形状 [N, D] 或 [D,]，整数类型
-            feature_names: 特征名列表，长度必须等于 D。若为 None，则使用全部离散特征
-            inverse: False=编码(value→index), True=解码(index→value)
-        
-        Returns:
-            处理后的整数数组，形状与输入相同
-        """
+    ) -> Union[np.ndarray, Any]:
+        """离散特征编码/解码 (兼容 NumPy 和 PyTorch Tensor)。"""
         self._ensure_config()
         
-        data = np.atleast_2d(np.asarray(data, dtype=np.int32))
-        n_samples, n_cols = data.shape
+        is_tensor = 'Tensor' in type(data).__name__
+        if is_tensor:
+            import torch
+            data_2d = data if data.dim() >= 2 else data.unsqueeze(0)
+            result = data_2d.clone()
+        else:
+            data_2d = np.atleast_2d(np.asarray(data, dtype=np.int32))
+            result = data_2d.copy()
+            
+        n_samples, n_cols = data_2d.shape
         
         if feature_names is None:
             feature_names = DISCRETE_FEATURE_NAMES
         
         if len(feature_names) != n_cols:
             raise ValueError(f"feature_names 长度 ({len(feature_names)}) 与数据列数 ({n_cols}) 不匹配")
-        
-        result = data.copy()
         
         for col_idx, name in enumerate(feature_names):
             if name not in self._discrete_mappings:
@@ -279,64 +271,67 @@ class UnifiedDataProcessor:
             
             mapping = self._discrete_inv_mappings[name] if inverse else self._discrete_mappings[name]
             
-            # 向量化映射：避免对每个样本的 Python 层循环，使用 NumPy 操作批量替换
-            col = result[:, col_idx].astype(np.int32)  # (n_samples,)
+            if is_tensor:
+                import torch
+                col = result[:, col_idx]
+                mapped_col = col.clone()
+                valid_mask = torch.zeros_like(col, dtype=torch.bool)
+                for k, v in mapping.items():
+                    # 对离散特征进行纯张量运算映射，避免破坏潜在计算图要求
+                    mask = (col == float(k))
+                    mapped_col[mask] = float(v)
+                    valid_mask |= mask
+                if not torch.all(valid_mask):
+                    raise ValueError(f"离散特征 '{name}' 存在非法值 (Tensor模式)")
+                result[:, col_idx] = mapped_col
+            else:
+                # 保留原有 numpy 的高效率 searchsorted 逻辑
+                col = result[:, col_idx].astype(np.int32)
+                keys = np.fromiter(mapping.keys(), dtype=np.int32)
+                vals = np.fromiter(mapping.values(), dtype=np.int32)
+                order = np.argsort(keys)
+                keys_s = keys[order]
+                vals_s = vals[order]
 
-            # 将 mapping 转为排序的 keys/values 数组，便于使用 searchsorted 进行向量化查找
-            keys = np.fromiter(mapping.keys(), dtype=np.int32) # (n_classes,)
-            vals = np.fromiter(mapping.values(), dtype=np.int32) # (n_classes,)
-            order = np.argsort(keys) # keys 的排序索引
-            keys_s = keys[order] # 排序后的 keys
-            vals_s = vals[order] # 对应的 values 已经按照 keys 排序
-
-            # 查找每个输入值在 keys_s 中的位置，并验证是否匹配
-            idxs = np.searchsorted(keys_s, col) # 在“有序”数组中查找每个元素应插入的位置（保持有序性）; 默认是左侧插入
-            valid_mask = (idxs < keys_s.size) & (keys_s[idxs] == col) # 排除那些插入位置等于 len(keys_s)（即 value 比所有 keys 都大）的情况，防止后面 keys_s[idxs] 越界索引 且 确保找到的 keys_s[idxs] 与 col 完全匹配（即确实存在于 keys 中）
-            if not np.all(valid_mask):
-                bad_vals = np.unique(col[~valid_mask]).tolist()
-                raise ValueError(
-                    f"离散特征 '{name}' 存在非法值: {bad_vals}，允许值: {sorted(keys_s.tolist())}"
-                )
-
-            # 使用索引批量替换（向量化）
-            result[:, col_idx] = vals_s[idxs]
+                idxs = np.searchsorted(keys_s, col)
+                valid_mask = (idxs < keys_s.size) & (keys_s[idxs] == col)
+                if not np.all(valid_mask):
+                    bad_vals = np.unique(col[~valid_mask]).tolist()
+                    raise ValueError(
+                        f"离散特征 '{name}' 存在非法值: {bad_vals}，允许值: {sorted(keys_s.tolist())}"
+                    )
+                result[:, col_idx] = vals_s[idxs]
         
-        return result.squeeze() if n_samples == 1 and data.ndim == 1 else result
+        if is_tensor:
+            return result.squeeze(0) if n_samples == 1 and data.dim() == 1 else result
+        else:
+            return result.squeeze() if n_samples == 1 and data.ndim == 1 else result
     
     def process_by_name(
         self,
-        values: np.ndarray,
+        values: Union[np.ndarray, Any],
         feature_names: List[str],
         inverse: bool = False
-    ) -> np.ndarray:
-        """通用接口：按特征名处理任意子集（自动分发到连续/离散处理）。
-        
-        此方法适用于 ARS_optim 策略网络输出的任意参数组合，无需预设固定的特征子集。
-        
-        Args:
-            values: 特征值数组，形状 [N, D] 或 [D,]
-            feature_names: 特征名列表，长度必须等于 D
-            inverse: False=归一化/编码, True=反归一化/解码
-        
-        Returns:
-            处理后的数组，形状与输入相同。
-            注意：若同时包含连续和离散特征，返回 float64 类型（离散值会被转为浮点）
-        """
+    ) -> Union[np.ndarray, Any]:
+        """通用接口：按特征名处理任意子集 (自动分发到连续/离散处理，完美兼容 Tensor)。"""
         self._ensure_config()
         
-        values = np.atleast_2d(np.asarray(values, dtype=np.float64))
-        n_samples, n_cols = values.shape
+        is_tensor = 'Tensor' in type(values).__name__
+        if is_tensor:
+            import torch
+            values_2d = values if values.dim() >= 2 else values.unsqueeze(0)
+            result = values_2d.clone()
+        else:
+            values_2d = np.atleast_2d(np.asarray(values, dtype=np.float64))
+            result = values_2d.copy()
+            
+        n_samples, n_cols = values_2d.shape
         
         if len(feature_names) != n_cols:
             raise ValueError(f"feature_names 长度 ({len(feature_names)}) 与数据列数 ({n_cols}) 不匹配")
         
-        result = values.copy()
-        
-        # 分离连续和离散特征的索引
-        cont_indices = []
-        cont_names = []
-        disc_indices = []
-        disc_names = []
+        cont_indices, cont_names = [], []
+        disc_indices, disc_names = [], []
         
         for idx, name in enumerate(feature_names):
             if name in CONTINUOUS_FEATURE_NAMES:
@@ -348,20 +343,24 @@ class UnifiedDataProcessor:
             else:
                 raise ValueError(f"未知特征名: '{name}'，不在 FEATURE_ORDER 中")
         
-        # 处理连续特征
         if cont_indices:
             cont_data = result[:, cont_indices]
             cont_processed = self.process_continuous(cont_data, cont_names, inverse=inverse)
             result[:, cont_indices] = cont_processed
-        
-        # 处理离散特征
+            
         if disc_indices:
-            disc_data = result[:, disc_indices].astype(np.int32)
+            disc_data = result[:, disc_indices]
             disc_processed = self.process_discrete(disc_data, disc_names, inverse=inverse)
-            result[:, disc_indices] = disc_processed.astype(np.float64)
+            if is_tensor:
+                # 显式投射到 result 的浮点精度，不产生中间 numpy
+                result[:, disc_indices] = disc_processed.to(result.dtype)
+            else:
+                result[:, disc_indices] = disc_processed.astype(np.float64)
         
-        return result.squeeze() if n_samples == 1 and values.ndim == 1 else result
-    
+        if is_tensor:
+            return result.squeeze(0) if n_samples == 1 and values.dim() == 1 else result
+        else:
+            return result.squeeze() if n_samples == 1 and values.ndim == 1 else result
     def process_all_features(
         self,
         x_raw: np.ndarray,

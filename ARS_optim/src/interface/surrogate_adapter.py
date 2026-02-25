@@ -1,192 +1,161 @@
-#src/interface/surrogate_adapter.py
-import sys
-import os
-import json
 import torch
 import torch.nn as nn
 import logging
-from typing import Dict, Any
-import importlib.util
+from typing import Dict, Tuple
 
-# 配置日志
-logger = logging.getLogger(__name__)
+# 引入全局损伤风险计算模块与特征顺序常量
+from common.metrics import injury_risk
+from common.settings import FEATURE_ORDER
+from src.core.param_manager import ParamManager
 
-class SurrogateModelAdapter(nn.Module):
+class SurrogateAdapter(nn.Module):
     """
-    代理模型适配器 (Adapter Pattern)
-    功能：
-    1. 封装原有的 InjuryPredictModel。
-    2. 自动从权重目录下的 JSON 文件读取模型结构参数。
-    3. 提供标准的 forward 接口，支持梯度回传到输入。
+    代理模型级联适配器 (Cascaded Surrogate Adapter)
+    将预训练的 PulsePredict 与 InjuryPredict 严格级联，封装为全流程可微的环境模拟器。
+    
+    核心机制 (计算流):
+    1. 组装物理尺度的状态参数(s)与决策参数(a) -> combined_phys [Batch, 13]
+    2. 特征归一化 -> combined_norm [Batch, 13] (保持 Tensor 梯度穿透)
+    3. PulsePredict 推理: f(combined_norm) -> waveform_norm (归一化波形)
+    4. InjuryPredict 推理: g(combined_norm, waveform_norm) -> predictions_phys (物理损伤)
+    5. 计算基于指数级权重的复合风险概率 (L_risk) 与越界软惩罚 (L_constraint)。
     """
-
-    def __init__(self, config: Dict[str, Any]):
-        """
-        Args:
-            config: 本项目的全局配置字典 (对应 default_config.yaml)
-        """
+    def __init__(self, pulse_model: nn.Module, injury_model: nn.Module, param_manager: ParamManager, config: dict, data_processor):
         super().__init__()
-        self.config = config
-        self.device = torch.device(config.get("device", "cpu"))
+        self.logger = logging.getLogger(self.__class__.__name__)
         
-        # 1. 路径设置与模块导入 (只导入类定义，不导入配置)
-        self._setup_imports()
+        self.pulse_model = pulse_model
+        self.injury_model = injury_model
+        self.param_manager = param_manager
         
-        # 2. 从权重目录加载模型结构配置
-        self.model_structure_params = self._load_model_config()
+        if data_processor is None:
+            raise ValueError("[致命错误] SurrogateAdapter 必须传入有效的 data_processor 实例！")
+        self.data_processor = data_processor
         
-        # 3. 初始化模型架构
-        self.model = self._build_model()
-        
-        # 4. 加载预训练权重
-        self._load_checkpoint()
-        
-        # 5. 冻结模型参数 (只优化输入, 不更新模型权重)
-        self._freeze_model()
-        
-        logger.info("Surrogate Model initialized and frozen successfully (Config loaded from some ...TrainingRecord.json).")
-
-    def _setup_imports(self):
-        """动态添加原项目路径到 sys.path，以便加载 utils.models"""
-        surrogate_dir = self.config['paths']['surrogate_project_dir']
-        abs_path = os.path.abspath(surrogate_dir) # 获取绝对路径
-        
-        if not os.path.exists(abs_path):
-            raise FileNotFoundError(f"Surrogate model project directory not found: {abs_path}")
-            
-        if abs_path not in sys.path:
-            sys.path.insert(0, abs_path) # 插入到 sys.path 前端
-            logger.debug(f"Added {abs_path} to sys.path")
-
-        try:
-            from utils import models
-            self.origin_models_module = models
-        except ImportError as e:
-            raise ImportError(f"Failed to import 'utils.models' from surrogate project: {e}")
-
-    def _load_model_config(self) -> Dict[str, Any]:
-        """
-        寻找并加载权重文件同目录下的 TrainingRecord.json
-        """
-        ckpt_path = self.config['paths']['surrogate_checkpoint']
-        ckpt_dir = os.path.dirname(ckpt_path) # 获取权重文件所在的目录
-        
-        # 配置文件名设为 TrainingRecord.json
-        json_path = os.path.join(ckpt_dir, "TrainingRecord.json")
-        
-        # 如果找不到，尝试搜索目录下的任意 json 文件
-        if not os.path.exists(json_path):
-            logger.warning(f"TrainingRecord.json not found at {json_path}. Searching for other .json files...")
-            json_files = [f for f in os.listdir(ckpt_dir) if f.endswith('.json')]
-            if len(json_files) == 1:
-                json_path = os.path.join(ckpt_dir, json_files[0])
-                logger.info(f"Found alternative config file: {json_files[0]}")
-            elif len(json_files) > 1:
-                raise FileNotFoundError(f"Multiple JSON files found in {ckpt_dir}. Please ensure 'TrainingRecord.json' exists.")
-            else:
-                raise FileNotFoundError(f"No JSON config file found in {ckpt_dir}. Cannot reconstruct model architecture.")
-
-        try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                record = json.load(f)
-            
-            # 提取模型参数部分
-            # 根据 train.py 结构: record["hyperparameters"]["model"]
-            if "hyperparameters" in record and "model" in record["hyperparameters"]:
-                return record["hyperparameters"]["model"]
-            else:
-                raise KeyError("Model configuration not found in JSON under 'hyperparameters.model'.")
-                
-        except Exception as e:
-            raise ValueError(f"Failed to parse model config from {json_path}: {e}")
-
-    def _build_model(self) -> nn.Module:
-        """根据 JSON 配置重建模型结构"""
-        mp = self.model_structure_params
-        
-        # 获取离散特征类别数 (从 JSON 读取)
-        num_classes_list = mp.get('num_classes_of_discrete')
-        
-        if num_classes_list is None:
-            # 兜底策略：如果 JSON 里实在没有，回退到默认值并警告
-            logger.warning("'num_classes_of_discrete' not found in JSON. Using default [1, 3].")
-            num_classes_list = [1, 3] 
-
-        # 实例化模型
-        try:
-            model = self.origin_models_module.InjuryPredictModel(
-                num_classes_of_discrete=num_classes_list,
-                Ksize_init=mp['Ksize_init'],
-                Ksize_mid=mp['Ksize_mid'],
-                num_blocks_of_tcn=mp['num_blocks_of_tcn'],
-                tcn_channels_list=mp['tcn_channels_list'],
-                tcn_output_dim=mp['tcn_output_dim'],
-                mlp_encoder_output_dim=mp['mlp_encoder_output_dim'],
-                mlp_decoder_output_dim=mp['mlp_decoder_output_dim'],
-                mlpE_hidden=mp['mlpE_hidden'],
-                mlpD_hidden=mp['mlpD_hidden'],
-                num_layers_of_mlpE=mp['num_layers_of_mlpE'],
-                num_layers_of_mlpD=mp['num_layers_of_mlpD'],
-                dropout_MLP=mp['dropout_MLP'], 
-                dropout_TCN=mp['dropout_TCN'],
-                use_channel_attention=mp['use_channel_attention'],
-                fixed_channel_weight=mp['fixed_channel_weight']
-            )
-            return model.to(self.device)
-        except KeyError as e:
-            raise KeyError(f"JSON config is missing required model parameter: {e}")
-
-    def _load_checkpoint(self):
-        """加载权重文件"""
-        ckpt_path = self.config['paths']['surrogate_checkpoint']
-        if not os.path.exists(ckpt_path):
-            raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
-            
-        logger.info(f"Loading surrogate weights from {ckpt_path}...")
-        
-        checkpoint = torch.load(ckpt_path, map_location=self.device)
-        
-        # 兼容性处理：如果保存的是整个 state_dict，直接加载
-        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-             self.model.load_state_dict(checkpoint['state_dict'])
-        else:
-             self.model.load_state_dict(checkpoint)
-
-    def _freeze_model(self):
-        """冻结模型所有参数，设置为 eval 模式"""
-        self.model.eval()
-        for param in self.model.parameters():
+        # 严苛约束：代理模型仅作为提供梯度的物理环境，严禁在寻优中发生权重更新
+        self.pulse_model.eval()
+        self.injury_model.eval()
+        for param in self.pulse_model.parameters():
             param.requires_grad = False
-
-    def forward(self, 
-                acc_waveforms: torch.Tensor, 
-                continuous_feats: torch.Tensor, 
-                discrete_feats: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播
-        """
-        # 确保输入在正确设备上
-        acc_waveforms = acc_waveforms.to(self.device)
-        continuous_feats = continuous_feats.to(self.device)
-        discrete_feats = discrete_feats.to(self.device)
-
-        preds, _, _ = self.model(acc_waveforms, continuous_feats, discrete_feats)
-        return preds
-
-    def get_input_gradients(self, 
-                          acc_waveforms: torch.Tensor, 
-                          continuous_feats: torch.Tensor, 
-                          discrete_feats: torch.Tensor) -> torch.Tensor:
-        """
-        辅助函数：计算 Loss 关于 continuous_feats 的梯度
-        """
-        if not continuous_feats.requires_grad:
-            continuous_feats.requires_grad_(True)
+        for param in self.injury_model.parameters():
+            param.requires_grad = False
             
-        preds = self.forward(acc_waveforms, continuous_feats, discrete_feats)
+        # 解析风险优化目标权重
+        obj_cfg = config.get('optimization', {}).get('objectives', {})
+        self.w_head = float(obj_cfg.get('weight_hic', 1.0))
+        self.w_chest = float(obj_cfg.get('weight_dmax', 1.0))
+        self.w_neck = float(obj_cfg.get('weight_nij', 1.0))
         
-        # 简单求和作为伪 Loss，触发自动微分引擎（Autograd），验证并计算输入张量（Input Tensor）的梯度
-        pseudo_loss = preds.sum()
-        pseudo_loss.backward()
+        if self.w_head <= 0 or self.w_chest <= 0 or self.w_neck <= 0:
+            raise ValueError("[致命配置错误] weight_hic, weight_dmax, weight_nij 必须全部为大于 0 的正值！")
+            
+        # 物理边界惩罚系数
+        self.weight_penalty = float(obj_cfg.get('weight_penalty', 10.0))
+
+    def forward(self, state_params: torch.Tensor, control_trainable: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        """
+        前向级联传播与全导向计算图 (Fully Differentiable Cascaded Graph) 构建。
         
-        return continuous_feats.grad
+        参数:
+            state_params: [Batch, D_state] 物理尺度的状态参数
+            control_trainable: [Batch, D_trainable] 物理尺度的可调约束系统参数 (a) 
+                # WARNING: [核心约束] 此张量必须具有 requires_grad=True 属性。
+            
+        返回:
+            total_loss: [Batch] 每个样本的融合标量损失
+            predictions_phys: [Batch, 3] 预测的物理损伤绝对值 (HIC15, Dmax, Nij)
+            info: 记录中间计算过程的监控字典
+        """
+        batch_size = state_params.shape[0]
+        device = state_params.device
+        total_dim = self.param_manager.get_total_feature_dim()
+        
+        # ==========================================
+        # 1. 组装输入张量 (物理尺度)
+        # ==========================================
+        # [Batch, 13]
+        combined_phys = torch.zeros((batch_size, total_dim), device=device, dtype=torch.float32)
+        
+        combined_phys[:, self.param_manager.get_state_indices()] = state_params
+        combined_phys[:, self.param_manager.get_control_trainable_indices()] = control_trainable
+        
+        fixed_indices, fixed_defaults = self.param_manager.get_control_fixed_defaults(device=device)
+        if len(fixed_indices) > 0:
+            # [Dim] -> [1, Dim] -> [Batch, Dim]
+            combined_phys[:, fixed_indices] = fixed_defaults.unsqueeze(0).expand(batch_size, -1)
+            
+        # ==========================================
+        # 2. 归一化特征 (保持梯度)
+        # ==========================================
+        # [Batch, 13] -> [Batch, 13]
+        model_input_norm = self.data_processor.process_by_name(
+            values=combined_phys, 
+            feature_names=FEATURE_ORDER, 
+            inverse=False
+        )
+            
+        # ==========================================
+        # 3. 代理模型级联推理 (PulsePredict -> InjuryPredict)
+        # ==========================================
+        # 3.1 碰撞波形预测
+        # 输入: 归一化 13维特征 -> 输出: 归一化波形 [Batch, Channels, SeqLen]
+        # TODO: [需确认] 此处调用方法严格依赖于 PulsePredict 的 forward 定义，默认其仅需特征张量输入。
+        waveform_norm = self.pulse_model(model_input_norm)
+        
+        # 3.2 损伤预测
+        # 输入: 归一化特征 + 归一化波形 -> 输出: 物理损伤 [Batch, 3]
+        # TODO: [需确认] 此处调用方法严格依赖于 InjuryPredict 的 forward 定义，假设其接收 (属性特征, 波形特征) 两个参数。
+        predictions_phys = self.injury_model(model_input_norm, waveform_norm)
+
+        # ==========================================
+        # 4. 摊销寻优计算：非线性联合风险项 L_risk
+        # ==========================================
+        hic15 = predictions_phys[:, 0]
+        dmax = predictions_phys[:, 1]
+        nij = predictions_phys[:, 2]
+        
+        # TODO: [需确认] 依赖 common/metrics/injury_risk.py 中的具体函数名获取 P(AIS3+) 概率
+        p_head = injury_risk.prob_hic15_ais3(hic15)
+        p_chest = injury_risk.prob_dmax_ais3(dmax)
+        p_neck = injury_risk.prob_nij_ais3(nij)
+        
+        # 极值截断: 防止后续指数运算发生 NaN 梯度崩溃
+        p_head = torch.clamp(p_head, 1e-6, 1.0 - 1e-6)
+        p_chest = torch.clamp(p_chest, 1e-6, 1.0 - 1e-6)
+        p_neck = torch.clamp(p_neck, 1e-6, 1.0 - 1e-6)
+        
+        # L_risk = 1 - (1-P_head)^w_head * (1-P_chest)^w_chest * (1-P_neck)^w_neck
+        term_head = torch.pow(1.0 - p_head, self.w_head)
+        term_chest = torch.pow(1.0 - p_chest, self.w_chest)
+        term_neck = torch.pow(1.0 - p_neck, self.w_neck)
+        
+        loss_risk = 1.0 - (term_head * term_chest * term_neck) # [Batch]
+        
+        # ==========================================
+        # 5. 摊销寻优计算：物理边界惩罚项 L_constraint
+        # ==========================================
+        min_bounds, max_bounds = self.param_manager.get_trainable_bounds(device=device)
+        
+        # [Batch, D_trainable]
+        exceed_max = torch.relu(control_trainable - max_bounds.unsqueeze(0))
+        exceed_min = torch.relu(min_bounds.unsqueeze(0) - control_trainable)
+        
+        loss_constraint = (exceed_max + exceed_min).sum(dim=1) # [Batch]
+        
+        # ==========================================
+        # 6. 总损失融合
+        # ==========================================
+        total_loss = loss_risk + self.weight_penalty * loss_constraint # [Batch]
+        
+        info = {
+            "loss_risk": loss_risk.detach(),
+            "loss_constraint": loss_constraint.detach(),
+            "p_head": p_head.detach(),
+            "p_chest": p_chest.detach(),
+            "p_neck": p_neck.detach(),
+            "hic15": hic15.detach(),
+            "dmax": dmax.detach(),
+            "nij": nij.detach()
+        }
+        
+        return total_loss, predictions_phys, info

@@ -1,315 +1,158 @@
-# src/core/param_manager.py
-
-import sys
-import os
-import torch
+import json
 import yaml
+import torch
 import logging
-import numpy as np
-from typing import Dict, Tuple, List, Any
-from common.data_utils.processor import UnifiedDataProcessor
-from common.settings import FEATURE_ORDER, CONTINUOUS_INDICES, DISCRETE_INDICES
+from typing import List, Tuple
 
-# 配置日志
-logger = logging.getLogger(__name__)
+# 引入全局项目设置中的特征顺序常量进行硬校验
+from common.settings import FEATURE_ORDER
 
 class ParamManager:
     """
-    参数管理器 (Parameter Manager)
-    
-    主要功能：
-    1. 解析 param_space.yaml 配置，建立物理参数名称与模型输入索引的映射关系。
-    2. 加载外部预处理器 (preprocessor)，构建物理空间到模型归一化空间的转换逻辑。
-    3. 提供支持批量化 (Batch) 的张量组装接口，将工况状态 (State) 与控制参数 (Action) 
-       合并为下游模型可接受的输入张量。
-    4. 维护控制参数的物理边界，支持优化过程中的截断 (Clamp) 操作。
+    参数空间管理器 (Parameter Space Manager) - 严格校验版
+    负责解析子项目专属的 param_space.yaml，并与全局的 normalization_config.json 及 common.settings 进行严格的一致性校验。
     """
-
-    def __init__(self, 
-                 param_space_path: str, 
-                 preprocessor_path: str,
-                 surrogate_project_dir: str,
-                 device: str = "cpu"):
-        """
-        初始化参数管理器。
-
-        Args:
-            param_space_path: 参数配置文件路径 (.yaml)
-            preprocessor_path: 预处理器配置路径 (data/normalization_config.json)
-            surrogate_project_dir: 代理模型项目根目录 (用于导入相关类定义)
-            device: 计算设备
-        """
-        self.device = device
+    def __init__(self, param_space_path: str, norm_config_path: str):
+        self.logger = logging.getLogger(self.__class__.__name__)
         
-        # 1. 环境准备与文件加载
-        self.params_config = self._load_yaml(param_space_path)
-        # 现在使用 common.UnifiedDataProcessor（JSON 配置），不再依赖 .joblib
-        self.processor = self._load_processor(preprocessor_path)
-        
-        # 2. 解析参数元数据
-        self._parse_parameter_metadata()
-        
-        # 3. 构建归一化张量 (Scale & Offset)
-        self._build_normalization_tensors()
-        
-        # 4. 构建优化边界张量
-        self._build_optimization_bounds()
-        
-        self.print_info()
-
-    def _setup_imports(self, project_dir: str):
-        """验证 surrogate 项目路径可达（不再向 sys.path 注入或依赖 DataProcessor）。"""
-        abs_path = os.path.abspath(project_dir)
-        if not os.path.exists(abs_path):
-            logger.warning(f"Surrogate project dir not found at {abs_path}; certain legacy flows may fail.")
-        return abs_path
-
-    def _load_yaml(self, path: str) -> Dict:
-        with open(path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
-
-    def _load_processor(self, path: str) -> UnifiedDataProcessor:
-        """加载 UnifiedDataProcessor 配置 (JSON)。
-        期望 path 指向 data/normalization_config.json（或等效文件）。
-        """
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Preprocessor config not found at: {path}")
-        proc = UnifiedDataProcessor(config_path=path)
-        ok = proc.load_config()
-        if not ok:
-            raise RuntimeError(f"Failed to load processor config from {path}")
-        return proc
-
-    def _parse_parameter_metadata(self):
-        """
-        根据配置文件建立参数索引映射。
-        区分连续/离散变量，以及状态/控制变量。
-        """
-        definitions = self.params_config['parameters']
-        
-        # 初始化索引容器
-        self.all_indices: List[int] = []
-        self.cont_indices: List[int] = []  # 连续变量索引
-        self.disc_indices: List[int] = []  # 离散变量索引
-        self.control_indices: List[int] = [] # 待优化的控制参数索引
-        
-        # 映射表: name -> config dict
-        self.param_map: Dict[str, dict] = {} 
-        
-        for p in definitions:
-            name = p['name']
-            idx = p['index']
-            role = p['role']
-            p_type = p['type']
+        # 1. 加载 ARS_optim 子项目定义的参数寻优空间配置文件
+        with open(param_space_path, 'r', encoding='utf-8') as f:
+            self.param_space_raw = yaml.safe_load(f)['parameters']
             
-            self.param_map[name] = p
-            self.all_indices.append(idx)
+        # 2. 加载全局项目共享的归一化配置文件
+        with open(norm_config_path, 'r', encoding='utf-8') as f:
+            self.norm_config = json.load(f)
             
-            # 按类型分类
-            if p_type == 'continuous':
-                self.cont_indices.append(idx)
-            elif p_type == 'discrete':
-                self.disc_indices.append(idx)
-            else:
-                raise ValueError(f"Unsupported parameter type '{p_type}' for {name}")
-                
-            # 按角色分类：只有标记为 trainable 的 control 参数才会被加入优化列表
-            if role == 'control' and p.get('trainable', True):
-                self.control_indices.append(idx)
+        self.all_params = []
+        self.state_params = []
+        self.control_trainable_params = []
+        self.control_fixed_params = []
         
-        # 转换为 LongTensor 以支持高级索引
-        self.cont_indices_t = torch.tensor(self.cont_indices, device=self.device, dtype=torch.long)
-        self.disc_indices_t = torch.tensor(self.disc_indices, device=self.device, dtype=torch.long)
+        # 依次执行解析与极其严格的校验机制
+        self._parse_parameters()
+        self._validate_feature_order()
+        self._validate_and_override_bounds()
+
+    def _parse_parameters(self):
+        """
+        解析并按照 index 升序排序参数。
+        严格强制校验重复索引以及必备的 default 键。
+        """
+        # 严格校验1：禁止重复的 index
+        indices = [p.get('index') for p in self.param_space_raw]
+        if len(indices) != len(set(indices)):
+            raise ValueError("[致命配置错误] param_space.yaml 中存在重复的 index 设定！")
+
+        sorted_params = sorted(self.param_space_raw, key=lambda x: x['index'])
         
-        # 计算特征维度
-        self.num_total = max(self.all_indices) + 1 if self.all_indices else 0
-        
-        logger.info(f"Param metadata parsed. Total features: {self.num_total}, Control vars: {len(self.control_indices)}")
-
-    def _build_normalization_tensors(self):
-        """
-        从 UnifiedDataProcessor 配置构建归一化张量（支持 MinMax / MaxAbs / discrete）。
-        """
-        proc: UnifiedDataProcessor = self.processor
-        # 波形缩放因子
-        self.waveform_factor = float(proc.config.get('waveform', {}).get('scale_factor', 1.0))
-
-        # 初始化 offset 和 scale 张量 (默认不缩放)
-        self.cont_offset = torch.zeros(self.num_total, device=self.device, dtype=torch.float32)
-        self.cont_scale = torch.ones(self.num_total, device=self.device, dtype=torch.float32)
-
-        # MinMax: proc._minmax_params -> {feature_name: (min, max)}
-        for name, (vmin, vmax) in proc._minmax_params.items():
-            if name not in FEATURE_ORDER:
-                continue
-            global_idx = FEATURE_ORDER.index(name)
-            if global_idx not in self.cont_indices:
-                continue
-            d_min = float(vmin)
-            d_max = float(vmax)
-            scale = d_max - d_min
-            if abs(scale) < 1e-8:
-                scale = 1.0
-            self.cont_offset[global_idx] = d_min
-            self.cont_scale[global_idx] = 1.0 / scale
-
-        # MaxAbs: proc._maxabs_params -> {feature_name: abs_max}
-        for name, abs_max in proc._maxabs_params.items():
-            if name not in FEATURE_ORDER:
-                continue
-            global_idx = FEATURE_ORDER.index(name)
-            if global_idx not in self.cont_indices:
-                continue
-            m_abs = float(abs_max)
-            if abs(m_abs) < 1e-8:
-                m_abs = 1.0
-            self.cont_offset[global_idx] = 0.0
-            self.cont_scale[global_idx] = 1.0 / m_abs
-
-        # 离散特征映射: proc._discrete_mappings -> name -> {value: index}
-        self.discrete_maps = {}
-        for name, mapping in proc._discrete_mappings.items():
-            if name not in FEATURE_ORDER:
-                continue
-            global_idx = FEATURE_ORDER.index(name)
-            if global_idx in self.disc_indices:
-                self.discrete_maps[global_idx] = mapping
-
-    def _build_optimization_bounds(self):
-        """
-        提取待优化控制参数的物理边界，用于后续的反归一化和截断操作。
-        """
-        mins = []
-        maxs = []
-        for idx in self.control_indices:
-            name = self._get_name_by_index(idx)
-            p = self.param_map[name]
-            mins.append(p['min'])
-            maxs.append(p['max'])
+        for p in sorted_params:
+            self.all_params.append(p)
+            role = p.get('role')
             
-        self.ctrl_min_t = torch.tensor(mins, device=self.device, dtype=torch.float32)
-        self.ctrl_max_t = torch.tensor(maxs, device=self.device, dtype=torch.float32)
-
-    def _get_name_by_index(self, idx: int) -> str:
-        """通过索引反查参数名称"""
-        for name, p in self.param_map.items():
-            if p['index'] == idx: return name
-        raise KeyError(f"Index {idx} not found in configuration.")
-
-    def print_info(self):
-        """打印参数管理器状态摘要"""
-        print(f"\n[ParamManager] Configured for {self.num_total} input features.")
-        print(f" - Continuous Indices: {self.cont_indices}")
-        print(f" - Discrete Indices: {self.disc_indices}")
-        print(f" - Control Indices (Optimization Targets): {self.control_indices}")
-
-    # =========================================================
-    #  核心功能: 批量化张量组装
-    # =========================================================
-
-    def create_base_params_tensor(self, state_dict_list: List[Dict[str, float]]) -> torch.Tensor:
-        """
-        将工况列表转换为基础物理参数张量。
-        此函数处理所有 State 参数的赋值，并为 Control 参数填充默认值 (如果有)。
-        
-        Args:
-            state_dict_list: 包含 N 个工况字典的列表
-            
-        Returns:
-            base_tensor: (N, Total_Features) 物理值张量
-        """
-        B = len(state_dict_list)
-        base_tensor = torch.zeros((B, self.num_total), device=self.device, dtype=torch.float32)
-        
-        # 遍历所有参数定义，从输入 dict 或默认配置中取值
-        for name, config in self.param_map.items():
-            idx = config['index']
-            default_val = config.get('default', 0.0)
-            
-            # 逐个样本填充
-            for i, state in enumerate(state_dict_list):
-                if name in state:
-                    base_tensor[i, idx] = float(state[name])
+            # 状态参数（不可控的环境/乘员变量）
+            if role == 'state':
+                self.state_params.append(p)
+            # 决策参数（约束系统的可控变量）
+            elif role == 'control':
+                trainable = p.get('trainable', False)
+                if trainable:
+                    self.control_trainable_params.append(p)
                 else:
-                    # 如果输入 dict 中缺失该参数，使用 config 中的 default
-                    base_tensor[i, idx] = float(default_val)
+                    # 严格校验2：固定控制参数必须具备 default 键，严禁使用隐性默认值(如0.0)
+                    if 'default' not in p:
+                        raise ValueError(f"[致命配置错误] 不可调控制参数 (trainable=False) '{p['name']}' 缺失 'default' 键！")
+                    self.control_fixed_params.append(p)
+            else:
+                raise ValueError(f"[致命配置错误] 参数 '{p['name']}' 的 role 属性异常: '{role}' (仅支持 state 或 control)")
+
+    def _validate_feature_order(self):
+        """
+        严格校验 param_space.yaml 中的参数定义是否与 common.settings.FEATURE_ORDER 完全一致。
+        任何名称或顺序的错位都会破坏代理模型的输入张量结构。
+        """
+        # 严格校验3：特征总数必须一致
+        if len(self.all_params) != len(FEATURE_ORDER):
+            raise ValueError(
+                f"[致命特征错位] 参数数量不匹配！\n"
+                f"param_space.yaml 定义了 {len(self.all_params)} 个参数，\n"
+                f"但 common.settings.FEATURE_ORDER 规定为 {len(FEATURE_ORDER)} 个。"
+            )
+            
+        for i, p in enumerate(self.all_params):
+            # 严格校验4：Index 的连续性与一致性
+            if p['index'] != i:
+                raise ValueError(f"[致命特征错位] 参数 '{p['name']}' 的 index ({p['index']}) 与其实际排序位置 ({i}) 不符！")
+            
+            # 严格校验5：特征名称必须与全局常量完全吻合
+            if p['name'] != FEATURE_ORDER[i]:
+                raise ValueError(
+                    f"[致命特征错位] 特征语义顺序不一致！\n"
+                    f"param_space.yaml 中 index={i} 的特征命名为 '{p['name']}'，\n"
+                    f"但 settings.FEATURE_ORDER 中严格约束该列应为 '{FEATURE_ORDER[i]}'。"
+                )
+
+    def _validate_and_override_bounds(self):
+        """
+        校验 param_space.yaml 与 normalization_config.json 物理边界的一致性。
+        当存在差异时，抛出警告，并逻辑上强制以 param_space.yaml (局部寻优约束) 为准。
+        """
+        minmax_stats = self.norm_config.get("continuous", {}).get("minmax", {}).get("stats", {})
+        maxabs_stats = self.norm_config.get("continuous", {}).get("maxabs", {}).get("stats", {})
+
+        for p in self.all_params:
+            if p.get("type") != "continuous":
+                continue
+
+            name = p["name"]
+            p_min = p.get("min")
+            p_max = p.get("max")
+            
+            if p_min is None or p_max is None:
+                raise ValueError(f"[致命配置错误] 连续变量 '{name}' 必须在 param_space.yaml 中明确配置 'min' 和 'max' 极值。")
+
+            norm_min, norm_max = None, None
+            # 从全局 json 中提取该参数的统计边界
+            if name in minmax_stats:
+                norm_min = minmax_stats[name]["min"]
+                norm_max = minmax_stats[name]["max"]
+            elif name in maxabs_stats:
+                norm_min = -maxabs_stats[name]["abs_max"]
+                norm_max = maxabs_stats[name]["abs_max"]
+
+            # 若比对发现差异（考虑浮点数精度截断，设阈值 1e-4）
+            if norm_min is not None and norm_max is not None:
+                if abs(p_min - norm_min) > 1e-4 or abs(p_max - norm_max) > 1e-4:
+                    self.logger.warning(
+                        f"[参数边界冲突] {name}: 全局归一化边界 [{norm_min}, {norm_max}] "
+                        f"与 ARS寻优边界 [{p_min}, {p_max}] 不一致。将强制以 ARS寻优边界 为准。"
+                    )
                     
-        return base_tensor
+    def get_total_feature_dim(self) -> int:
+        return len(self.all_params)
 
-    def get_model_input_from_tensor(self, 
-                                    base_params: torch.Tensor, 
-                                    action_tensor: torch.Tensor,
-                                    waveform_tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        组装模型输入张量。
-        将当前的控制参数 (Action) 覆盖到基础参数张量 (Base Params) 中，并执行归一化。
+    def get_state_dim(self) -> int:
+        return len(self.state_params)
         
-        Args:
-            base_params: (B, Total_Features) 基础物理参数张量
-            action_tensor: (B, N_Controls) 当前优化的控制参数物理值
-            waveform_tensor: (B, 2, 150) 物理波形张量
-            
-        Returns:
-            acc_norm: (B, 2, 150) 归一化后的波形
-            cont_norm: (B, N_Cont) 归一化后的连续特征
-            disc_enc: (B, N_Disc) 编码后的离散特征索引
-        """
-        # 1. 融合 Action：使用 clone 确保不修改原始 base_params
-        current_phys = base_params.clone()
-        
-        # 将 Action 填入对应的 Control 列
-        # 注意：这里假设 action_tensor 的列顺序与 self.control_indices 的顺序一致
-        for i, global_idx in enumerate(self.control_indices):
-            current_phys[:, global_idx] = action_tensor[:, i]
-            
-        # 2. 连续特征归一化
-        # 提取连续特征列
-        cont_phys = current_phys[:, self.cont_indices_t] # (B, N_Cont)
-        
-        # 获取对应的 offset/scale 并执行线性变换
-        c_offset = self.cont_offset[self.cont_indices_t]
-        c_scale = self.cont_scale[self.cont_indices_t]
-        cont_norm = (cont_phys - c_offset) * c_scale
-        
-        # 3. 离散特征编码
-        # 提取离散特征列 (物理值)
-        disc_phys = current_phys[:, self.disc_indices_t] # (B, N_Disc)
-        
-        disc_enc_list = []
-        # 对每一列离散特征进行查表编码
-        for i, global_idx in enumerate(self.disc_indices):
-            col_vals = disc_phys[:, i].cpu().numpy() # 查表操作在 CPU 执行
-            mapping = self.discrete_maps[global_idx]
-            
-            # 向量化查表
-            # 若遇到未知值，默认映射为 0 (通常为 class 0)
-            encoded_col = [mapping.get(int(v), 0) for v in col_vals]
-            disc_enc_list.append(encoded_col)
-            
-        # 堆叠为 (B, N_Disc) 张量
-        if disc_enc_list:
-            disc_enc = torch.tensor(disc_enc_list, device=self.device, dtype=torch.long).t()
-        else:
-            # 处理无离散特征的边缘情况
-            disc_enc = torch.zeros((len(base_params), 0), device=self.device, dtype=torch.long)
-        
-        # 4. 波形归一化
-        acc_norm = waveform_tensor / self.waveform_factor
-        
-        return acc_norm, cont_norm, disc_enc
+    def get_trainable_dim(self) -> int:
+        return len(self.control_trainable_params)
 
-    def normalize_action(self, action_phys: torch.Tensor) -> torch.Tensor:
-        """
-        将物理空间的控制参数映射到优化空间 [-1, 1]。
-        公式: y = 2 * (x - min) / (max - min) - 1
-        """
-        return 2.0 * (action_phys - self.ctrl_min_t) / (self.ctrl_max_t - self.ctrl_min_t) - 1.0
+    def get_state_indices(self) -> List[int]:
+        return [p['index'] for p in self.state_params]
 
-    def denormalize_action(self, action_opt: torch.Tensor) -> torch.Tensor:
-        """
-        将优化空间的控制参数 [-1, 1] 映射回物理空间。
-        公式: x = 0.5 * (y + 1) * (max - min) + min
-        同时执行数值截断，确保物理值不越界。
-        """
-        action_opt = torch.clamp(action_opt, -1.0, 1.0)
-        return 0.5 * (action_opt + 1.0) * (self.ctrl_max_t - self.ctrl_min_t) + self.ctrl_min_t
+    def get_control_trainable_indices(self) -> List[int]:
+        return [p['index'] for p in self.control_trainable_params]
+
+    def get_control_fixed_indices(self) -> List[int]:
+        return [p['index'] for p in self.control_fixed_params]
+
+    def get_trainable_bounds(self, device: torch.device = torch.device('cpu')) -> Tuple[torch.Tensor, torch.Tensor]:
+        mins = [p['min'] for p in self.control_trainable_params]
+        maxs = [p['max'] for p in self.control_trainable_params]
+        return torch.tensor(mins, dtype=torch.float32, device=device), \
+               torch.tensor(maxs, dtype=torch.float32, device=device)
+
+    def get_control_fixed_defaults(self, device: torch.device = torch.device('cpu')) -> Tuple[List[int], torch.Tensor]:
+        indices = [p['index'] for p in self.control_fixed_params]
+        # 由于在 _parse_parameters 中已做硬校验，此处 p['default'] 必然存在，直接提取
+        defaults = [p['default'] for p in self.control_fixed_params]
+        return indices, torch.tensor(defaults, dtype=torch.float32, device=device)
