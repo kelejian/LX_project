@@ -11,15 +11,32 @@ class ParamManager:
     """
     参数空间管理器 (Parameter Space Manager) - 严格校验版
     负责解析子项目专属的 param_space.yaml，并与全局的 normalization_config.json 及 common.settings 进行严格的一致性校验。
+
+    构造器支持两种用法：
+      1. 传入文件路径：
+         ParamManager('path/to/param_space.yaml', 'path/to/norm.json')
+      2. 传入已解析的 dict（通常用于测试或交互式场景）
+         ParamManager(param_space_dict, norm_config_path=None)
+    若第二个参数省略，将使用 common.settings.NORMALIZATION_CONFIG_PATH。
     """
-    def __init__(self, param_space_path: str, norm_config_path: str):
+    def __init__(self, param_space_path_or_dict, norm_config_path: str = None):
         self.logger = logging.getLogger(self.__class__.__name__)
-        
-        # 1. 加载 ARS_optim 子项目定义的参数寻优空间配置文件
-        with open(param_space_path, 'r', encoding='utf-8') as f:
-            self.param_space_raw = yaml.safe_load(f)['parameters']
-            
-        # 2. 加载全局项目共享的归一化配置文件
+
+        # --------------- 解析参数空间 ----------------
+        if isinstance(param_space_path_or_dict, dict):
+            # 直接给定了加载后的 dict（适用于单元测试）
+            self.param_space_raw = param_space_path_or_dict.get('parameters', [])
+        else:
+            # 视为文件路径
+            with open(param_space_path_or_dict, 'r', encoding='utf-8') as f:
+                self.param_space_raw = yaml.safe_load(f)['parameters']
+
+        # --------------- 解析归一化配置 ----------------
+        if norm_config_path is None:
+            # 使用全局常量作为默认值
+            from common.settings import NORMALIZATION_CONFIG_PATH
+            norm_config_path = str(NORMALIZATION_CONFIG_PATH)
+
         with open(norm_config_path, 'r', encoding='utf-8') as f:
             self.norm_config = json.load(f)
             
@@ -32,6 +49,8 @@ class ParamManager:
         self._parse_parameters()
         self._validate_feature_order()
         self._validate_and_override_bounds()
+        # 额外校验：每个连续变量在归一化配置中必须存在统计边界
+        self._check_norm_presence()
 
     def _parse_parameters(self):
         """
@@ -156,3 +175,16 @@ class ParamManager:
         # 由于在 _parse_parameters 中已做硬校验，此处 p['default'] 必然存在，直接提取
         defaults = [p['default'] for p in self.control_fixed_params]
         return indices, torch.tensor(defaults, dtype=torch.float32, device=device)
+
+    # ------------------------------------------------------------------
+    def _check_norm_presence(self):
+        """
+        验证每个连续参数在全局归一化配置中有对应的统计边界。
+        如果发现某参数既不在 minmax 统计也不在 maxabs 统计中，则抛出异常。
+        """
+        cont_names = [p['name'] for p in self.all_params if p.get('type') == 'continuous']
+        minmax_stats = self.norm_config.get('continuous', {}).get('minmax', {}).get('stats', {})
+        maxabs_stats = self.norm_config.get('continuous', {}).get('maxabs', {}).get('stats', {})
+        missing = [n for n in cont_names if n not in minmax_stats and n not in maxabs_stats]
+        if missing:
+            raise ValueError(f"[规范错误] 以下连续参数在归一化配置中缺失统计边界: {missing}")

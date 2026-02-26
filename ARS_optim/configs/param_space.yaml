@@ -12,18 +12,24 @@ parameters:
     index: 0
     role: "state"
     type: "continuous"
+    min: 23.5
+    max: 65.0
     default: 56.0
 
   - name: "impact_angle"
     index: 1
     role: "state"
     type: "continuous"
+    min: -45
+    max: 45
     default: 0.0
 
   - name: "overlap"
     index: 2
     role: "state"
     type: "continuous"
+    min: -1.0
+    max: 1.0
     default: 1.0
 
   # --- 2. 连续型控制参数 (Control) ---
@@ -72,23 +78,32 @@ parameters:
     trainable: True
     default: 20.0
 
-  # --- 3. 乘员与座椅状态 (State) ---
+  # --- 3. 座椅参数（control） ---
   - name: "SP"
     index: 8
-    role: "state"
+    role: "control"
     type: "continuous"
+    min: -110.0
+    max: 110.0
+    trainable: False
     default: 0.0
 
   - name: "SH"
     index: 9
-    role: "state"
+    role: "control"
     type: "continuous"
+    min: 0.0
+    max: 60.0
+    trainable: False
     default: 0.0
 
   - name: "RA"
     index: 10
-    role: "state"
+    role: "control"
     type: "continuous"
+    min: 15.0
+    max: 40.0
+    trainable: False
     default: 25.0
 
   # --- 4. 离散型状态参数 (State) ---

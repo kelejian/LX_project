@@ -1,4 +1,4 @@
 # src/interface/__init__.py
-from .surrogate_adapter import SurrogateModelAdapter
+from .surrogate_adapter import SurrogateAdapter
 
-__all__ = ["SurrogateModelAdapter"]
+__all__ = ["SurrogateAdapter"]

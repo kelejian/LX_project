@@ -3,163 +3,192 @@ import yaml
 import torch
 import pandas as pd
 import logging
-from tqdm import tqdm
+import argparse
 from pathlib import Path
 
-# 引入项目全局依赖
-from common.settings import NORMALIZATION_CONFIG_PATH
 from common.data_utils.processor import UnifiedDataProcessor
+from common.settings import FEATURE_ORDER, NORMALIZATION_CONFIG_PATH, PULSE_PREDICT_DIR, INJURY_PREDICT_DIR
+from PulsePredict.model.model import HybridPulseCNN
+from InjuryPredict.utils.models import InjuryPredictModel
 
-# 引入子项目核心模块
 from ARS_optim.src.core.param_manager import ParamManager
 from ARS_optim.src.core.constraints import PhysicalConstraintManager
-from ARS_optim.src.core.optimizer import ARSLocalOptimizer
 from ARS_optim.src.interface.surrogate_adapter import SurrogateAdapter
 from ARS_optim.src.models.strategy_net import StrategyNet
+from ARS_optim.src.core.optimizer import ARSLocalOptimizer
 
-# TODO: [需确认] 替换为您实际的模型类
-from PulsePredict.model.model import HybridPulseCNN 
-from InjuryPredict.utils.models import InjuryPredictModel  
+
+def _resolve_checkpoint_path(base_dir: Path, cfg_value: str) -> str:
+    """
+    统一解析 checkpoint 路径：
+    - 支持历史配置里误写的 r'...'/r"..." 文本
+    - 去除前导斜杠，强制按“相对子路径”拼接到 base_dir
+    """
+    if cfg_value is None:
+        return ""
+    raw = str(cfg_value).strip()
+    if (raw.startswith("r'") and raw.endswith("'")) or (raw.startswith('r"') and raw.endswith('"')):
+        raw = raw[2:-1]
+    raw = raw.strip().lstrip("/\\")
+    return str(base_dir / Path(raw))
 
 def setup_logger():
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    return logging.getLogger("EvaluateARS")
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+    return logging.getLogger("Evaluator")
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="ARS Local Refinement Evaluator")
+    parser.add_argument('--input_csv', type=str, required=True, help="输入的本地工况参数CSV文件路径")
+    parser.add_argument('--output_csv', type=str, default='evaluation_results.csv', help="输出的对比结果CSV文件路径")
+    parser.add_argument('--strategy_ckpt', type=str, default=None,
+                        help="可选：策略网络权重文件路径，若指定则加载并启用直推模式")
+    parser.add_argument('--direct_inference', action='store_true',
+                        help="启用策略网络直推（忽略 config 中的相应设置）")
+    return parser.parse_args()
 
 def main():
+    args = parse_args()
     logger = setup_logger()
-    logger.info("="*60)
-    logger.info("启动 ARS_optim 在线评估流水线 (Evaluation Pipeline)")
-    logger.info("="*60)
-
-    # 1. 路径与输入文件配置
-    # TODO: [假设] 用户提供需要被评估的工况数据 (仅含状态参数)
-    input_csv_path = "ARS_optim/input_cases.csv" 
-    output_csv_path = "ARS_optim/output_results.csv"
     
-    if not os.path.exists(input_csv_path):
-        raise FileNotFoundError(f"[致命错误] 找不到输入数据文件: {input_csv_path}")
-
-    config_path = Path("ARS_optim/configs/default_config.yaml")
-    with open(config_path, 'r', encoding='utf-8') as f:
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    cfg_path = os.path.join(base_dir, 'configs', 'default_config.yaml')
+    if not os.path.isfile(cfg_path):
+        raise FileNotFoundError(f"config file not found: {cfg_path}")
+    with open(cfg_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-        
-    device = torch.device(config.get("device", "cpu"))
-    
-    # 2. 初始化底层基建
-    param_manager = ParamManager(
-        param_space_path="ARS_optim/configs/param_space.yaml",
-        norm_config_path=NORMALIZATION_CONFIG_PATH
-    )
-    constraint_manager = PhysicalConstraintManager(param_manager)
-    processor = UnifiedDataProcessor(config_path=NORMALIZATION_CONFIG_PATH)
-    processor.load_config()
 
-    # 3. 加载代理模型环境
-    # TODO: [需确认] 请加入您真实的权重加载逻辑
-    pulse_model = HybridPulseCNN().to(device) 
+    # basic validation
+    if 'surrogate' not in config:
+        raise KeyError("配置文件中缺失 'surrogate' 部分，请检查配置。")
+    if 'optimization' not in config:
+        logger.warning("配置文件中缺失 'optimization' 部分，将使用默认设置。")
+    if 'evaluation' not in config:
+        logger.warning("配置文件中缺失 'evaluation' 部分，将使用默认设置。")
+
+    eval_cfg = config.get('evaluation', {})
+    device = torch.device(eval_cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
+
+    param_space_path = os.path.join(base_dir, 'configs', 'param_space.yaml')
+    param_manager = ParamManager(param_space_path)
+    constraint_manager = PhysicalConstraintManager(param_manager)
+    data_processor = UnifiedDataProcessor(str(NORMALIZATION_CONFIG_PATH))
+
+    # 加载代理模型权重路径
+    pulse_model = HybridPulseCNN(GauNll_use=False).to(device)
+    pulse_ckpt = _resolve_checkpoint_path(Path(PULSE_PREDICT_DIR), config.get('surrogate', {}).get('pulse_checkpoint', ''))
+    if not os.path.isfile(pulse_ckpt):
+        raise FileNotFoundError(f"pulse model checkpoint not found: {pulse_ckpt}")
+    pulse_model.load_state_dict(torch.load(pulse_ckpt, map_location=device))
+
     injury_model = InjuryPredictModel(num_classes_of_discrete=[2, 3]).to(device)
+    inj_ckpt = _resolve_checkpoint_path(Path(INJURY_PREDICT_DIR), config.get('surrogate', {}).get('checkpoint_rel_path', ''))
+    if not os.path.isfile(inj_ckpt):
+        raise FileNotFoundError(f"injury model checkpoint not found: {inj_ckpt}")
+    injury_model.load_state_dict(torch.load(inj_ckpt, map_location=device))
     
-    surrogate_env = SurrogateAdapter(
-        pulse_model=pulse_model, injury_model=injury_model,
-        param_manager=param_manager, config=config, data_processor=processor
+    surrogate = SurrogateAdapter(
+        pulse_model=pulse_model, injury_model=injury_model, 
+        param_manager=param_manager, config=config, data_processor=data_processor
     ).to(device)
 
-    # 4. 根据 direct_inference 加载策略网络
-    is_direct_infer = config['optimization'].get('direct_inference', False)
-    strategy_net = None
-    if is_direct_infer:
-        logger.info("[模式] 开启 StrategyNet 直推 + 局部精调")
-        strategy_net = StrategyNet(
-            param_manager=param_manager, constraint_manager=constraint_manager,
-            hidden_dims=config['strategy_net']['hidden_dims']
-        ).to(device)
-        # TODO: 加载训练好的权重
-        # weight_path = "ARS_optim/saved_models/strategy_net_best.pth"
-        # strategy_net.load_state_dict(torch.load(weight_path, map_location=device)['state_dict'])
-        strategy_net.eval()
-    else:
-        logger.info("[模式] 关闭 StrategyNet，仅使用 Default 起点执行局部精调")
+    strat_cfg = config.get('strategy_net', {})
+    strategy_net = StrategyNet(
+        param_manager=param_manager,
+        constraint_manager=constraint_manager,
+        hidden_dims=strat_cfg.get('hidden_dims', [128, 256, 128]),
+        activation=strat_cfg.get('activation', 'LeakyReLU'),
+        dropout=float(strat_cfg.get('dropout', 0.0)),
+        pulse_channels=int(strat_cfg.get('pulse_channels', 2)),
+        pulse_embed_dim=int(strat_cfg.get('pulse_embed_dim', 32)),
+    ).to(device)
 
-    # 初始化寻优引擎
+    # 允许通过命令行覆盖 config 里的设置
+    if args.strategy_ckpt:
+        if not os.path.isfile(args.strategy_ckpt):
+            raise FileNotFoundError(f"指定的策略网络权重不存在: {args.strategy_ckpt}")
+        strategy_net.load_state_dict(torch.load(args.strategy_ckpt, map_location=device))
+        logger.info(f"已加载策略网络权重: {args.strategy_ckpt}")
+        config['optimization']['direct_inference'] = True
+    if args.direct_inference:
+        logger.info("命令行指定启用直接推理模式 (direct_inference)")
+        config['optimization']['direct_inference'] = True
+
+    # 实例化核心寻优引擎
     optimizer = ARSLocalOptimizer(
-        config=config, param_manager=param_manager, 
-        constraint_manager=constraint_manager, 
-        surrogate=surrogate_env, strategy_net=strategy_net
+        config=config, param_manager=param_manager, constraint_manager=constraint_manager,
+        surrogate=surrogate, strategy_net=strategy_net
     )
 
-    # 5. 读取数据并校验列名
-    df_input = pd.read_csv(input_csv_path)
+    # 1. 解析输入 CSV
+    logger.info(f"读取输入工况文件: {args.input_csv}")
+    df_input = pd.read_csv(args.input_csv)
+    
+    # 提取状态特征并转换为物理张量
     state_names = [p['name'] for p in param_manager.state_params]
-    missing_cols = [col for col in state_names if col not in df_input.columns]
-    if missing_cols:
-        raise ValueError(f"输入 CSV 缺失必需的状态参数列: {missing_cols}")
-
-    # 将工况参数转换为 Tensor
+    for col in state_names:
+        if col not in df_input.columns:
+            raise ValueError(f"输入 CSV 缺失必填状态列: {col}")
+            
     state_tensor = torch.tensor(df_input[state_names].values, dtype=torch.float32, device=device)
-    batch_size = state_tensor.shape[0]
-    
-    logger.info(f"成功读取待优化工况: {batch_size} 条")
 
-    # ==========================================
-    # 6. 计算 Baseline (优化前：输入Default动作)
-    # ==========================================
-    logger.info(">>> 正在计算 Baseline (未经优化的默认损伤)...")
+    # 2. 算力复用执行推理
+    logger.info("开始执行基线推断与联合局部精调...")
+    
+    # 构造仅包含可训练参数的 baseline 动作向量（SurrogateAdapter 只看 trainable 部分）
     trainable_defaults = [p['default'] for p in param_manager.control_trainable_params]
-    base_actions = torch.tensor(trainable_defaults, dtype=torch.float32, device=device).unsqueeze(0).expand(batch_size, -1)
-    
+    baseline_trainable = torch.tensor(trainable_defaults, dtype=torch.float32, device=device)
+    baseline_trainable = baseline_trainable.unsqueeze(0).expand(state_tensor.shape[0], -1)
+
+    # 同时准备完整的“基线控制参数”用于结果输出（可调 + 固定）
+    fixed_idxs, fixed_defaults = param_manager.get_control_fixed_defaults(device=device)
+    if fixed_defaults.numel() > 0:
+        full_baseline = torch.cat([baseline_trainable, fixed_defaults.unsqueeze(0).expand(state_tensor.shape[0], -1)], dim=1)
+    else:
+        full_baseline = baseline_trainable
+
     with torch.no_grad():
-        base_loss, base_preds_phys, base_info = surrogate_env(state_tensor, base_actions)
+        pulse_norm = surrogate.generate_pulse(state_tensor)
+        # 评测 Baseline 损伤值，同时记录损失信息
+        baseline_loss_batch, baseline_preds, baseline_info = surrogate.predict_injury_and_loss(state_tensor, baseline_trainable, pulse_norm)
 
-    # ==========================================
-    # 7. 计算 Optimized (执行在线寻优)
-    # ==========================================
-    logger.info(f">>> 正在执行 ARS 在线寻优 (精调步数={optimizer.refine_steps})...")
-    opt_actions, opt_preds_phys, opt_info = optimizer.optimize(state_tensor)
+    # 执行 StrategyNet 零次推断 + 局部反向微调
+    optimized_actions, optimized_preds, opt_info = optimizer.optimize(state_tensor)
 
-    # ==========================================
-    # 8. 组装结果并保存
-    # ==========================================
-    trainable_names = [p['name'] for p in param_manager.control_trainable_params]
-    
-    # 提取评估数据并转为 numpy
-    base_act_np = base_actions.cpu().numpy()
-    opt_act_np = opt_actions.cpu().numpy()
-    base_inj_np = base_preds_phys.cpu().numpy()
-    opt_inj_np = opt_preds_phys.cpu().numpy()
-    
-    # 构建对比结果字典
-    results_dict = {}
-    # 1. 填入环境状态
-    for i, name in enumerate(state_names):
-        results_dict[name] = df_input[name].values
-        
-    # 2. 填入动作对比
-    for i, name in enumerate(trainable_names):
-        results_dict[f"Baseline_{name}"] = base_act_np[:, i]
-        results_dict[f"Optimized_{name}"] = opt_act_np[:, i]
-        
-    # 3. 填入损伤对比 (0:HIC, 1:Dmax, 2:Nij)
-    results_dict["Baseline_HIC15"] = base_inj_np[:, 0]
-    results_dict["Optimized_HIC15"] = opt_inj_np[:, 0]
-    results_dict["Baseline_Dmax"] = base_inj_np[:, 1]
-    results_dict["Optimized_Dmax"] = opt_inj_np[:, 1]
-    results_dict["Baseline_Nij"] = base_inj_np[:, 2]
-    results_dict["Optimized_Nij"] = opt_inj_np[:, 2]
-    
-    # 计算综合风险下降率
-    base_risk = base_info['loss_risk'].cpu().numpy()
-    opt_risk = opt_info['loss_risk'].cpu().numpy()
-    results_dict["Baseline_TotalRisk"] = base_risk
-    results_dict["Optimized_TotalRisk"] = opt_risk
-    results_dict["Risk_Reduction(%)"] = (base_risk - opt_risk) / (base_risk + 1e-8) * 100.0
+    # 日志一些简要指标
+    logger.info(f"优化耗时: {opt_info.get('time_cost', float('nan')):.6f} s")
+    if 'initial' in opt_info:
+        logger.info(f"初始平均损伤: {opt_info['initial'].get('loss_mean', float('nan')):.4f}")
+    if baseline_loss_batch is not None:
+        mean_base = baseline_loss_batch.mean().item()
+        logger.info(f"基线平均损伤: {mean_base:.4f}")
 
-    df_output = pd.DataFrame(results_dict)
-    df_output.to_csv(output_csv_path, index=False)
-    
-    logger.info("="*60)
-    logger.info(f"评估完成！结果已保存至: {output_csv_path}")
-    logger.info(f"平均综合风险: 优化前={base_risk.mean():.4f} -> 优化后={opt_risk.mean():.4f}")
-    logger.info("="*60)
+    # 3. 结果合并与输出
+    # 基线/优化完整控制参数（含固定）
+    control_names = [p['name'] for p in param_manager.control_trainable_params]
+    fixed_names = [p['name'] for p in param_manager.control_fixed_params]
+    all_control_names = control_names + fixed_names
+    df_base_ctrl = pd.DataFrame(full_baseline.cpu().numpy(), columns=[f"Base_{n}" for n in all_control_names])
+    if fixed_defaults.numel() > 0:
+        full_optimized = torch.cat([optimized_actions, fixed_defaults.unsqueeze(0).expand(state_tensor.shape[0], -1)], dim=1)
+    else:
+        full_optimized = optimized_actions
+    df_opt_actions = pd.DataFrame(full_optimized.cpu().numpy(), columns=[f"Opt_{n}" for n in all_control_names])
+
+    # 拼装损伤对比
+    df_baseline_inj = pd.DataFrame(baseline_preds.cpu().numpy(), columns=['Base_HIC', 'Base_Dmax', 'Base_Nij'])
+    df_opt_inj = pd.DataFrame(optimized_preds.cpu().numpy(), columns=['Opt_HIC', 'Opt_Dmax', 'Opt_Nij'])
+    # add loss columns if available
+    df_base_loss = pd.DataFrame(baseline_loss_batch.cpu().numpy(), columns=['Base_Loss'])
+    opt_loss_batch = opt_info.get('final_loss_batch')
+    if opt_loss_batch is not None:
+        df_opt_loss = pd.DataFrame(opt_loss_batch.cpu().numpy(), columns=['Opt_Loss'])
+    else:
+        df_opt_loss = pd.DataFrame([], columns=['Opt_Loss'])
+
+    df_final = pd.concat([df_input, df_base_ctrl, df_opt_actions, df_baseline_inj, df_opt_inj, df_base_loss, df_opt_loss], axis=1)
+    df_final.to_csv(args.output_csv, index=False)
+
+    logger.info(f"评估完成！对比结果已保存至: {args.output_csv}")
 
 if __name__ == "__main__":
     main()

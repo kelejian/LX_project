@@ -11,8 +11,12 @@ device: "cuda" # 或 "cpu"
 # ===========================
 # 2. 外部依赖配置 (与环境解耦)
 # ===========================
-# 仅指定代理模型权重的相对位置，根路径将由代码从 common.settings.INJURY_PREDICT_DIR 获取
+# 仅指定代理模型权重的相对位置，根路径由代码从 common.settings.PULSE_PREDICT_DIR
+# 和 common.settings.INJURY_PREDICT_DIR 分别解析。
 surrogate:
+  # pulse 模型相对路径
+  pulse_checkpoint: "saved/models/HybridPulseCNN/1213_095952/model_best.pth"
+  # injury 模型相对路径
   checkpoint_rel_path: "runs/InjuryPredictModel_01281059/best_val_loss.pth"
 
 # ===========================
