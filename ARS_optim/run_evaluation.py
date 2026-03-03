@@ -123,13 +123,29 @@ def main():
     logger.info(f"读取输入工况文件: {args.input_csv}")
     df_input = pd.read_csv(args.input_csv)
     
-    # 提取状态特征并转换为物理张量
+    # 组装上下文特征（state + fixed-control）并转换为物理张量
     state_names = [p['name'] for p in param_manager.state_params]
+    fixed_params = param_manager.control_fixed_params
+    fixed_names = [p['name'] for p in fixed_params]
+
     for col in state_names:
         if col not in df_input.columns:
             raise ValueError(f"输入 CSV 缺失必填状态列: {col}")
-            
-    state_tensor = torch.tensor(df_input[state_names].values, dtype=torch.float32, device=device)
+
+    context_df = df_input[state_names].copy()
+    missing_fixed_cols = []
+    for p in fixed_params:
+        name = p['name']
+        if name in df_input.columns:
+            context_df[name] = df_input[name].values
+        else:
+            context_df[name] = float(p['default'])
+            missing_fixed_cols.append(name)
+    if missing_fixed_cols:
+        logger.warning(f"输入 CSV 缺失固定控制参数列，已回退 default: {missing_fixed_cols}")
+
+    context_names = param_manager.get_context_names()
+    context_tensor = torch.tensor(context_df[context_names].values, dtype=torch.float32, device=device)
 
     # 2. 算力复用执行推理
     logger.info("开始执行基线推断与联合局部精调...")
@@ -137,22 +153,22 @@ def main():
     # 构造仅包含可训练参数的 baseline 动作向量（SurrogateAdapter 只看 trainable 部分）
     trainable_defaults = [p['default'] for p in param_manager.control_trainable_params]
     baseline_trainable = torch.tensor(trainable_defaults, dtype=torch.float32, device=device)
-    baseline_trainable = baseline_trainable.unsqueeze(0).expand(state_tensor.shape[0], -1)
+    baseline_trainable = baseline_trainable.unsqueeze(0).expand(context_tensor.shape[0], -1)
 
     # 同时准备完整的“基线控制参数”用于结果输出（可调 + 固定）
     fixed_idxs, fixed_defaults = param_manager.get_control_fixed_defaults(device=device)
     if fixed_defaults.numel() > 0:
-        full_baseline = torch.cat([baseline_trainable, fixed_defaults.unsqueeze(0).expand(state_tensor.shape[0], -1)], dim=1)
+        full_baseline = torch.cat([baseline_trainable, fixed_defaults.unsqueeze(0).expand(context_tensor.shape[0], -1)], dim=1)
     else:
         full_baseline = baseline_trainable
 
     with torch.no_grad():
-        pulse_norm = surrogate.generate_pulse(state_tensor)
+        pulse_norm = surrogate.generate_pulse(context_tensor)
         # 评测 Baseline 损伤值，同时记录损失信息
-        baseline_loss_batch, baseline_preds, baseline_info = surrogate.predict_injury_and_loss(state_tensor, baseline_trainable, pulse_norm)
+        baseline_loss_batch, baseline_preds, baseline_info = surrogate.predict_injury_and_loss(context_tensor, baseline_trainable, pulse_norm)
 
     # 执行 StrategyNet 零次推断 + 局部反向微调
-    optimized_actions, optimized_preds, opt_info = optimizer.optimize(state_tensor)
+    optimized_actions, optimized_preds, opt_info = optimizer.optimize(context_tensor)
 
     # 日志一些简要指标
     logger.info(f"优化耗时: {opt_info.get('time_cost', float('nan')):.6f} s")
@@ -165,11 +181,10 @@ def main():
     # 3. 结果合并与输出
     # 基线/优化完整控制参数（含固定）
     control_names = [p['name'] for p in param_manager.control_trainable_params]
-    fixed_names = [p['name'] for p in param_manager.control_fixed_params]
     all_control_names = control_names + fixed_names
     df_base_ctrl = pd.DataFrame(full_baseline.cpu().numpy(), columns=[f"Base_{n}" for n in all_control_names])
     if fixed_defaults.numel() > 0:
-        full_optimized = torch.cat([optimized_actions, fixed_defaults.unsqueeze(0).expand(state_tensor.shape[0], -1)], dim=1)
+        full_optimized = torch.cat([optimized_actions, fixed_defaults.unsqueeze(0).expand(context_tensor.shape[0], -1)], dim=1)
     else:
         full_optimized = optimized_actions
     df_opt_actions = pd.DataFrame(full_optimized.cpu().numpy(), columns=[f"Opt_{n}" for n in all_control_names])

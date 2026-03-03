@@ -10,7 +10,7 @@ import numpy as np
 from torch.utils.data import DataLoader, ConcatDataset
 
 from common.utils.seeding import set_random_seed
-from InjuryPredict.Injurydata_prepare import InjuryPackedDataset
+from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.utils import models
 from common.settings import INJURY_PROCESSED_DIR
 
@@ -39,13 +39,15 @@ def test_inference_time(model, loader):
                         model(batch_x_acc, batch_x_att_continuous, batch_x_att_discrete)
 
                 # 开始计时
-                torch.cuda.synchronize() # 确保CUDA操作同步
+                if device.type == 'cuda':
+                    torch.cuda.synchronize() # 确保CUDA操作同步
                 start_time = time.time()
 
                 model(batch_x_acc, batch_x_att_continuous, batch_x_att_discrete)
 
                 # 结束计时
-                torch.cuda.synchronize() # 确保CUDA操作同步
+                if device.type == 'cuda':
+                    torch.cuda.synchronize() # 确保CUDA操作同步
                 elapsed_time = time.time() - start_time
                 total_time += elapsed_time
 
@@ -75,8 +77,8 @@ if __name__ == "__main__":
     model_params = training_record["hyperparameters"]["model"]
     
     # 加载数据集（从 processed .pt）
-    test_dataset1 = torch.load((INJURY_PROCESSED_DIR / "val_dataset.pt").as_posix(), weights_only=False)
-    test_dataset2 = torch.load((INJURY_PROCESSED_DIR / "test_dataset.pt").as_posix(), weights_only=False)
+    test_dataset1 = load_processed_subset(INJURY_PROCESSED_DIR / "val_dataset.pt")
+    test_dataset2 = load_processed_subset(INJURY_PROCESSED_DIR / "test_dataset.pt")
     test_dataset = ConcatDataset([test_dataset1, test_dataset2])
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, num_workers=0)
 
@@ -85,7 +87,7 @@ if __name__ == "__main__":
             **model_params
         ).to(device)
     
-    model.load_state_dict(torch.load(os.path.join(args.run_dir, args.weight_file)))
+    model.load_state_dict(torch.load(os.path.join(args.run_dir, args.weight_file), map_location=device))
 
     print(f"Start testing inference time for model: {args.weight_file}")
     test_inference_time(model, test_loader)

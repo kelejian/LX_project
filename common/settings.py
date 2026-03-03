@@ -2,8 +2,6 @@ from pathlib import Path
 import os
 
 ''' 设置数据集特征相关的常量, 规范数据接口 '''
-CASE_ID_OFFSET_DEFAULT = 50000 # 默认的主副驾 case_id 差量，可用于生成识别原始碰撞波形csv文件的唯一case_id
-
 FEATURE_ORDER = [
     "impact_velocity", "impact_angle", "overlap",
     "LL1", "LL2", "BTF", "LLATTF", "AFT", "SP", "SH", "RA",
@@ -24,7 +22,7 @@ DISCRETE_VALUE_TO_INDEX = { # 按照 FEATURE_ORDER 中离散特征的顺序，�
 } # 固定离散映射（等价于LabelEncoder在这些取值上的编码）
 
 REQUIRED_COLUMNS_FOR_PACKING = set(FEATURE_ORDER + [
-    "case_id", "is_pulse_ok", "is_injury_ok",
+    "case_id", "pulse_source_case_id", "is_pulse_ok", "is_injury_ok",
     "HIC15", "Dmax", "Nij"
 ])
 

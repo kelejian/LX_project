@@ -1,13 +1,19 @@
 {
-  "rule": "inherit_injury_driver + add_pulse_only_driver_by_ratio",
+  "rule": "inherit_injury_pulse_source_ids + resolve_cross_split_conflicts_by_ratio + add_pulse_only_sources_by_ratio",
   "total_final": 5849,
-  "train_final": 4679,
+  "train_final": 4678,
   "val_final": 585,
-  "test_final": 585,
-  "inherited_from_injury_driver": {
-    "train": 0,
-    "val": 0,
-    "test": 0
+  "test_final": 586,
+  "inherited_source_counts": {
+    "train": 4500,
+    "val": 563,
+    "test": 563
   },
-  "date": "2026-02-13 15:22:27"
+  "pulse_only_source_counts": {
+    "train": 178,
+    "val": 22,
+    "test": 23,
+    "total": 223
+  },
+  "date": "2026-03-03 19:25:38"
 }

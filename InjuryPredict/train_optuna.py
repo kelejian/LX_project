@@ -17,7 +17,7 @@ from common.settings import INJURY_PROCESSED_DIR
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 
 from InjuryPredict.utils import models
-from InjuryPredict.Injurydata_prepare import InjuryPackedDataset
+from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.utils.weighted_loss import weighted_loss
 from InjuryPredict.utils.optimizer_utils import get_parameter_groups
 from InjuryPredict.config import RUNS_DIR
@@ -143,8 +143,8 @@ def objective(trial):
     val_pt = INJURY_PROCESSED_DIR / "val_dataset.pt"
     if not (train_pt.exists() and val_pt.exists()):
         raise FileNotFoundError(f"请先运行: python -m InjuryPredict.Injurydata_prepare 以生成 {INJURY_PROCESSED_DIR.as_posix()}/train_dataset.pt")
-    train_dataset = torch.load(train_pt.as_posix(), weights_only=False)
-    val_dataset = torch.load(val_pt.as_posix(), weights_only=False)
+    train_dataset = load_processed_subset(train_pt)
+    val_dataset = load_processed_subset(val_pt)
     train_loader = DataLoader(train_dataset, batch_size=Batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=Batch_size, shuffle=False, num_workers=0)
 

@@ -45,7 +45,7 @@ python -m PulsePredict.train -c PulsePredict/config.json --bs 64 --lr 0.001
 恢复训练：
 
 ```bash
-python -m PulsePredict.train -r saved/models/<实验名>/<时间戳>/checkpoint-epochX.pth
+python -m PulsePredict.train -r PulsePredict/saved/models/<实验名>/<时间戳>/checkpoint-epochX.pth
 ```
 
 训练结果与日志保存在 `PulsePredict/saved/` 下（由 `config.json` 中 `trainer.save_dir` 指定）。
@@ -54,7 +54,7 @@ python -m PulsePredict.train -r saved/models/<实验名>/<时间戳>/checkpoint-
 评估已训练模型：
 
 ```bash
-python -m PulsePredict.test -c PulsePredict/config.json -r saved/models/<实验名>/<时间戳>/model_best.pth
+python -m PulsePredict.test -r PulsePredict/saved/models/<实验名>/<时间戳>/model_best.pth
 ```
 
 `test.py` 会加载模型并在测试集上计算指标，按配置会将图像和日志写入对应 `saved` 目录。

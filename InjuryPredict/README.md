@@ -38,30 +38,30 @@ python -m InjuryPredict.Injurydata_prepare --out-dir data/processed/injury
 
 ## 5. 训练
 - 单次训练：
-  ```bash
+```bash
   python -m InjuryPredict.train
-  ```
+```
   输出保存在 `runs/`（包含 checkpoints、TrainingRecord.json、tensorboard logs）。
 
 - K-Fold 训练：
-  ```bash
+```bash
   python -m InjuryPredict.train_KFold
-  ```
+```
   注: K-Fold 训练的输出文件已经包含了每折的训练记录、模型权重和详细的评估结果，不需要单独再运行评估脚本。
 
 模型/训练超参统一配置于 `InjuryPredict/config.py`，无需改源码即可调整。
 
 ## 6. 评估与导出
 - 生成评估报告与图表：
-  ```bash
+```bash
   python -m InjuryPredict.eval_model
-  ```
+```
   （建议仅用于评估 InjuryPredict.train 训练的模型. 在脚本 `__main__` 中设置需要评估的 `run_dir` 与 `weight_file`）
 
 - 在完整数据集上导出预测 CSV：
-  ```bash
+```bash
   python -m InjuryPredict.test_all_data
-  ```
+```
 
 ## 7. 可视化（TensorBoard）
 ```bash

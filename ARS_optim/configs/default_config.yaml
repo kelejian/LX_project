@@ -15,7 +15,7 @@ device: "cuda" # 或 "cpu"
 # 和 common.settings.INJURY_PREDICT_DIR 分别解析。
 surrogate:
   # pulse 模型相对路径
-  pulse_checkpoint: "saved/models/HybridPulseCNN/1213_095952/model_best.pth"
+  pulse_checkpoint: "saved/models/HybridPulseCNN/0210_115651/model_best.pth"
   # injury 模型相对路径
   checkpoint_rel_path: "runs/InjuryPredictModel_01281059/best_val_loss.pth"
 

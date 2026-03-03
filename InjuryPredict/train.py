@@ -17,7 +17,7 @@ from common.utils.seeding import set_random_seed, GLOBAL_SEED
 from common.settings import INJURY_PROCESSED_DIR
 
 from InjuryPredict.utils import models
-from InjuryPredict.Injurydata_prepare import InjuryPackedDataset
+from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.utils.weighted_loss import weighted_loss
 from InjuryPredict.utils.optimizer_utils import get_parameter_groups
 from InjuryPredict.config import RUNS_DIR, training_params, loss_params, model_params
@@ -187,8 +187,8 @@ if __name__ == "__main__":
         raise FileNotFoundError(
             f"找不到训练数据 ({INJURY_PROCESSED_DIR}/*.pt)。请先运行: python -m InjuryPredict.Injurydata_prepare"
         )
-    train_dataset = torch.load(train_pt.as_posix(), weights_only=False)
-    val_dataset = torch.load(val_pt.as_posix(), weights_only=False)
+    train_dataset = load_processed_subset(train_pt)
+    val_dataset = load_processed_subset(val_pt)
     train_loader = DataLoader(train_dataset, batch_size=Batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=Batch_size, shuffle=False, num_workers=0) 
 

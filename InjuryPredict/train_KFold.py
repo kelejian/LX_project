@@ -30,7 +30,7 @@ from common.utils.seeding import GLOBAL_SEED, set_random_seed
 from common.settings import INJURY_PROCESSED_DIR
 
 from InjuryPredict.utils import models
-from InjuryPredict.Injurydata_prepare import InjuryPackedDataset
+from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.utils.weighted_loss import weighted_loss
 from InjuryPredict.utils.optimizer_utils import get_parameter_groups
 from InjuryPredict.config import RUNS_DIR, training_params, loss_params, model_params, kfold_params
@@ -422,9 +422,9 @@ if __name__ == "__main__":
         train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
         val_pt = INJURY_PROCESSED_DIR / "val_dataset.pt"
         test_pt = INJURY_PROCESSED_DIR / "test_dataset.pt"
-        train_subset_orig = torch.load(train_pt.as_posix(), weights_only=False)
-        val_subset_orig = torch.load(val_pt.as_posix(), weights_only=False)
-        test_subset_orig = torch.load(test_pt.as_posix(), weights_only=False)
+        train_subset_orig = load_processed_subset(train_pt)
+        val_subset_orig = load_processed_subset(val_pt)
+        test_subset_orig = load_processed_subset(test_pt)
     except FileNotFoundError as e:
         print(f"错误: {e}")
         print(f"请确保 {INJURY_PROCESSED_DIR} 下存在 train_dataset.pt、val_dataset.pt 和 test_dataset.pt。")

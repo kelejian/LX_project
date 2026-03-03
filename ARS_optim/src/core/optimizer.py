@@ -44,20 +44,20 @@ class ARSLocalOptimizer:
         # 是否在归一化空间中执行梯度精调，便于处理尺度不均问题
         self.optimize_in_normalized = bool(opt_cfg.get('optimize_in_normalized', False))
 
-    def optimize(self, state_params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    def optimize(self, context_params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
         执行在线寻优管线 (Online Optimization Pipeline)
         
         参数:
-            state_params: [Batch, D_State] 物理尺度的环境工况参数
+            context_params: [Batch, D_context] 物理尺度的上下文参数（state + fixed-control）
         返回:
             actions: [Batch, D_trainable] 寻优结束后的物理动作决策
             final_preds: [Batch, 3] 最终的损伤预测值 (HIC, Dmax, Nij)
             final_info: Dict 包含损失与违规惩罚等辅助信息的字典
         """
         import time
-        batch_size = state_params.shape[0]
-        device = state_params.device
+        batch_size = context_params.shape[0]
+        device = context_params.device
         
         self.surrogate.eval()
         
@@ -67,7 +67,7 @@ class ARSLocalOptimizer:
         # ==========================================
         with torch.no_grad():
             # pulse_norm: [Batch, 2, Seq_Len]
-            pulse_norm = self.surrogate.generate_pulse(state_params)
+            pulse_norm = self.surrogate.generate_pulse(context_params)
         
         # ==========================================
         # 阶段 1：获取初始解 (a_0)
@@ -78,7 +78,7 @@ class ARSLocalOptimizer:
             self.strategy_net.eval()
             with torch.no_grad():
                 # [接口对齐]: 传入状态与波形进行多模态融合推断
-                init_actions = self.strategy_net(state_params, pulse_norm)
+                init_actions = self.strategy_net(context_params, pulse_norm)
         else:
             # 严格校验：提取可调参数的 default 值作为寻优起点
             try:
@@ -91,11 +91,11 @@ class ARSLocalOptimizer:
 
         # 强制进行一次硬投影以确保合法（初始解已约束）
         with torch.no_grad():
-            init_actions = self.constraint_manager.project_forward(init_actions, state_params)
+            init_actions = self.constraint_manager.project_forward(init_actions, context_params)
         
         # 记录初始损失 / 预测值
         with torch.no_grad():
-            init_loss_batch, init_preds, init_info = self.surrogate.predict_injury_and_loss(state_params, init_actions, pulse_norm)
+            init_loss_batch, init_preds, init_info = self.surrogate.predict_injury_and_loss(context_params, init_actions, pulse_norm)
         init_loss = init_loss_batch.mean()
 
         # 若不需要精调 (零次迭代)，直接评估并返回初始解
@@ -141,7 +141,7 @@ class ARSLocalOptimizer:
             else:
                 phys = opt_var
 
-            loss_batch, preds, info = self.surrogate.predict_injury_and_loss(state_params, phys, pulse_norm)
+            loss_batch, preds, info = self.surrogate.predict_injury_and_loss(context_params, phys, pulse_norm)
             loss_mean = loss_batch.mean()
             loss_mean.backward()
             optimizer.step()
@@ -150,11 +150,11 @@ class ARSLocalOptimizer:
                 if self.optimize_in_normalized:
                     opt_var.clamp_(0.0, 1.0)
                     phys_tmp = opt_var * (max_b - min_b).unsqueeze(0) + min_b.unsqueeze(0)
-                    phys_tmp = self.constraint_manager.project_forward(phys_tmp, state_params)
+                    phys_tmp = self.constraint_manager.project_forward(phys_tmp, context_params)
                     opt_var.copy_((phys_tmp - min_b.unsqueeze(0)) / (max_b - min_b).unsqueeze(0))
                 else:
                     opt_var.clamp_(min_b, max_b)
-                    projected_actions = self.constraint_manager.project_forward(opt_var, state_params)
+                    projected_actions = self.constraint_manager.project_forward(opt_var, context_params)
                     opt_var.copy_(projected_actions)
             trajectory.append(loss_mean.item())
         end_time = time.time()
@@ -165,10 +165,10 @@ class ARSLocalOptimizer:
             if self.optimize_in_normalized:
                 actions = opt_var * (max_b - min_b).unsqueeze(0) + min_b.unsqueeze(0)
                 actions.clamp_(min_b, max_b)
-                actions = self.constraint_manager.project_forward(actions, state_params)
+                actions = self.constraint_manager.project_forward(actions, context_params)
             else:
                 actions = opt_var
-            final_loss, final_preds, final_info = self.surrogate.predict_injury_and_loss(state_params, actions, pulse_norm)
+            final_loss, final_preds, final_info = self.surrogate.predict_injury_and_loss(context_params, actions, pulse_norm)
             final_info['final_loss_batch'] = final_loss.detach()
         
         final_info['initial'] = {

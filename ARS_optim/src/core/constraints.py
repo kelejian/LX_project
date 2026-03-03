@@ -26,10 +26,10 @@ class PhysicalConstraintManager:
         # 建立参数类别映射表：用于跨越张量边界进行动态数据检索
         # 核心逻辑：记录可调参数在 actions 张量中的具体列索引，以及状态参数在 state 张量中的列索引
         self.trainable_names = {p['name']: i for i, p in enumerate(param_manager.control_trainable_params)}
-        self.state_names = {p['name']: i for i, p in enumerate(param_manager.state_params)}
+        self.context_names = {p['name']: i for i, p in enumerate(param_manager.get_context_params())}
         self.fixed_defaults = {p['name']: p['default'] for p in param_manager.control_fixed_params}
 
-    def _get_param_col(self, name: str, cols: List[torch.Tensor], state_params: torch.Tensor, device: torch.device) -> torch.Tensor:
+    def _get_param_col(self, name: str, cols: List[torch.Tensor], context_params: torch.Tensor, device: torch.device) -> torch.Tensor:
         """
         动态张量列寻址器 (Dynamic Tensor Column Resolver)
         
@@ -41,15 +41,15 @@ class PhysicalConstraintManager:
         """
         if name in self.trainable_names:
             return cols[self.trainable_names[name]]
-        elif name in self.state_names:
-            return state_params[:, self.state_names[name]]
+        elif name in self.context_names:
+            return context_params[:, self.context_names[name]]
         elif name in self.fixed_defaults:
-            batch_size = state_params.shape[0]
+            batch_size = context_params.shape[0]
             return torch.full((batch_size,), self.fixed_defaults[name], device=device, dtype=torch.float32)
         else:
             raise ValueError(f"[物理约束异常] 试图检索未知的系统参数: {name}")
 
-    def project_forward(self, actions: torch.Tensor, state_params: torch.Tensor) -> torch.Tensor:
+    def project_forward(self, actions: torch.Tensor, context_params: torch.Tensor) -> torch.Tensor:
         """
         前向硬投影 (Hard Projection)
         
@@ -59,7 +59,7 @@ class PhysicalConstraintManager:
         
         参数:
             actions: [Batch, D_trainable] 策略网络输出的绝对尺度决策参数
-            state_params: [Batch, D_state] 物理尺度的环境工况参数，提供上下文锚点
+            context_params: [Batch, D_context] 物理尺度上下文参数（state + fixed-control）
         返回:
             projected_actions: [Batch, D_trainable] 修正后且保留梯度的决策参数
         """
@@ -71,15 +71,15 @@ class PhysicalConstraintManager:
         # 约束 1: 气囊点爆时刻 (AFT) 必须早于 预紧器点火时刻 (BTF) + 25ms
         # 数学表达: AFT <= BTF + 25 - epsilon
         # =========================================================
-        aft = self._get_param_col('AFT', cols, state_params, device)
-        btf = self._get_param_col('BTF', cols, state_params, device)
+        aft = self._get_param_col('AFT', cols, context_params, device)
+        btf = self._get_param_col('BTF', cols, context_params, device)
         
         # 正向截断：如果 AFT 可调，其上限受制于 BTF
         if 'AFT' in self.trainable_names:
             cols[self.trainable_names['AFT']] = torch.min(aft, btf + 25.0 - 1e-3)
             
         # 级联更新与反向截断：重新提取可能已被修正的 AFT。如果 BTF 可调，其下限受制于 AFT
-        aft = self._get_param_col('AFT', cols, state_params, device)
+        aft = self._get_param_col('AFT', cols, context_params, device)
         if 'BTF' in self.trainable_names:
             cols[self.trainable_names['BTF']] = torch.max(btf, aft - 25.0 + 1e-3)
 
@@ -87,13 +87,13 @@ class PhysicalConstraintManager:
         # 约束 2: 二级限力切换时刻 (LLATTF) 必须晚于或等于 预紧器点火时刻 (BTF)
         # 数学表达: LLATTF >= BTF
         # =========================================================
-        llattf = self._get_param_col('LLATTF', cols, state_params, device)
-        btf = self._get_param_col('BTF', cols, state_params, device)
+        llattf = self._get_param_col('LLATTF', cols, context_params, device)
+        btf = self._get_param_col('BTF', cols, context_params, device)
         
         if 'LLATTF' in self.trainable_names:
             cols[self.trainable_names['LLATTF']] = torch.max(llattf, btf)
             
-        llattf = self._get_param_col('LLATTF', cols, state_params, device)
+        llattf = self._get_param_col('LLATTF', cols, context_params, device)
         if 'BTF' in self.trainable_names:
             cols[self.trainable_names['BTF']] = torch.min(btf, llattf)
 
@@ -101,13 +101,13 @@ class PhysicalConstraintManager:
         # 约束 3: 二级限力值 (LL2) 必须小于等于 一级限力值 (LL1)
         # 数学表达: LL2 <= LL1
         # =========================================================
-        ll1 = self._get_param_col('LL1', cols, state_params, device)
-        ll2 = self._get_param_col('LL2', cols, state_params, device)
+        ll1 = self._get_param_col('LL1', cols, context_params, device)
+        ll2 = self._get_param_col('LL2', cols, context_params, device)
         
         if 'LL2' in self.trainable_names:
             cols[self.trainable_names['LL2']] = torch.min(ll2, ll1)
             
-        ll2 = self._get_param_col('LL2', cols, state_params, device)
+        ll2 = self._get_param_col('LL2', cols, context_params, device)
         if 'LL1' in self.trainable_names:
             cols[self.trainable_names['LL1']] = torch.max(ll1, ll2)
 
@@ -115,7 +115,7 @@ class PhysicalConstraintManager:
         projected_actions = torch.stack(cols, dim=1)
         return projected_actions
 
-    def compute_soft_penalty(self, actions: torch.Tensor, state_params: torch.Tensor) -> torch.Tensor:
+    def compute_soft_penalty(self, actions: torch.Tensor, context_params: torch.Tensor) -> torch.Tensor:
         """
         软惩罚计算 (Soft Penalty for Objective Function)
         
@@ -125,7 +125,7 @@ class PhysicalConstraintManager:
         
         参数:
             actions: [Batch, D_trainable]
-            state_params: [Batch, D_state]
+            context_params: [Batch, D_context]
         返回:
             penalty: [Batch] 当前批次内各个样本的违规程度总和
         """
@@ -136,11 +136,11 @@ class PhysicalConstraintManager:
         # 软惩罚阶段直接使用原始 actions，无需考虑张量原地修改问题
         cols = [actions[:, i] for i in range(actions.shape[1])]
         
-        aft = self._get_param_col('AFT', cols, state_params, device)
-        btf = self._get_param_col('BTF', cols, state_params, device)
-        llattf = self._get_param_col('LLATTF', cols, state_params, device)
-        ll1 = self._get_param_col('LL1', cols, state_params, device)
-        ll2 = self._get_param_col('LL2', cols, state_params, device)
+        aft = self._get_param_col('AFT', cols, context_params, device)
+        btf = self._get_param_col('BTF', cols, context_params, device)
+        llattf = self._get_param_col('LLATTF', cols, context_params, device)
+        ll1 = self._get_param_col('LL1', cols, context_params, device)
+        ll2 = self._get_param_col('LL2', cols, context_params, device)
         
         # 惩罚项 1: 约束 AFT < BTF + 25 越界
         penalty += torch.relu(aft - (btf + 25.0))

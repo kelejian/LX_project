@@ -38,7 +38,7 @@ class StrategyNet(nn.Module):
         self.constraint_manager = constraint_manager
         
         # 确定输入与输出基础维度
-        self.state_dim = self.param_manager.get_state_dim()
+        self.context_dim = self.param_manager.get_context_dim()
         self.output_dim = self.param_manager.get_trainable_dim()
         # 记录波形编码器输出维度，方便在 forward 中做一致性检查
         self.pulse_embed_dim = pulse_embed_dim
@@ -72,8 +72,8 @@ class StrategyNet(nn.Module):
         # 2. 构建 MLP 决策骨干网络 (Decision Backbone)
         # ---------------------------------------------------------
         layers = []
-        # MLP 的输入维度 = 标量状态特征维度 + 波形嵌入特征维度
-        in_features = self.state_dim + pulse_embed_dim
+        # MLP 的输入维度 = 上下文特征维度 + 波形嵌入特征维度
+        in_features = self.context_dim + pulse_embed_dim
         act_layer_instance = act_layer_cls(inplace=True)
         
         for hidden_dim in hidden_dims:
@@ -126,12 +126,12 @@ class StrategyNet(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def forward(self, state_features: torch.Tensor, pulse_features: torch.Tensor) -> torch.Tensor:
+    def forward(self, context_features: torch.Tensor, pulse_features: torch.Tensor) -> torch.Tensor:
         """
         前向推理过程，融合多模态特征并输出受严格物理法则约束的寻优动作。
         
         参数:
-            state_features: [Batch, D_state] 物理尺度的环境与乘员标量参数
+            context_features: [Batch, D_context] 物理尺度上下文参数（state + fixed-control）
             pulse_features: [Batch, 2, Seq_Len] 归一化后的二维（XY轴）碰撞加速度波形
             
         返回:
@@ -147,11 +147,11 @@ class StrategyNet(nn.Module):
             "pulse_encoder output dimension mismatch"
         
         # 2. 多模态特征级联
-        # [Batch, D_state] ⊕ [Batch, pulse_embed_dim] -> [Batch, D_state + pulse_embed_dim]
-        combined_features = torch.cat([state_features, pulse_embed], dim=1)
+        # [Batch, D_context] ⊕ [Batch, pulse_embed_dim] -> [Batch, D_context + pulse_embed_dim]
+        combined_features = torch.cat([context_features, pulse_embed], dim=1)
         
         # 3. 骨干网络非线性决策映射
-        # [Batch, D_state + pulse_embed_dim] -> [Batch, D_trainable]
+        # [Batch, D_context + pulse_embed_dim] -> [Batch, D_trainable]
         raw_output = self.mlp(combined_features)
         
         # 4. 绝对极值范围逆映射 (Sigmoid + Affine Transform)
@@ -167,7 +167,7 @@ class StrategyNet(nn.Module):
             self.logger.warning("策略网络输出包含 NaN/Inf，可能发生梯度爆炸或数据异常。")
         
         # 5. 混合状态物理法则硬投影 (Hard Constraint Projection)
-        # 依赖于 PhysicalConstraintManager，融入 state_features 上下文以解析混合参数耦合限制
-        final_actions = self.constraint_manager.project_forward(abs_actions, state_features)
+        # 依赖于 PhysicalConstraintManager，融入 context_features 上下文以解析混合参数耦合限制
+        final_actions = self.constraint_manager.project_forward(abs_actions, context_features)
         
         return final_actions

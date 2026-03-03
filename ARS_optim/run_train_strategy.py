@@ -7,7 +7,6 @@ import argparse
 from pathlib import Path
 from tqdm import tqdm
 
-# 全局禁用冗余引用，严格执行根目录模块化导入 (Absolute Import for CLI)
 from common.data_utils.processor import UnifiedDataProcessor
 from common.settings import PULSE_PREDICT_DIR, INJURY_PREDICT_DIR, NORMALIZATION_CONFIG_PATH
 from PulsePredict.model.model import HybridPulseCNN
@@ -156,7 +155,7 @@ def main():
         device=device,
         seed=int(config.get('seed', 42))
     )
-    state_generator = data_loader_manager.get_infinite_generator()
+    context_generator = data_loader_manager.get_infinite_generator()
 
     # 3. 摊销训练主循环 (Amortized Training Loop)
     max_iters = int(train_cfg.get('max_iterations'))
@@ -168,18 +167,18 @@ def main():
     for iter_idx in pbar:
         optimizer.zero_grad()
 
-        # Step A: 零拷贝在 Device 上生成物理工况态
-        state_params = next(state_generator) # [Batch, D_State]
+        # Step A: 零拷贝在 Device 上生成物理上下文
+        context_params = next(context_generator) # [Batch, D_context]
         
         # Step B: 提取环境波形特征 (前置特征，阻断梯度)
         with torch.no_grad():
-            pulse_norm = surrogate.generate_pulse(state_params) # [Batch, 2, Seq_Len]
+            pulse_norm = surrogate.generate_pulse(context_params) # [Batch, 2, Seq_Len]
             
         # Step C: 策略网络多模态融合推断，输出合法动作
-        actions = strategy_net(state_params, pulse_norm) # [Batch, D_trainable]
+        actions = strategy_net(context_params, pulse_norm) # [Batch, D_trainable]
         
         # Step D: 计算物理损伤与惩罚损失
-        total_loss, preds, info = surrogate.predict_injury_and_loss(state_params, actions, pulse_norm)
+        total_loss, preds, info = surrogate.predict_injury_and_loss(context_params, actions, pulse_norm)
         
         loss_mean = total_loss.mean()
         loss_mean.backward()

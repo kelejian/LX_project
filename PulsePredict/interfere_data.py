@@ -30,7 +30,7 @@ plt.rcParams['axes.unicode_minus'] = False    # 负号正常显示
 # --------------------------------------------------------------------------------------
 # 指定要加载的模型检查点 (.pth) 文件路径
 CHECKPOINT_PATH = (
-    r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_project\PulsePredict\saved\models\HybridPulseCNN\0210_115651\model_best.pth"
+    r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_project\PulsePredict\saved\models\HybridPulseCNN\0303_201345\model_best.pth"
 )
 
 # 数据集路径（已弃用旧的多文件列表）：
@@ -122,6 +122,8 @@ def get_run_root_and_config_path(checkpoint_path):
         # .pth 在 session 文件夹中, config 也在
         run_root_dir = cp_path.parent
     else:
+
+        
         # .pth 在 session 文件夹中, config 在上一级 (标准的 resume 场景)
         config_path = cp_path.parent.parent / 'config.json'
         if config_path.exists():
@@ -133,7 +135,7 @@ def get_run_root_and_config_path(checkpoint_path):
                 run_root_dir = cp_path.parent
             else:
                 raise FileNotFoundError(
-                    f"在 {cp_path.parent} 或其父目录中均未找到 'config.json'。"
+                    f"[interfere_data] 在 {cp_path.parent} 或其父目录中均未找到 'config.json'。"
                 )
     
     return run_root_dir, config_path
@@ -141,7 +143,6 @@ def get_run_root_and_config_path(checkpoint_path):
 def plot_iso_scatter(x_data, y_data, color_data, config, save_path, vmin, vmax):
     """
     绘制并保存散点图。
-    (此版本接受 vmin 和 vmax 参数)
     """
     plt.figure(figsize=(12, 10))
     sc = plt.scatter(
@@ -351,7 +352,7 @@ def main():
     try:
         model = getattr(module_arch, model_arch_type)(**model_arch_args).to(device)
     except Exception as e:
-        logger.error(f"加载模型架构 '{model_arch_type}' 失败: {e}")
+        logger.error(f"[interfere_data] 加载模型架构 '{model_arch_type}' 失败: {e}")
         return
         
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -364,9 +365,9 @@ def main():
     proc_cfg_path = Path(config['data_loader_train']['args'].get('processor_config', 'data/normalization_config.json'))
     processor = UnifiedDataProcessor(config_path=proc_cfg_path)
     if not processor.load_config():
-        raise RuntimeError(f"无法加载归一化配置: {proc_cfg_path}")
+        raise RuntimeError(f"[interfere_data] 无法加载归一化配置: {proc_cfg_path}")
     if not processor.validate_config():
-        raise RuntimeError(f"归一化配置校验失败: {proc_cfg_path}")
+        raise RuntimeError(f"[interfere_data] 归一化配置校验失败: {proc_cfg_path}")
     logger.info(f"使用 UnifiedDataProcessor (config={proc_cfg_path}) 进行归一化/反归一化")
 
     # --- 4. 加载并筛选数据 ---
@@ -376,22 +377,35 @@ def main():
     # 加载单一 canonical .npz 文件（路径从 config 中读取）。
     npz_path = Path(config['data_loader_train']['args'].get('packaged_data_path', 'data/raw_packed/raw_data_packed.npz'))
     if not npz_path.exists():
-        logger.error(f"数据文件不存在: {npz_path} — 请先运行 `python prepare_data.py` 来生成原始尺度的打包数据文件 (.npz)")
+        logger.error(f"[interfere_data] 数据文件不存在: {npz_path} — 请先运行 `python prepare_data.py` 来生成原始尺度的打包数据文件 (.npz)")
         return
 
     data = np.load(npz_path)
     # canonical keys produced by prepare_data.py
     # x_att_raw: (N, D)  (full FEATURE_ORDER)
     # x_acc_xyz: (N, 3, T)
-    # case_ids:  (N,)
+    # case_ids / pulse_source_case_ids:  (N,)
     try:
-        # 仅考虑主驾侧case_id <= 50000 的样本，排除副驾侧
-        data_mask = data['case_ids'] <= 50000
-        full_att = data['x_att_raw'][data_mask]
-        waveforms = data['x_acc_xyz'][data_mask]
-        case_ids = data['case_ids'][data_mask]
+        required_keys = {'x_att_raw', 'x_acc_xyz', 'case_ids', 'pulse_source_case_ids'}
+        missing_keys = sorted(required_keys - set(data.files))
+        if missing_keys:
+            raise KeyError(f"[interfere_data] 缺少必要键: {missing_keys}")
+
+        full_att_all = data['x_att_raw']
+        waveforms_all = data['x_acc_xyz']
+        case_ids_all = data['case_ids']
+        pulse_source_ids_all = data['pulse_source_case_ids'].astype(np.int64)
+
+        # 仅按 pulse_source_case_id 去重，保留每个 source 的唯一代表样本
+        unique_source_ids, first_indices = np.unique(pulse_source_ids_all, return_index=True)
+        order = np.argsort(first_indices)
+        selected_indices = first_indices[order]
+
+        full_att = full_att_all[selected_indices]
+        waveforms = waveforms_all[selected_indices]
+        case_ids = case_ids_all[selected_indices]
     except Exception as e:
-        logger.error(f"数据文件 {npz_path} 不包含预期键 (x_att_raw/x_acc_xyz/case_ids): {e}")
+        logger.error(f"[interfere_data] 数据文件 {npz_path} 不满足 PulseSourceId 数据接口要求: {e}")
         return
 
     # 仅保留脚本需要的三项标量参数 (velocity, angle, overlap)
@@ -401,18 +415,18 @@ def main():
 
     all_raw_params = params
     all_waveforms = waveforms
-    all_case_ids = case_ids
+    all_case_ids = case_ids # 仅包含唯一 pulse_source_case_id 的代表case
     all_source_files = np.array([npz_path.name] * len(case_ids))
 
-    logger.info(f"成功加载数据文件: {npz_path.name} (波形样本数: {len(case_ids)})")
+    logger.info(f"[interfere_data] 成功加载数据文件: {npz_path.name} (波形样本数: {len(case_ids)})")
 
     # 应用工况筛选
     conditions = SPECIFIC_CASE_CONFIG.get('conditions', [])
     if not conditions:
-        logger.info("未定义筛选条件，将分析数据集中的所有样本。")
+        logger.info("[interfere_data] 未定义筛选条件，将分析数据集中的所有样本。")
         filtered_indices = np.arange(all_raw_params.shape[0])
     else:
-        logger.info(f"根据 {len(conditions)} 个条件筛选工况...")
+        logger.info(f"[interfere_data] 根据 {len(conditions)} 个条件筛选工况...")
         combined_mask = np.full(all_raw_params.shape[0], True)
         for cond in conditions:
             param_index = cond['param_index']
@@ -431,10 +445,10 @@ def main():
         filtered_indices = np.where(combined_mask)[0]
 
     if len(filtered_indices) == 0:
-        logger.error("筛选后无任何样本，脚本终止。")
+        logger.error("[interfere_data] 筛选后无任何样本，脚本终止。")
         return
 
-    logger.info(f"筛选完毕，共 {len(filtered_indices)} / {all_raw_params.shape[0]} 个样本待处理。")
+    logger.info(f"[interfere_data] 筛选完毕，共 {len(filtered_indices)} / {all_raw_params.shape[0]} 个样本待处理。")
 
     # 提取筛选后的数据
     filtered_raw_params = all_raw_params[filtered_indices]

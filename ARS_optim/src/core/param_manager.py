@@ -151,6 +151,23 @@ class ParamManager:
 
     def get_state_dim(self) -> int:
         return len(self.state_params)
+
+    def get_context_params(self) -> List[dict]:
+        """
+        获取上下文参数列表：state + trainable=False 的 control，按全局 index 升序。
+        该顺序用于策略网络输入与经验池切片，必须稳定。
+        """
+        params = self.state_params + self.control_fixed_params
+        return sorted(params, key=lambda x: x['index'])
+
+    def get_context_dim(self) -> int:
+        return len(self.get_context_params())
+
+    def get_context_indices(self) -> List[int]:
+        return [p['index'] for p in self.get_context_params()]
+
+    def get_context_names(self) -> List[str]:
+        return [p['name'] for p in self.get_context_params()]
         
     def get_trainable_dim(self) -> int:
         return len(self.control_trainable_params)

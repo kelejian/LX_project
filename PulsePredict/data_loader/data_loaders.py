@@ -18,9 +18,22 @@ class PulseDataset(Dataset):
         # 加载全量数据
         data = np.load(packaged_data_path, allow_pickle=True)
         print(f"[PulseDataset] Loaded raw scale data from {packaged_data_path} with keys: {list(data.keys())}")
-        self.case_ids = data['case_ids']      
-        self.att_raw = data['x_att_raw']    # (N, 13)
-        self.acc_raw = data['x_acc_xyz']    # (N, 3, 150)
+        required_keys = {"case_ids", "pulse_source_case_ids", "x_att_raw", "x_acc_xyz"}
+        missing_keys = sorted(required_keys - set(data.files))
+        if missing_keys:
+            raise KeyError(f"[PulseDataset] Packaged data 缺少必要键: {missing_keys}. 请先使用最新 prepare_data.py 重新打包。")
+
+        case_ids_all = data['case_ids'].astype(np.int64)
+        pulse_source_case_ids_all = data['pulse_source_case_ids'].astype(np.int64)
+        att_raw_all = data['x_att_raw']
+        acc_raw_all = data['x_acc_xyz']
+
+        # 保留 raw_packed 的原始行顺序；pulse split 的 indices 直接使用 raw 行索引（首次出现 source 对应行）。
+        self.case_ids = case_ids_all
+        self.pulse_source_case_ids = pulse_source_case_ids_all
+        self.att_raw = att_raw_all
+        self.acc_raw = acc_raw_all
+        print(f"[PulseDataset] Raw rows: {len(self.case_ids)}, unique pulse sources: {len(np.unique(self.pulse_source_case_ids))}")
         
         # 初始化公共处理器（保留 config 路径）
         self._processor_config_path = processor_config_path
@@ -60,7 +73,7 @@ class PulseDataset(Dataset):
         return (
             torch.from_numpy(self.impact_feats_norm[idx]),
             torch.from_numpy(self.acc_norm[idx]),
-            self.case_ids[idx]  # 传递ID以便调试或追踪
+            self.pulse_source_case_ids[idx]  # 传递波形主键ID，避免与case_id语义混淆
         )
     
 #==========================================================================================
@@ -84,29 +97,25 @@ class PulseDataLoader(BaseDataLoader):
         
         if training:
             # --- 训练模式 ---
-            t_path = self.split_dir / "pulse_train_indices.npy"
-            v_path = self.split_dir / "pulse_val_indices.npy"
-            
-            # 严格检查训练索引
-            if not t_path.exists():
-                raise FileNotFoundError(f"[data_loader] Train indices missing: {t_path}")
-            self.train_test_indices = np.load(t_path)
-            
-            # 加载验证索引 (如果存在)
-            if v_path.exists():
-                self.val_indices = np.load(v_path)
-            # 注意：如果验证集文件不存在，self.val_indices 为 None，BaseDataLoader 将不创建验证集 loader
+            t_idx_path = self.split_dir / "pulse_train_indices.npy"
+            v_idx_path = self.split_dir / "pulse_val_indices.npy"
+
+            if not t_idx_path.exists():
+                raise FileNotFoundError(f"[PulseDataLoader] Train split missing: {t_idx_path}")
+            if not v_idx_path.exists():
+                raise FileNotFoundError(f"[PulseDataLoader] Val split missing: {v_idx_path}")
+
+            self.train_test_indices = self._load_and_validate_indices(np.load(t_idx_path).astype(np.int64), "train")
+            self.val_indices = self._load_and_validate_indices(np.load(v_idx_path).astype(np.int64), "val")
             
         else:
             # --- 测试模式 ---
-            test_path = self.split_dir / "pulse_test_indices.npy"
-            
-            # 严格检查测试索引
-            if not test_path.exists():
-                raise FileNotFoundError(f"[data_loader] Test indices missing: {test_path}")
-            
-            # 将测试集索引传给 self.train_test_indices，作为 Loader 的主迭代对象
-            self.train_test_indices = np.load(test_path) 
+            test_idx_path = self.split_dir / "pulse_test_indices.npy"
+
+            if not test_idx_path.exists():
+                raise FileNotFoundError(f"[PulseDataLoader] Test split missing: {test_idx_path}")
+
+            self.train_test_indices = self._load_and_validate_indices(np.load(test_idx_path).astype(np.int64), "test")
             
             # 测试模式下强制无验证集
             self.val_indices = None
@@ -120,3 +129,18 @@ class PulseDataLoader(BaseDataLoader):
             train_test_indices=self.train_test_indices,  # 显式传入，不可为None
             val_indices=self.val_indices                 # 显式传入
         )
+
+    def _load_and_validate_indices(self, indices: np.ndarray, split_name: str) -> np.ndarray:
+        if indices.ndim != 1:
+            raise ValueError(f"[PulseDataLoader] {split_name} split 索引必须是一维数组，实际形状: {indices.shape}")
+        if indices.size == 0:
+            return np.asarray(indices, dtype=np.int64)
+
+        min_idx = int(indices.min())
+        max_idx = int(indices.max())
+        n = len(self.dataset)
+        if min_idx < 0 or max_idx >= n:
+            raise ValueError(
+                f"[PulseDataLoader] {split_name} split 索引越界：min={min_idx}, max={max_idx}, 数据集大小={n}"
+            )
+        return np.asarray(indices, dtype=np.int64)

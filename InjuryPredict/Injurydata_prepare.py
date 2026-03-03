@@ -40,10 +40,18 @@ class InjuryPackedDataset(Dataset):
         (x_acc, x_att_continuous, x_att_discrete,
          y_HIC, y_Dmax, y_Nij,
          ais_head, ais_chest, ais_neck, mais, OT_raw)
-    说明：保留必要的字段与元信息 (`processor`, `num_classes_of_discrete`)，不再包含额外的历史兼容分支。
+    说明：保留必要的字段与元信息 (`processor`, `num_classes_of_discrete`)。
     """
     def __init__(self, raw_npz: Path, processor: Optional[UnifiedDataProcessor] = None):
         data = np.load(raw_npz)
+        required_keys = {
+            "case_ids", "x_att_raw", "x_acc_xy",
+            "y_HIC", "y_Dmax", "y_Nij",
+            "ais_head", "ais_chest", "ais_neck", "mais"
+        }
+        missing_keys = sorted(required_keys - set(data.files))
+        if missing_keys:
+            raise KeyError(f"raw_packed 数据缺少必要键: {missing_keys}. 请先使用最新 prepare_data.py 重新打包。")
         # 原始字段（来自 prepare_data 的命名约定）
         self.case_ids = data["case_ids"].astype(np.int32)
         # x_att_raw: shape (N, len(FEATURE_ORDER))
@@ -91,6 +99,22 @@ class InjuryPackedDataset(Dataset):
             torch.tensor(self.mais[idx], dtype=torch.int),
             torch.tensor(self.OT_raw[idx], dtype=torch.int),
         ) # 与旧有dataset_prepare.py 中的数据集类的返回项保持一致
+
+
+def load_processed_subset(pt_path: Path):
+    """严格加载 Injury processed .pt：不做任何历史兼容兜底。"""
+    pt_path = Path(pt_path)
+    if not pt_path.exists():
+        raise FileNotFoundError(f"processed dataset 文件不存在: {pt_path}")
+
+    subset = torch.load(pt_path.as_posix(), weights_only=False)
+    if not isinstance(subset, Subset):
+        raise TypeError(f"{pt_path} 不是 torch.utils.data.Subset，实际类型: {type(subset)}")
+    if not isinstance(subset.dataset, InjuryPackedDataset):
+        raise TypeError(
+            f"{pt_path} 的底层数据集类型非法，期望 InjuryPackedDataset，实际: {type(subset.dataset)}"
+        )
+    return subset
 
 # --------------------- 主流程函数 ---------------------
 def build_and_save_splits(

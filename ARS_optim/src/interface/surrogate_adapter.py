@@ -55,18 +55,18 @@ class SurrogateAdapter(nn.Module):
         # 物理边界惩罚系数
         self.weight_penalty = float(obj_cfg.get('weight_penalty', 10.0))
 
-    def _prepare_normalized_inputs(self, state_params: torch.Tensor, control_trainable: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _prepare_normalized_inputs(self, context_params: torch.Tensor, control_trainable: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         内部特征组装与归一化对齐器。
         严格确保按照 FEATURE_ORDER 顺序拼装物理尺度的特征，并调用统一处理器进行归一化。
         """
-        batch_size = state_params.shape[0]
-        device = state_params.device
+        batch_size = context_params.shape[0]
+        device = context_params.device
         total_dim = self.param_manager.get_total_feature_dim()
         
         # 1. 组装输入张量 (物理尺度)
         combined_phys = torch.zeros((batch_size, total_dim), device=device, dtype=torch.float32)
-        combined_phys[:, self.param_manager.get_state_indices()] = state_params
+        combined_phys[:, self.param_manager.get_context_indices()] = context_params
         
         if control_trainable is not None:
             combined_phys[:, self.param_manager.get_control_trainable_indices()] = control_trainable
@@ -89,20 +89,20 @@ class SurrogateAdapter(nn.Module):
         # 输出: 物理尺度合并张量及其归一化版本
         return combined_phys, model_input_norm
 
-    def predict_injury_and_loss(self, state_params: torch.Tensor, control_trainable: torch.Tensor, pulse_norm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    def predict_injury_and_loss(self, context_params: torch.Tensor, control_trainable: torch.Tensor, pulse_norm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
         独立物理接口 2: 损伤预测与风险计算器 (Injury Predictor & Loss Evaluator)
         融合缓存的波形特征与当前的决策参数，评估整体物理风险。这是梯度下降的核心运算域。
         
         参数:
-            state_params: [Batch, D_State] 物理尺度的状态参数
+            context_params: [Batch, D_context] 物理尺度上下文参数（state + fixed-control）
             control_trainable: [Batch, D_Trainable] 当前优化的物理尺度约束参数
             pulse_norm: [Batch, 2, Seq_Len] 从 generate_pulse 获取并缓存的归一化波形
         """
-        device = state_params.device
+        device = context_params.device
         # 检查输入是否包含 NaN/Inf，尽早排除异常
-        if torch.isnan(state_params).any() or torch.isinf(state_params).any():
-            raise ValueError("state_params 包含 NaN 或 Inf")
+        if torch.isnan(context_params).any() or torch.isinf(context_params).any():
+            raise ValueError("context_params 包含 NaN 或 Inf")
         if control_trainable is not None and (torch.isnan(control_trainable).any() or torch.isinf(control_trainable).any()):
             raise ValueError("control_trainable 包含 NaN 或 Inf")
 
@@ -111,7 +111,7 @@ class SurrogateAdapter(nn.Module):
             exp = self.param_manager.get_trainable_dim()
             assert control_trainable.size(1) == exp, \
                 f"control_trainable has {control_trainable.size(1)} cols, expected {exp}"
-        combined_phys, model_input_norm = self._prepare_normalized_inputs(state_params, control_trainable)
+        combined_phys, model_input_norm = self._prepare_normalized_inputs(context_params, control_trainable)
         
         # 1. 切片提取 InjuryPredict 需要的特征结构
         # [Batch, 11] (连续特征) & [Batch, 2] (离散类别)
@@ -154,7 +154,7 @@ class SurrogateAdapter(nn.Module):
         abs_penalty = (exceed_max + exceed_min).sum(dim=1)
         
         # 4.2 相对耦合违规惩罚 (依赖于第二步升级的混合状态约束上下文)
-        rel_penalty = self.constraint_manager.compute_soft_penalty(control_trainable, state_params)
+        rel_penalty = self.constraint_manager.compute_soft_penalty(control_trainable, context_params)
         
         loss_constraint = abs_penalty + rel_penalty # [Batch]
         
@@ -201,22 +201,19 @@ class SurrogateAdapter(nn.Module):
         norm_max = torch.ones(d_train, device=device, dtype=torch.float32)
         return norm_min, norm_max
 
-    def generate_pulse(self, state_params: torch.Tensor) -> torch.Tensor:
+    def generate_pulse(self, context_params: torch.Tensor) -> torch.Tensor:
         """
         利用波形代理模型生成归一化后的 XY 轴碰撞波形。
-        输入: 物理尺度的状态参数 tensor [B, D_state]
+        输入: 物理尺度的上下文参数 tensor [B, D_context]
         返回: pulse_norm [B, 2, Seq_Len]
         """
-        device = state_params.device
-        batch = state_params.shape[0]
+        device = context_params.device
+        batch = context_params.shape[0]
 
         # 组装完整物理张量并填充默认控制参数
         total_dim = self.param_manager.get_total_feature_dim()
         combined = torch.zeros((batch, total_dim), device=device, dtype=torch.float32)
-        combined[:, self.param_manager.get_state_indices()] = state_params
-        fixed_idxs, fixed_defs = self.param_manager.get_control_fixed_defaults(device=device)
-        if fixed_defs.numel() > 0:
-            combined[:, fixed_idxs] = fixed_defs.unsqueeze(0).expand(batch, -1)
+        combined[:, self.param_manager.get_context_indices()] = context_params
 
         # 仅取关键工况、并归一化
         impact_names = ["impact_velocity", "impact_angle", "overlap"]
@@ -240,11 +237,11 @@ class SurrogateAdapter(nn.Module):
             f"expected waveform length {WAVEFORM_LENGTH}, got {x_acc_xy.size(2)}"
         return x_acc_xy
 
-    def forward(self, state_params: torch.Tensor, control_trainable: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    def forward(self, context_params: torch.Tensor, control_trainable: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
         兼容性前向端到端通道 (End-to-End Pipeline)
         用于简单的基线测试或不支持波形缓存的场景，内部隐式调用解耦后的管线。
         """
         # [Batch, 2, Seq_Len]
-        pulse_norm = self.generate_pulse(state_params)
-        return self.predict_injury_and_loss(state_params, control_trainable, pulse_norm)
+        pulse_norm = self.generate_pulse(context_params)
+        return self.predict_injury_and_loss(context_params, control_trainable, pulse_norm)

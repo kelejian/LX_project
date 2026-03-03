@@ -21,7 +21,7 @@ from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from common.utils.seeding import set_random_seed
 
 from InjuryPredict.utils import models
-from InjuryPredict.Injurydata_prepare import InjuryPackedDataset
+from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.config import RUNS_DIR
 
 # --- 1. 配置区：请在此处设置您的路径 ---
@@ -33,7 +33,7 @@ RUN_DIR = os.path.join(RUNS_DIR, "InjuryPredictModel_02151111")  # 示例: "./ru
 WEIGHT_FILE = "best_val_loss.pth"
 
 # 1.3) 包含原始13个标量特征的 distribution 文件路径
-DISTRIBUTION_FILE = r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0206.csv" 
+DISTRIBUTION_FILE = r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0302.csv" 
 
 # 1.4) 存放 .pt 数据集的目录
 DATA_DIR = INJURY_PROCESSED_DIR.as_posix()
@@ -55,7 +55,7 @@ def load_original_features(dist_file_path):
     # 连续特征 (0-10): impact_velocity, impact_angle, overlap, LL1, LL2, BTF, LLATTF, AFT, SP, SH, RA
     # 离散特征 (11-12): is_driver_side, OT
     feature_columns = [
-        'case_id',
+        'case_id', 'pulse_source_case_id',
         'impact_velocity', 'impact_angle', 'overlap', 'LL1', 'LL2', 
         'BTF', 'LLATTF', 'AFT', 'SP', 'SH', 'RA', 
         'is_driver_side', 'OT',
@@ -90,9 +90,9 @@ def load_model_and_data(run_dir, weight_file, data_dir=DATA_DIR):
     if not all(os.path.exists(p) for p in [train_pt_path, val_pt_path, test_pt_path]):
         raise FileNotFoundError(f"未在 {INJURY_PROCESSED_DIR.as_posix()} 中找到 train/val/test_dataset.pt。请先运行：python -m InjuryPredict.Injurydata_prepare 来生成数据集文件。")
         
-    train_subset = torch.load(train_pt_path)
-    val_subset = torch.load(val_pt_path)
-    test_subset = torch.load(test_pt_path)
+    train_subset = load_processed_subset(train_pt_path)
+    val_subset = load_processed_subset(val_pt_path)
+    test_subset = load_processed_subset(test_pt_path)
     
     # 拼接 Subset 作为完整的数据集
     full_dataset = torch.utils.data.ConcatDataset([train_subset, val_subset, test_subset])
@@ -139,7 +139,7 @@ def run_inference(model, dataset, device):
     print("开始在完整数据集上运行模型推理...")
     with torch.no_grad():
         for batch in data_loader:
-            # 从底层 Dataset 的 __getitem__ 解包（与旧 CrashDataset 行为兼容）
+            # 从底层 Dataset 的 __getitem__ 解包
             (batch_x_acc, batch_x_att_continuous, batch_x_att_discrete,
              batch_y_HIC, batch_y_Dmax, batch_y_Nij,
              batch_ais_head, batch_ais_chest, batch_ais_neck, batch_y_MAIS, batch_OT) = [d.to(device) for d in batch]
