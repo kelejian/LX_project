@@ -27,7 +27,7 @@ from InjuryPredict.config import RUNS_DIR
 # --- 1. 配置区：请在此处设置您的路径 ---
 
 # 1.1) 要评估的模型所在的运行目录
-RUN_DIR = os.path.join(RUNS_DIR, "InjuryPredictModel_02151111")  # 示例: "./runs/InjuryPredictModel_XXXXXXXX" 或 "./runs/StudentModel_XXXXXX"
+RUN_DIR = os.path.join(RUNS_DIR, "InjuryPredictModel_03032051")  # 示例: "./runs/InjuryPredictModel_XXXXXXXX" 或 "./runs/StudentModel_XXXXXX"
 
 # 1.2) 要加载的模型权重文件名
 WEIGHT_FILE = "best_val_loss.pth"

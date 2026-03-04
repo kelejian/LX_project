@@ -5,7 +5,7 @@ from typing import Dict, Tuple
 
 # 引入全局损伤风险计算模块与特征顺序常量
 from common.metrics import injury_risk
-from common.settings import FEATURE_ORDER
+from common.settings import FEATURE_ORDER, CONTINUOUS_INDICES, DISCRETE_INDICES
 from ARS_optim.src.core.param_manager import ParamManager
 
 # 引入物理约束管理器
@@ -13,12 +13,12 @@ from ARS_optim.src.core.constraints import PhysicalConstraintManager
 
 class SurrogateAdapter(nn.Module):
     """
-    代理模型级联适配器 (Cascaded Surrogate Adapter) - 物理因果解耦版
-    
-    架构设计:
-    本模块将物理环境严格解耦为两阶马尔可夫链: State -> Pulse -> Actions -> Injury。
-    通过拆分波形预测与损伤预测接口，允许优化器在局部寻优（Local Refinement）时
-    只计算一次波形并驻留显存缓存，从而在梯度迭代中仅调用轻量的损伤预测模型
+    代理模型级联适配器。
+
+    作用：
+    - 管理“波形预测 + 损伤预测 + 总损失计算”的统一接口；
+    - 训练/评估阶段都可复用同一套输入拼接与归一化规则；
+    - 支持先生成并缓存 pulse，再多次评估不同动作（避免重复推理波形模型）。
     """
     def __init__(self, pulse_model: nn.Module, injury_model: nn.Module, param_manager: ParamManager, config: dict, data_processor):
         super().__init__()
@@ -35,7 +35,7 @@ class SurrogateAdapter(nn.Module):
             raise ValueError("[致命错误] SurrogateAdapter 必须传入有效的 data_processor 实例！")
         self.data_processor = data_processor
         
-        # 严苛约束：代理模型仅作为提供物理梯度的环境模拟器，严禁在寻优中发生权重更新
+        # 代理模型在 ARS_optim 中视为冻结环境：不参与权重更新
         self.pulse_model.eval()
         self.injury_model.eval()
         for param in self.pulse_model.parameters():
@@ -43,7 +43,8 @@ class SurrogateAdapter(nn.Module):
         for param in self.injury_model.parameters():
             param.requires_grad = False
             
-        # 解析风险优化目标权重
+        # 损失权重来自配置：
+        # loss = risk + weight_penalty * constraint
         obj_cfg = config.get('optimization', {}).get('objectives', {})
         self.w_head = float(obj_cfg.get('weight_hic', 1.0))
         self.w_chest = float(obj_cfg.get('weight_dmax', 1.0))
@@ -57,8 +58,15 @@ class SurrogateAdapter(nn.Module):
 
     def _prepare_normalized_inputs(self, context_params: torch.Tensor, control_trainable: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        内部特征组装与归一化对齐器。
-        严格确保按照 FEATURE_ORDER 顺序拼装物理尺度的特征，并调用统一处理器进行归一化。
+        组装完整特征并做归一化。
+
+        输入：
+        - context_params: [Batch, D_context]
+        - control_trainable: [Batch, D_trainable]（可选）
+
+        输出：
+        - combined_phys: [Batch, D_total]（物理尺度）
+        - model_input_norm: [Batch, D_total]（归一化尺度）
         """
         batch_size = context_params.shape[0]
         device = context_params.device
@@ -69,13 +77,10 @@ class SurrogateAdapter(nn.Module):
         combined_phys[:, self.param_manager.get_context_indices()] = context_params
         
         if control_trainable is not None:
+            # 只覆盖可调控制参数列；其余列仍保留 context/default 语义
             combined_phys[:, self.param_manager.get_control_trainable_indices()] = control_trainable
             
-        fixed_indices, fixed_defaults = self.param_manager.get_control_fixed_defaults(device=device)
-        if len(fixed_indices) > 0:
-            combined_phys[:, fixed_indices] = fixed_defaults.unsqueeze(0).expand(batch_size, -1)
-            
-        # 2. 归一化特征 (保持梯度链)
+        # 2. 归一化特征（保持梯度链）
         # [Batch, Total_Dim] -> [Batch, Total_Dim]
         model_input_norm = self.data_processor.process_by_name(
             values=combined_phys, 
@@ -91,8 +96,8 @@ class SurrogateAdapter(nn.Module):
 
     def predict_injury_and_loss(self, context_params: torch.Tensor, control_trainable: torch.Tensor, pulse_norm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
-        独立物理接口 2: 损伤预测与风险计算器 (Injury Predictor & Loss Evaluator)
-        融合缓存的波形特征与当前的决策参数，评估整体物理风险。这是梯度下降的核心运算域。
+        损伤预测与总损失计算。
+        该接口是策略训练和局部精调的核心计算入口。
         
         参数:
             context_params: [Batch, D_context] 物理尺度上下文参数（state + fixed-control）
@@ -113,15 +118,19 @@ class SurrogateAdapter(nn.Module):
                 f"control_trainable has {control_trainable.size(1)} cols, expected {exp}"
         combined_phys, model_input_norm = self._prepare_normalized_inputs(context_params, control_trainable)
         
-        # 1. 切片提取 InjuryPredict 需要的特征结构
-        # [Batch, 11] (连续特征) & [Batch, 2] (离散类别)
-        x_att_continuous = model_input_norm[:, 0:11]
-        x_att_discrete = model_input_norm[:, 11:13].to(torch.long)
+        # 1. 提取 InjuryPredict 所需特征（使用全局索引常量，避免硬编码）
+        # [Batch, 13] -> [Batch, 11] 连续特征；[Batch, 2] 离散特征
+        x_att_continuous = model_input_norm[:, CONTINUOUS_INDICES]
+        # InjuryPredict 的离散输入要求为类别索引（long/int64）
+        # 例如 is_driver_side=1, OT=2 在编码后会对应整型类别 ID。
+        x_att_discrete = model_input_norm[:, DISCRETE_INDICES].to(torch.long)
         
-        # 2. 预测损伤物理值 (梯度将从这里回流至 control_trainable)
+        # 2) 损伤预测（梯度可从此处回传到 control_trainable）
         predictions_phys, _, _ = self.injury_model(pulse_norm, x_att_continuous, x_att_discrete)
 
-        # 3. 摊销寻优计算：非线性联合风险项 L_risk
+        # 3) 计算风险项 L_risk
+        # 例：若 p_head=0.2, p_chest=0.1, p_neck=0.05，
+        # 则 risk = 1 - (1-p_head)^w_h * (1-p_chest)^w_c * (1-p_neck)^w_n
         hic15 = predictions_phys[:, 0]
         dmax = predictions_phys[:, 1]
         nij = predictions_phys[:, 2]
@@ -133,7 +142,8 @@ class SurrogateAdapter(nn.Module):
         p_chest = injury_risk.Injury_prob_cal_chest(dmax, OT=ot_tensor)
         p_neck = injury_risk.Injury_prob_cal_neck(nij)
         
-        # 极值保护，防止导数在 0 或 1 处崩溃
+        # 极值保护：概率过近 0/1 时，乘幂与对数相关梯度会非常不稳定
+        # 这里保留一个很小缓冲带 [1e-6, 1-1e-6]。
         p_head = torch.clamp(p_head, 1e-6, 1.0 - 1e-6)
         p_chest = torch.clamp(p_chest, 1e-6, 1.0 - 1e-6)
         p_neck = torch.clamp(p_neck, 1e-6, 1.0 - 1e-6)
@@ -142,26 +152,27 @@ class SurrogateAdapter(nn.Module):
         term_chest = torch.pow(1.0 - p_chest, self.w_chest)
         term_neck = torch.pow(1.0 - p_neck, self.w_neck)
         
-        # 联合存活概率补集作为风险值 [Batch]
+        # 联合风险（逐样本）：[Batch]
         loss_risk = 1.0 - (term_head * term_chest * term_neck) 
         
-        # 4. 摊销寻优计算：物理边界双重惩罚项 L_constraint
-        # 4.1 绝对极值违规惩罚 (Min-Max Out-of-Bound) 在归一化空间中计算
+        # 4) 计算约束项 L_constraint
+        # 4.1 边界违规惩罚（在 [0,1] 归一化空间计算）
         norm_actions = self._normalize_control(control_trainable, device=device)
         norm_min, norm_max = self._get_normalized_bounds(device=device)
         exceed_max = torch.relu(norm_actions - norm_max.unsqueeze(0))
         exceed_min = torch.relu(norm_min.unsqueeze(0) - norm_actions)
         abs_penalty = (exceed_max + exceed_min).sum(dim=1)
         
-        # 4.2 相对耦合违规惩罚 (依赖于第二步升级的混合状态约束上下文)
+        # 4.2 耦合关系惩罚（例如 AFT 与 BTF 的关系）
         rel_penalty = self.constraint_manager.compute_soft_penalty(control_trainable, context_params)
         
         loss_constraint = abs_penalty + rel_penalty # [Batch]
         
-        # 5. 总损失融合
+        # 5) 总损失
         total_loss = loss_risk + self.weight_penalty * loss_constraint # [Batch]
         
         info = {
+            # info 仅用于日志/导出，不参与反向传播，因此统一 detach
             "loss_risk": loss_risk.detach(),
             "loss_constraint": loss_constraint.detach(),
             "abs_penalty": abs_penalty.detach(),
@@ -215,8 +226,10 @@ class SurrogateAdapter(nn.Module):
         combined = torch.zeros((batch, total_dim), device=device, dtype=torch.float32)
         combined[:, self.param_manager.get_context_indices()] = context_params
 
-        # 仅取关键工况、并归一化
+        # 仅提取 impact 三要素（速度/角度/重叠率）
+        # [B, D_total] -> [B, 3] -> 归一化后 [B, 3]
         impact_names = ["impact_velocity", "impact_angle", "overlap"]
+        # 按 FEATURE_ORDER 动态查列，避免写死列号导致未来错位
         impact_indices = [FEATURE_ORDER.index(name) for name in impact_names]
         impact_phys = combined[:, impact_indices]
         impact_norm = self.data_processor.process_by_name(
@@ -228,7 +241,8 @@ class SurrogateAdapter(nn.Module):
             waveform_norm = self.pulse_model.get_metrics_output(pulse_output_raw)
         else:
             waveform_norm = pulse_output_raw[-1][0] if isinstance(pulse_output_raw, (list, tuple)) else pulse_output_raw
-        # 提取XY轴
+        # 提取 XY 轴：
+        # [B, 3, Seq_Len] -> [B, 2, Seq_Len]
         x_acc_xy = waveform_norm[:, 0:2, :]
         from common.settings import WAVEFORM_LENGTH
         assert x_acc_xy.dim() == 3 and x_acc_xy.size(1) == 2, \

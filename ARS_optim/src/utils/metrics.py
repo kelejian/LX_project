@@ -1,9 +1,8 @@
 # src/utils/metrics.py
 
 import numpy as np
-import torch
-from typing import Dict, List, Any, Union
-from src.utils.logger import setup_logger
+from typing import Dict, Any, Optional
+from ARS_optim.src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
@@ -32,7 +31,13 @@ class MetricsTracker:
             "steps_taken": []
         }
     
-    def update(self, result: Dict[str, Any], case_id: int):
+    def update(
+        self,
+        result: Dict[str, Any],
+        case_id: int,
+        initial_action: Optional[np.ndarray] = None,
+        optimized_action: Optional[np.ndarray] = None
+    ):
         """
         更新单次优化结果
         
@@ -40,8 +45,15 @@ class MetricsTracker:
             result: optimizer.optimize() 返回的字典
             case_id: 当前案例 ID
         """
-        init_loss = result['initial']['loss']
-        final_loss = result['optimized']['loss']
+        if 'initial' not in result:
+            raise KeyError("result 缺少 'initial' 字段，无法更新指标。")
+
+        init_loss = float(result['initial'].get('loss_mean', 0.0))
+        final_loss_batch = result.get('final_loss_batch')
+        if final_loss_batch is None:
+            final_loss = init_loss
+        else:
+            final_loss = float(final_loss_batch.mean().item())
         
         # 计算优化率 (防止除零)
         if abs(init_loss) > 1e-6:
@@ -49,20 +61,20 @@ class MetricsTracker:
         else:
             imp_rate = 0.0
             
-        # 计算参数偏移量 (L2 Distance)
-        # 此时 action_phys 已经是 list
-        p0 = np.array(result['initial']['action_phys'])
-        p_opt = np.array(result['optimized']['action_phys'])
-        shift = np.linalg.norm(p_opt - p0)
+        # 参数偏移量 (L2 Distance) 由调用方提供，避免强依赖 result 结构
+        if initial_action is not None and optimized_action is not None:
+            shift = float(np.linalg.norm(np.asarray(optimized_action) - np.asarray(initial_action)))
+        else:
+            shift = 0.0
         
         # 记录数据
         self.history["case_ids"].append(case_id)
         self.history["initial_loss"].append(init_loss)
         self.history["final_loss"].append(final_loss)
         self.history["improvement_rate"].append(imp_rate)
-        self.history["time_cost"].append(result['time_cost'])
+        self.history["time_cost"].append(float(result.get('time_cost', 0.0)))
         self.history["param_shift_l2"].append(shift)
-        self.history["steps_taken"].append(len(result['trajectory']))
+        self.history["steps_taken"].append(len(result.get('trajectory', [])))
 
     def compute_summary(self) -> Dict[str, float]:
         """计算当前所有记录的聚合统计信息"""

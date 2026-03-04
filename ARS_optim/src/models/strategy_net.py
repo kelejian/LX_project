@@ -6,6 +6,7 @@ from typing import List
 # 严格执行绝对路径引用规范
 from ARS_optim.src.core.param_manager import ParamManager
 from ARS_optim.src.core.constraints import PhysicalConstraintManager
+from common.data_utils.processor import UnifiedDataProcessor
 
 class StrategyNet(nn.Module):
     """
@@ -26,6 +27,7 @@ class StrategyNet(nn.Module):
         self, 
         param_manager: ParamManager, 
         constraint_manager: PhysicalConstraintManager,
+        data_processor: UnifiedDataProcessor,
         hidden_dims: List[int] = [128, 256, 128],
         activation: str = "LeakyReLU",
         dropout: float = 0.1,
@@ -36,10 +38,12 @@ class StrategyNet(nn.Module):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.param_manager = param_manager
         self.constraint_manager = constraint_manager
+        self.data_processor = data_processor
         
         # 确定输入与输出基础维度
         self.context_dim = self.param_manager.get_context_dim()
         self.output_dim = self.param_manager.get_trainable_dim()
+        self.context_names = self.param_manager.get_context_names()
         # 记录波形编码器输出维度，方便在 forward 中做一致性检查
         self.pulse_embed_dim = pulse_embed_dim
         
@@ -74,12 +78,15 @@ class StrategyNet(nn.Module):
         layers = []
         # MLP 的输入维度 = 上下文特征维度 + 波形嵌入特征维度
         in_features = self.context_dim + pulse_embed_dim
-        act_layer_instance = act_layer_cls(inplace=True)
         
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(in_features, hidden_dim, bias=False)) # BN前无需Bias
             layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(act_layer_instance)
+            # 每层使用独立激活模块，避免未来改为有状态激活时发生参数共享
+            if act_layer_cls is nn.PReLU:
+                layers.append(act_layer_cls())
+            else:
+                layers.append(act_layer_cls(inplace=True))
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             in_features = hidden_dim
@@ -95,6 +102,11 @@ class StrategyNet(nn.Module):
         min_b, max_b = self.param_manager.get_trainable_bounds()
         self.register_buffer("min_bounds", min_b)
         self.register_buffer("max_bounds", max_b)
+
+        # 记录可调参数 default 值（用于最后一层偏置初始化，使未训练时输出即为 default）
+        # 例：若 BTF 的 min/max/default = 10/100/20，则期望初始输出靠近 20。
+        defaults = [p['default'] for p in self.param_manager.control_trainable_params]
+        self.register_buffer("default_actions", torch.tensor(defaults, dtype=torch.float32))
         
         # 权重初始化
         self._initialize_weights()
@@ -117,7 +129,7 @@ class StrategyNet(nn.Module):
         return (actions_phys - self.min_bounds.unsqueeze(0)) / safe_span.unsqueeze(0)
 
     def _initialize_weights(self):
-        """深度网络权重初始化 (Kaiming Normal for LeakyReLU/ReLU)"""
+        """深度网络权重初始化 + 输出层 default 对齐初始化。"""
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -125,6 +137,31 @@ class StrategyNet(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
+
+        # 输出层特殊初始化：让未训练网络在任意输入下逼近 param_space 默认值
+        # 公式：sigmoid(z)=r, r=(default-min)/(max-min), z=log(r/(1-r))
+        out_layer = self.mlp[-1]
+        if isinstance(out_layer, nn.Linear):
+            with torch.no_grad():
+                # 把最后一层权重清零，相当于先“屏蔽输入差异”，仅保留 bias 控制输出
+                nn.init.constant_(out_layer.weight, 0.0)
+
+                ratio = (self.default_actions - self.min_bounds) / torch.clamp(self.max_bounds - self.min_bounds, min=1e-12)
+                # ratio 需要落在 (0,1) 才能做 logit；边界值会造成数值溢出
+                ratio = torch.clamp(ratio, min=1e-6, max=1.0 - 1e-6)
+                bias = torch.log(ratio / (1.0 - ratio))
+                if out_layer.bias is None:
+                    raise ValueError("策略网络输出层必须包含 bias，才能对齐 default 初始化。")
+                out_layer.bias.copy_(bias)
+
+    def _normalize_context(self, context_features: torch.Tensor) -> torch.Tensor:
+        """按全局 normalization_config 对 context 参数做归一化。"""
+        normalized = self.data_processor.process_by_name(
+            values=context_features,
+            feature_names=self.context_names,
+            inverse=False
+        )
+        return normalized
 
     def forward(self, context_features: torch.Tensor, pulse_features: torch.Tensor) -> torch.Tensor:
         """
@@ -146,27 +183,32 @@ class StrategyNet(nn.Module):
         assert pulse_embed.size(1) == self.pulse_embed_dim, \
             "pulse_encoder output dimension mismatch"
         
-        # 2. 多模态特征级联
+        # 2. 上下文归一化（与训练时全局归一化规则保持一致）
+        # [Batch, D_context] 物理尺度 -> [Batch, D_context] 归一化尺度
+        context_norm = self._normalize_context(context_features)
+
+        # 3. 多模态特征级联
         # [Batch, D_context] ⊕ [Batch, pulse_embed_dim] -> [Batch, D_context + pulse_embed_dim]
-        combined_features = torch.cat([context_features, pulse_embed], dim=1)
+        combined_features = torch.cat([context_norm, pulse_embed], dim=1)
         
-        # 3. 骨干网络非线性决策映射
+        # 4. 骨干网络非线性决策映射
         # [Batch, D_context + pulse_embed_dim] -> [Batch, D_trainable]
         raw_output = self.mlp(combined_features)
         
-        # 4. 绝对极值范围逆映射 (Sigmoid + Affine Transform)
+        # 5. 绝对极值范围逆映射 (Sigmoid + Affine Transform)
         # 利用 Sigmoid 将输出强制压入 (0, 1) 区间，随后按对应参数的 Min-Max 拉伸至真实物理标度
         norm_actions = torch.sigmoid(raw_output)
         range_span = self.max_bounds - self.min_bounds
         # 防止某些维度 min==max 导致 0 乘法
         safe_span = torch.where(range_span > 0, range_span, torch.ones_like(range_span))
+        # [Batch, D_trainable] * [1, D_trainable] + [1, D_trainable]
         abs_actions = norm_actions * safe_span.unsqueeze(0) + self.min_bounds.unsqueeze(0)
         
         # 输出数值检查，某些激活和归一化组合在训练初期可能产生 NaN/Inf
         if torch.isnan(abs_actions).any() or torch.isinf(abs_actions).any():
             self.logger.warning("策略网络输出包含 NaN/Inf，可能发生梯度爆炸或数据异常。")
         
-        # 5. 混合状态物理法则硬投影 (Hard Constraint Projection)
+        # 6. 混合状态物理法则硬投影 (Hard Constraint Projection)
         # 依赖于 PhysicalConstraintManager，融入 context_features 上下文以解析混合参数耦合限制
         final_actions = self.constraint_manager.project_forward(abs_actions, context_features)
         

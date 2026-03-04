@@ -15,9 +15,9 @@ device: "cuda" # 或 "cpu"
 # 和 common.settings.INJURY_PREDICT_DIR 分别解析。
 surrogate:
   # pulse 模型相对路径
-  pulse_checkpoint: "saved/models/HybridPulseCNN/0210_115651/model_best.pth"
+  pulse_checkpoint: "saved/models/HybridPulseCNN/0303_213959/model_best.pth"
   # injury 模型相对路径
-  checkpoint_rel_path: "runs/InjuryPredictModel_01281059/best_val_loss.pth"
+  checkpoint_rel_path: "runs/InjuryPredictModel_03032051/best_val_loss.pth"
 
 # ===========================
 # 3. 策略网络(Strategy Net)训练 - 摊销优化超参
@@ -26,12 +26,26 @@ strategy_net:
   hidden_dims: [128, 256, 128] # MLP 隐藏层架构
   activation: "LeakyReLU"
   dropout: 0.1
+  pulse_channels: 2      # 波形输入通道（当前为 XY 两通道）
+  pulse_embed_dim: 32    # 波形编码后的嵌入维度
   
   train:
     batch_size: 256
     max_iterations: 50000  # 放弃 Epoch 概念，使用最大迭代步数控制无标签自监督数据流
     lr: 0.001
     weight_decay: 1e-4
+    log_interval: 10
+    save_best: true
+    save_last: true
+    scheduler:
+      type: "cosine"      # none | cosine | step
+      T_max: 50000
+      eta_min: 1.0e-5
+    val_interval: 500       # 每隔多少 iterations 评估一次完整验证集
+    val_batch_size: 1024    # 验证阶段批大小（不影响训练batch）
+    gradient_clip_max_norm: 1.0 # 梯度裁剪阈值
+    jitter_ratio: 0.01      # 经验池连续参数扰动幅度（占参数范围比例）
+    jitter_prob: 1.0        # 每个连续参数施加扰动的概率
 
 # ===========================
 # 4. 在线寻优(Online Optimization) - 策略网络直推和局部精调超参
@@ -42,9 +56,11 @@ optimization:
   # 直推后的精调迭代参数
   refine_steps: 50         # 局部精调迭代次数 k. 若为0，则仅依赖策略网络直接推理
   lr: 0.05                 # 代理模型梯度下降步长 (针对归一化后的参数)
+  optimize_in_normalized: False  # 是否在归一化空间进行局部精调
   
   # 综合目标函数(Loss)各部位风险权重
   objectives:
     weight_hic: 1.0
     weight_dmax: 1.0
     weight_nij: 1.0
+    weight_penalty: 10.0   # 物理约束惩罚项系数

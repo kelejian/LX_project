@@ -22,6 +22,10 @@ class PhysicalConstraintManager:
     def __init__(self, param_manager: ParamManager):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.param_manager = param_manager
+        self.rules = param_manager.get_sampling_rules() if hasattr(param_manager, 'get_sampling_rules') else {}
+        coupling = self.rules.get('coupling', {}) if isinstance(self.rules, dict) else {}
+        self.aft_btf_delta_max = float(coupling.get('aft_btf_delta_max', 25.0))
+        self.epsilon = float(coupling.get('epsilon', 1e-3))
         
         # 建立参数类别映射表：用于跨越张量边界进行动态数据检索
         # 核心逻辑：记录可调参数在 actions 张量中的具体列索引，以及状态参数在 state 张量中的列索引
@@ -64,7 +68,8 @@ class PhysicalConstraintManager:
             projected_actions: [Batch, D_trainable] 修正后且保留梯度的决策参数
         """
         device = actions.device
-        # 列表解包：将各列拆分为独立 Tensor 列表，规避 In-place 原地赋值引发的梯度断裂
+        # 将 [Batch, D] 拆成列列表，后续逐列替换时更直观。
+        # 注意：这里不直接对 actions 原地改列，避免复杂的梯度别名问题。
         cols = [actions[:, i] for i in range(actions.shape[1])]
         
         # =========================================================
@@ -76,12 +81,15 @@ class PhysicalConstraintManager:
         
         # 正向截断：如果 AFT 可调，其上限受制于 BTF
         if 'AFT' in self.trainable_names:
-            cols[self.trainable_names['AFT']] = torch.min(aft, btf + 25.0 - 1e-3)
+            # torch.min 是逐元素可微算子，适合做“上界投影”
+            cols[self.trainable_names['AFT']] = torch.min(aft, btf + self.aft_btf_delta_max - self.epsilon)
             
-        # 级联更新与反向截断：重新提取可能已被修正的 AFT。如果 BTF 可调，其下限受制于 AFT
+        # 级联更新与反向截断：当一端改为 fixed/context 时，该分支可避免另一端失控
+        # 注：在双侧都可调且前向已满足约束时，这里通常是恒等操作
         aft = self._get_param_col('AFT', cols, context_params, device)
         if 'BTF' in self.trainable_names:
-            cols[self.trainable_names['BTF']] = torch.max(btf, aft - 25.0 + 1e-3)
+            # 反向投影对应“下界投影”
+            cols[self.trainable_names['BTF']] = torch.max(btf, aft - self.aft_btf_delta_max + self.epsilon)
 
         # =========================================================
         # 约束 2: 二级限力切换时刻 (LLATTF) 必须晚于或等于 预紧器点火时刻 (BTF)
@@ -93,6 +101,7 @@ class PhysicalConstraintManager:
         if 'LLATTF' in self.trainable_names:
             cols[self.trainable_names['LLATTF']] = torch.max(llattf, btf)
             
+        # 同上：该分支主要用于 mixed-state 场景的稳定约束闭环
         llattf = self._get_param_col('LLATTF', cols, context_params, device)
         if 'BTF' in self.trainable_names:
             cols[self.trainable_names['BTF']] = torch.min(btf, llattf)
@@ -107,12 +116,24 @@ class PhysicalConstraintManager:
         if 'LL2' in self.trainable_names:
             cols[self.trainable_names['LL2']] = torch.min(ll2, ll1)
             
+        # 同上：保留反向分支以兼容未来 trainable 配置调整
         ll2 = self._get_param_col('LL2', cols, context_params, device)
         if 'LL1' in self.trainable_names:
             cols[self.trainable_names['LL1']] = torch.max(ll1, ll2)
 
         # 梯度安全重组：重新堆叠回张量 [Batch, D_trainable]
         projected_actions = torch.stack(cols, dim=1)
+
+        # 轻量一致性检查：若投影后仍有耦合约束残差，提示存在不可满足的参数组合
+        with torch.no_grad():
+            residual = self.compute_soft_penalty(projected_actions, context_params)
+            # 阈值 1e-6 主要用于滤掉浮点误差，避免日志噪声
+            if torch.any(residual > 1e-6):
+                max_residual = float(residual.max().item())
+                self.logger.warning(
+                    f"检测到投影后仍有约束残差（max={max_residual:.6f}）。"
+                    "请检查 fixed/state 参数是否导致耦合关系不可同时满足。"
+                )
         return projected_actions
 
     def compute_soft_penalty(self, actions: torch.Tensor, context_params: torch.Tensor) -> torch.Tensor:
@@ -143,7 +164,7 @@ class PhysicalConstraintManager:
         ll2 = self._get_param_col('LL2', cols, context_params, device)
         
         # 惩罚项 1: 约束 AFT < BTF + 25 越界
-        penalty += torch.relu(aft - (btf + 25.0))
+        penalty += torch.relu(aft - (btf + self.aft_btf_delta_max))
         
         # 惩罚项 2: 约束 LLATTF >= BTF 越界
         penalty += torch.relu(btf - llattf)

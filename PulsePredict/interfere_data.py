@@ -30,12 +30,8 @@ plt.rcParams['axes.unicode_minus'] = False    # 负号正常显示
 # --------------------------------------------------------------------------------------
 # 指定要加载的模型检查点 (.pth) 文件路径
 CHECKPOINT_PATH = (
-    r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_project\PulsePredict\saved\models\HybridPulseCNN\0303_201345\model_best.pth"
+    r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_project\PulsePredict\saved\models\HybridPulseCNN\0303_213959\model_best.pth"
 )
-
-# 数据集路径（已弃用旧的多文件列表）：
-# DATASET_NPZ_PATH_LIST 已被移除，脚本现在直接从 checkpoint 的 config.json
-# 中读取单一 canonical 打包文件（data/packaged ... -> 'packaged_data_path'），不再兼容旧格式。
 
 # 1.2. 绘图轴配置
 # --------------------------------------------------------------------------------------

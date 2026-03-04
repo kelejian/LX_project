@@ -61,7 +61,7 @@ class InjuryPackedDataset(Dataset):
             self.x_acc_raw = data["x_acc_xy"].astype(np.float32)  # (N, C=2, T)
         else:
             self.x_acc_raw = data["x_acc_xyz"][:, :2, :].astype(np.float32)
-        # labels（可能部分缺失）
+        # labels（容许存在缺失以保证运行; 因为存在缺失的case不会被包含在train/val/test数据划分中）
         self.y_HIC = data.get("y_HIC", np.full((len(self.case_ids),), np.nan)).astype(np.float32)
         self.y_Dmax = data.get("y_Dmax", np.full((len(self.case_ids),), np.nan)).astype(np.float32)
         self.y_Nij = data.get("y_Nij", np.full((len(self.case_ids),), np.nan)).astype(np.float32)

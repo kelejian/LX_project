@@ -66,8 +66,8 @@ if __name__ == "__main__":
     from dataclasses import dataclass
     @dataclass
     class args:
-        run_dir: str = r'E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_model_injurypredict\runs\InjuryPredictModel_10261509'
-        weight_file: str = 'final_model.pth'
+        run_dir: str = r'E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_model_injurypredict\runs\InjuryPredictModel_03032051'
+        weight_file: str = 'best_val_loss.pth'
 
     # 加载超参数和训练记录
     with open(os.path.join(args.run_dir, "TrainingRecord.json"), "r") as f:

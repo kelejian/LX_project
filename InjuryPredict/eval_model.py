@@ -175,14 +175,14 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') 
  
     # parser = argparse.ArgumentParser(description="Evaluate a trained injury prediction model")
-    # parser.add_argument("--run_dir", '-r', type=str, required=True, help="Directory of the training run to evaluate.")
-    # parser.add_argument("--weight_file", '-w', type=str, default="best_mais_accu.pth", help="Name of the model weight file.")
+    # parser.add_argument("--run_dir", '-r', type=str, default=r".\InjuryPredict\runs\InjuryPredictModel_03032051", help="Directory of the training run to evaluate.")
+    # parser.add_argument("--weight_file", '-w', type=str, default="best_val_loss.pth", help="Name of the model weight file.")
     # args = parser.parse_args()
 
     from dataclasses import dataclass
     @dataclass
     class args:
-        run_dir: str = r".\InjuryPredict\runs\InjuryPredictModel_02151111"
+        run_dir: str = r".\InjuryPredict\runs\InjuryPredictModel_03032051"
         weight_file: str = 'best_val_loss.pth'
 
     # --- 1. 加载模型和数据 ---

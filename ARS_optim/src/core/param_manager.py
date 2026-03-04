@@ -21,15 +21,21 @@ class ParamManager:
     """
     def __init__(self, param_space_path_or_dict, norm_config_path: str = None):
         self.logger = logging.getLogger(self.__class__.__name__)
+        self.param_space_config = {}
+        self.sampling_rules = {}
 
         # --------------- 解析参数空间 ----------------
         if isinstance(param_space_path_or_dict, dict):
             # 直接给定了加载后的 dict（适用于单元测试）
+            self.param_space_config = param_space_path_or_dict
             self.param_space_raw = param_space_path_or_dict.get('parameters', [])
+            self.sampling_rules = param_space_path_or_dict.get('sampling_rules', {})
         else:
             # 视为文件路径
             with open(param_space_path_or_dict, 'r', encoding='utf-8') as f:
-                self.param_space_raw = yaml.safe_load(f)['parameters']
+                self.param_space_config = yaml.safe_load(f)
+            self.param_space_raw = self.param_space_config['parameters']
+            self.sampling_rules = self.param_space_config.get('sampling_rules', {})
 
         # --------------- 解析归一化配置 ----------------
         if norm_config_path is None:
@@ -192,6 +198,10 @@ class ParamManager:
         # 由于在 _parse_parameters 中已做硬校验，此处 p['default'] 必然存在，直接提取
         defaults = [p['default'] for p in self.control_fixed_params]
         return indices, torch.tensor(defaults, dtype=torch.float32, device=device)
+
+    def get_sampling_rules(self) -> dict:
+        """获取参数空间中集中定义的采样/约束规则。"""
+        return self.sampling_rules
 
     # ------------------------------------------------------------------
     def _check_norm_presence(self):

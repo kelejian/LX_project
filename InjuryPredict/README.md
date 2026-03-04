@@ -24,7 +24,7 @@ pip install -r requirements.txt
 ## 4. 数据准备（必须先做）
 注意：**严格依赖**先运行根目录的 `prepare_data.py` 来生成原始打包与索引文件。
 
-1) 生成原始打包与索引：
+1) 根目录下生成原始打包与索引（如已生成请忽略该步）：
 ```bash
 python prepare_data.py
 ```

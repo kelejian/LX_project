@@ -6,7 +6,7 @@ FEATURE_ORDER = [
     "impact_velocity", "impact_angle", "overlap",
     "LL1", "LL2", "BTF", "LLATTF", "AFT", "SP", "SH", "RA",
     "is_driver_side", "OT"
-] # 共12个特征列，11个连续值+1个二分类标志位+1个整数OT; 顺序不可更改！严格依赖此顺序读取和存储数据，与损伤预测模型输入对应！
+] # 共13个特征列，11个连续值+1个二分类标志位+1个整数OT; 顺序不可更改！严格依赖此顺序读取和存储数据，与损伤预测模型输入对应！
 
 CONTINUOUS_INDICES = list(range(11)) # 在特征向量中的索引（对应前11个连续特征）
 

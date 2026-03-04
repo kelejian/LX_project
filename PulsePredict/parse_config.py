@@ -23,7 +23,8 @@ class ConfigParser:
         """
         # load config file and apply modification
         self._config = _update_config(config, modification)
-        self.resume = resume
+        # 使 resume 也为绝对路径，避免 relative_to 失败
+        self.resume = Path(resume).resolve() if resume is not None else None
 
         timestamp = datetime.now().strftime(r'%m%d_%H%M%S')
         save_dir_root = Path(self.config['trainer']['save_dir'])
