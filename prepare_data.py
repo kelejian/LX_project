@@ -15,6 +15,7 @@ from common.settings import RAW_DATA_DIR, SPLIT_INDICES_DIR, NORMALIZATION_CONFI
 from common.settings import WAVEFORM_LENGTH, WAVEFORM_CHANNELS_XY, WAVEFORM_CHANNELS_XYZ
 from common.data_utils.splitter import stratified_split_case_ids, case_ids_to_indices
 from common.data_utils.processor import UnifiedDataProcessor
+from common.data_utils.split_io import save_int_vector_csv, load_int_vector_csv
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 
 from tqdm import tqdm
@@ -282,17 +283,17 @@ def _save_split(out_dir: Path, prefix: str, case_ids_all: np.ndarray,
     '''
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    np.save(out_dir / f"{prefix}_train_case_ids.npy", train_case_ids.astype(np.int64))
-    np.save(out_dir / f"{prefix}_val_case_ids.npy", val_case_ids.astype(np.int64))
-    np.save(out_dir / f"{prefix}_test_case_ids.npy", test_case_ids.astype(np.int64))
+    save_int_vector_csv(out_dir / f"{prefix}_train_case_ids.csv", train_case_ids)
+    save_int_vector_csv(out_dir / f"{prefix}_val_case_ids.csv", val_case_ids)
+    save_int_vector_csv(out_dir / f"{prefix}_test_case_ids.csv", test_case_ids)
 
     train_idx = case_ids_to_indices(case_ids_all, train_case_ids) # 将训练集 case_ids 转为对应的索引
     val_idx = case_ids_to_indices(case_ids_all, val_case_ids)   # 将验证集 case_ids 转为对应的索引
     test_idx = case_ids_to_indices(case_ids_all, test_case_ids) # 将测试集 case_ids 转为对应的索引
 
-    np.save(out_dir / f"{prefix}_train_indices.npy", train_idx)
-    np.save(out_dir / f"{prefix}_val_indices.npy", val_idx)
-    np.save(out_dir / f"{prefix}_test_indices.npy", test_idx)
+    save_int_vector_csv(out_dir / f"{prefix}_train_indices.csv", train_idx)
+    save_int_vector_csv(out_dir / f"{prefix}_val_indices.csv", val_idx)
+    save_int_vector_csv(out_dir / f"{prefix}_test_indices.csv", test_idx)
 
     with open(out_dir / f"{prefix}_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -314,9 +315,9 @@ def _save_pulse_split_with_first_occurrence_indices(
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    np.save(out_dir / "pulse_train_case_ids.npy", train_source_ids.astype(np.int64))
-    np.save(out_dir / "pulse_val_case_ids.npy", val_source_ids.astype(np.int64))
-    np.save(out_dir / "pulse_test_case_ids.npy", test_source_ids.astype(np.int64))
+    save_int_vector_csv(out_dir / "pulse_train_case_ids.csv", train_source_ids)
+    save_int_vector_csv(out_dir / "pulse_val_case_ids.csv", val_source_ids)
+    save_int_vector_csv(out_dir / "pulse_test_case_ids.csv", test_source_ids)
 
     source_to_first_row: Dict[int, int] = {}
     for row_idx, src in enumerate(pulse_source_case_ids_all.tolist()):
@@ -340,9 +341,9 @@ def _save_pulse_split_with_first_occurrence_indices(
             )
         return np.asarray(mapped, dtype=np.int64)
 
-    np.save(out_dir / "pulse_train_indices.npy", _map_sources_to_first_rows(train_source_ids, "train"))
-    np.save(out_dir / "pulse_val_indices.npy", _map_sources_to_first_rows(val_source_ids, "val"))
-    np.save(out_dir / "pulse_test_indices.npy", _map_sources_to_first_rows(test_source_ids, "test"))
+    save_int_vector_csv(out_dir / "pulse_train_indices.csv", _map_sources_to_first_rows(train_source_ids, "train"))
+    save_int_vector_csv(out_dir / "pulse_val_indices.csv", _map_sources_to_first_rows(val_source_ids, "val"))
+    save_int_vector_csv(out_dir / "pulse_test_indices.csv", _map_sources_to_first_rows(test_source_ids, "test"))
 
     with open(out_dir / "pulse_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -358,7 +359,7 @@ def generate_splits(
 ):
     """
     基于打包数据.npz文件 生成 injury/pulse 两套划分结果。
-    生成的./data 下保存的所有数据集索引(_indices.npy 文件)，严格对应 raw_data_packed.npz 中各个 np.ndarray 的行索引. raw_data_packed.npz 目前只包含 is_pulse_ok==True 的样本。
+    生成的./data 下保存的所有数据集索引(_indices.csv 文件)，严格对应 raw_data_packed.npz 中各个 np.ndarray 的行索引. raw_data_packed.npz 目前只包含 is_pulse_ok==True 的样本。
     """
     data = np.load(raw_npz_path)
     case_ids_all = data["case_ids"].astype(np.int64) # (N,), 全量 pulse_ok==True 的 case_ids
@@ -573,10 +574,10 @@ def main():
     
     # 加载打包数据和训练集索引
     raw_data = np.load(out_raw)
-    train_indices_path = out_splits / "injury_train_indices.npy"
+    train_indices_path = out_splits / "injury_train_indices.csv"
     
     if train_indices_path.exists():
-        train_indices = np.load(train_indices_path)
+        train_indices = load_int_vector_csv(train_indices_path)
         # 构建训练集数据字典（仅用于统计量计算）
         train_data = {
             'x_att_raw': raw_data['x_att_raw'][train_indices], # shape: (N, len(FEATURE_ORDER))

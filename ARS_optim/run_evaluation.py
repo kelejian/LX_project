@@ -9,6 +9,7 @@ import re
 from datetime import datetime
 
 from common.data_utils.processor import UnifiedDataProcessor
+from common.data_utils.split_io import load_int_vector_csv
 from common.settings import NORMALIZATION_CONFIG_PATH, RAW_DATA_DIR, SPLIT_INDICES_DIR, FEATURE_ORDER
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 
@@ -42,7 +43,7 @@ case_id
 def parse_args():
     parser = argparse.ArgumentParser(description="ARS Local Refinement Evaluator")
     parser.add_argument('--input_csv', type=str, default=None,
-                        help="可选：输入工况参数CSV。若不提供，则自动使用 injury_test_indices 对应的测试集工况。")
+                        help="可选：输入工况参数CSV。若不提供，则自动使用 injury_test_indices.csv 对应的测试集工况。")
     parser.add_argument('--output_csv', type=str, default='evaluation_results.csv', help="输出的对比结果CSV文件路径")
     parser.add_argument('--strategy_ckpt', type=str, default=None,
                         help="可选：策略网络权重文件路径，若指定则加载并启用直推模式")
@@ -148,7 +149,7 @@ def main():
     # 1) 解析输入工况
     # 双模式：
     # - 指定 --input_csv：按本地 CSV 工况评估
-    # - 未指定 --input_csv：自动读取 injury_test_indices 对应测试集，附带真值标签
+    # - 未指定 --input_csv：自动读取 injury_test_indices.csv 对应测试集，附带真值标签
     truth_arrays = {}
     input_source_type = None
     input_source_path = None
@@ -166,13 +167,13 @@ def main():
             truth_arrays['y_Nij'] = df_input['y_Nij'].to_numpy(dtype=np.float32)
     else:
         pool_npz_path = RAW_DATA_DIR / 'raw_data_packed.npz'
-        test_idx_path = SPLIT_INDICES_DIR / 'injury_test_indices.npy'
+        test_idx_path = SPLIT_INDICES_DIR / 'injury_test_indices.csv'
         if not pool_npz_path.exists():
             raise FileNotFoundError(f"测试集自动模式下未找到数据包: {pool_npz_path}")
         if not test_idx_path.exists():
             raise FileNotFoundError(f"测试集自动模式下未找到索引文件: {test_idx_path}")
 
-        test_indices = np.load(test_idx_path).astype(np.int64)
+        test_indices = load_int_vector_csv(test_idx_path)
         with np.load(pool_npz_path, allow_pickle=True) as data:
             if 'x_att_raw' not in data:
                 raise KeyError("raw_data_packed.npz 缺失 x_att_raw，无法组装测试集工况。")

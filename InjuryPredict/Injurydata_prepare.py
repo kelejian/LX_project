@@ -30,6 +30,7 @@ from common.settings import (
     INJURY_PROCESSED_DIR, ensure_dirs
 )
 from common.data_utils.processor import UnifiedDataProcessor
+from common.data_utils.split_io import load_int_vector_csv
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 
 # --------------------- 辅助 Dataset（轻量） ---------------------
@@ -128,7 +129,7 @@ def build_and_save_splits(
 
     调用前必须已运行根目录的 `prepare_data.py` 来生成
     - `data/raw_packed/raw_data_packed.npz`
-    - `data/split_indices/*_indices.npy`
+    - `data/split_indices/*_indices.csv`
     - `data/normalization_config.json`
 
     """
@@ -142,17 +143,17 @@ def build_and_save_splits(
         raise FileNotFoundError(f"raw_packed 文件未找到: {raw_packed} — 请先运行 prepare_data.py")
 
     # 2) 读取划分索引（优先使用 injury 前缀）
-    train_idx_path = split_dir / "injury_train_indices.npy"
-    val_idx_path = split_dir / "injury_val_indices.npy"
-    test_idx_path = split_dir / "injury_test_indices.npy"
+    train_idx_path = split_dir / "injury_train_indices.csv"
+    val_idx_path = split_dir / "injury_val_indices.csv"
+    test_idx_path = split_dir / "injury_test_indices.csv"
     if not (train_idx_path.exists() and val_idx_path.exists() and test_idx_path.exists()):
         raise FileNotFoundError(
-            f"缺少划分索引（injury_*_indices.npy）。请先运行 prepare_data.py 或检查 {split_dir}" 
+            f"缺少划分索引（injury_*_indices.csv）。请先运行 prepare_data.py 或检查 {split_dir}" 
         )
 
-    train_idx = np.load(train_idx_path)
-    val_idx = np.load(val_idx_path)
-    test_idx = np.load(test_idx_path)
+    train_idx = load_int_vector_csv(train_idx_path)
+    val_idx = load_int_vector_csv(val_idx_path)
+    test_idx = load_int_vector_csv(test_idx_path)
 
     # 3) 构建 Dataset 实例
     dataset = InjuryPackedDataset(raw_packed)

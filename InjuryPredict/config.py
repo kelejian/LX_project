@@ -12,6 +12,7 @@ training_params = {
     "Learning_rate": 0.005,
     "Learning_rate_min": 0,
     "weight_decay": 0.1,
+    "early_stop_start_epochs": 250, # 早停开始轮数
     "Patience": 75, # 早停轮数
 }
 

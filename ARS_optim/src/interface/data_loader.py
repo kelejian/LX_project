@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from matplotlib.path import Path as MplPath
 
+from common.data_utils.split_io import load_int_vector_csv
 from common.settings import FEATURE_ORDER, RAW_DATA_DIR, SPLIT_INDICES_DIR
 from ARS_optim.src.core.param_manager import ParamManager
 
@@ -55,11 +56,11 @@ class StateDataLoaderManager:
         self.rules = self.param_manager.get_sampling_rules() if hasattr(self.param_manager, 'get_sampling_rules') else {}
 
         pool_path = Path(pool_npz_path) if pool_npz_path else (RAW_DATA_DIR / 'raw_data_packed.npz')
-        split_path = Path(train_indices_path) if train_indices_path else (SPLIT_INDICES_DIR / 'injury_train_indices.npy')
+        split_path = Path(train_indices_path) if train_indices_path else (SPLIT_INDICES_DIR / 'injury_train_indices.csv')
 
         full_features = self._load_feature_matrix_from_pool(pool_path)
         if split_path.exists():
-            train_idx = np.load(split_path)
+            train_idx = load_int_vector_csv(split_path)
             full_features = full_features[train_idx]
             self.logger.info(f"经验池使用训练切分索引: {split_path}，样本数={full_features.shape[0]}")
         else:

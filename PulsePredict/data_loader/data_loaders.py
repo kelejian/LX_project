@@ -6,6 +6,7 @@ from torch.utils.data import Dataset
 
 from PulsePredict.base import BaseDataLoader
 from common.data_utils.processor import UnifiedDataProcessor
+from common.data_utils.split_io import load_int_vector_csv
 from common.settings import FEATURE_ORDER
 #==========================================================================================
 # 定制的 Dataset 类
@@ -97,25 +98,25 @@ class PulseDataLoader(BaseDataLoader):
         
         if training:
             # --- 训练模式 ---
-            t_idx_path = self.split_dir / "pulse_train_indices.npy"
-            v_idx_path = self.split_dir / "pulse_val_indices.npy"
+            t_idx_path = self.split_dir / "pulse_train_indices.csv"
+            v_idx_path = self.split_dir / "pulse_val_indices.csv"
 
             if not t_idx_path.exists():
                 raise FileNotFoundError(f"[PulseDataLoader] Train split missing: {t_idx_path}")
             if not v_idx_path.exists():
                 raise FileNotFoundError(f"[PulseDataLoader] Val split missing: {v_idx_path}")
 
-            self.train_test_indices = self._load_and_validate_indices(np.load(t_idx_path).astype(np.int64), "train")
-            self.val_indices = self._load_and_validate_indices(np.load(v_idx_path).astype(np.int64), "val")
+            self.train_test_indices = self._load_and_validate_indices(load_int_vector_csv(t_idx_path), "train")
+            self.val_indices = self._load_and_validate_indices(load_int_vector_csv(v_idx_path), "val")
             
         else:
             # --- 测试模式 ---
-            test_idx_path = self.split_dir / "pulse_test_indices.npy"
+            test_idx_path = self.split_dir / "pulse_test_indices.csv"
 
             if not test_idx_path.exists():
                 raise FileNotFoundError(f"[PulseDataLoader] Test split missing: {test_idx_path}")
 
-            self.train_test_indices = self._load_and_validate_indices(np.load(test_idx_path).astype(np.int64), "test")
+            self.train_test_indices = self._load_and_validate_indices(load_int_vector_csv(test_idx_path), "test")
             
             # 测试模式下强制无验证集
             self.val_indices = None

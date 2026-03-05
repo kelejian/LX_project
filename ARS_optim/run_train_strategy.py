@@ -198,7 +198,7 @@ def main():
 
     # 构建验证集迭代器（损伤预测验证集，不加扰动）
     from common.settings import SPLIT_INDICES_DIR
-    val_indices_path = SPLIT_INDICES_DIR / 'injury_val_indices.npy'
+    val_indices_path = SPLIT_INDICES_DIR / 'injury_val_indices.csv'
     val_loader_manager = StateDataLoaderManager(
         param_manager=param_manager,
         batch_size=int(train_cfg.get('val_batch_size', 1024)),
