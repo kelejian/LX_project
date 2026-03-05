@@ -15,14 +15,16 @@ import pandas as pd
 import torch
 import numpy as np
 import argparse
-import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, ConcatDataset
-from imblearn.metrics import geometric_mean_score, classification_report_imbalanced
-from sklearn.metrics import confusion_matrix, r2_score, accuracy_score
-from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.utils import models
+from InjuryPredict.utils.tools import (
+    get_regression_metrics,
+    get_classification_metrics,
+    plot_scatter,
+    plot_confusion_matrix,
+)
 
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from common.utils.seeding import set_random_seed
@@ -72,88 +74,6 @@ def test(model, loader):
     
     return preds, trues
 
-def get_regression_metrics(y_true, y_pred):
-    """计算并返回一组回归指标"""
-    return {
-        'mae': mean_absolute_error(y_true, y_pred),
-        'rmse': root_mean_squared_error(y_true, y_pred),
-        'r2': r2_score(y_true, y_pred)
-    }
-
-def get_classification_metrics(y_true, y_pred, labels):
-    """计算并返回一组分类指标 - 改进版"""
-    # 检查缺失的类别
-    present_labels = set(np.unique(np.concatenate([y_true, y_pred])))
-    missing_labels = set(labels) - present_labels
-    
-    if missing_labels:
-        print(f"\n*Warning: Labels {missing_labels} are not present in the data\n")
-    
-    return {
-        'accuracy': accuracy_score(y_true, y_pred) * 100,
-        'g_mean': geometric_mean_score(y_true, y_pred, labels=labels, average='multiclass'),
-        'conf_matrix': confusion_matrix(y_true, y_pred, labels=labels),
-        'report': classification_report_imbalanced(
-            y_true, y_pred, labels=labels, digits=3, 
-            zero_division=0  # 处理除零情况
-        )
-    }
-
-def plot_scatter(y_true, y_pred, ais_true, title, xlabel, save_path):
-    """改进的散点图函数"""
-    plt.figure(figsize=(8, 7))
-    colors = ['blue', 'green', 'yellow', 'orange', 'red', 'darkred']
-    ais_colors = [colors[min(ais, 5)] for ais in ais_true]
-    plt.scatter(y_true, y_pred, c=ais_colors, alpha=0.5, s=40)
-
-    # 显示所有可能的类别，即使数据中不存在
-    # all_possible_ais = range(6)
-    # legend_elements = [
-    #     Patch(facecolor=colors[i], 
-    #           label=f'AIS {i}' + (' (absent)' if i not in np.unique(ais_true) else ''))
-    #     for i in all_possible_ais
-    # ]
-
-    from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor=colors[i], label=f'AIS {i}') for i in range(6) if i in np.unique(ais_true)]
-    
-    max_val = max(np.max(y_true), np.max(y_pred)) * 1.05
-    plt.plot([0, max_val], [0, max_val], 'r--', label="Ideal Line")
-    plt.xlabel(f"Ground Truth ({xlabel})", fontsize=16)
-    plt.ylabel(f"Predictions ({xlabel})", fontsize=16)
-    plt.title(f"Scatter Plot of Predictions vs Ground Truth\n({title})", fontsize=18)
-    plt.xlim(0, max_val)
-    plt.ylim(0, max_val)
-    
-    first_legend = plt.legend(handles=legend_elements, title='AIS Level', loc='upper left')
-    plt.gca().add_artist(first_legend)
-    plt.legend(loc='lower right')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-
-def plot_confusion_matrix(cm, labels, title, save_path):
-    """绘制并保存混淆矩阵图"""
-    plt.figure(figsize=(8, 6))
-    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-    plt.title(title, fontsize=16)
-    plt.colorbar()
-    tick_marks = np.arange(len(labels))
-    plt.xticks(tick_marks, labels, fontsize=12)
-    plt.yticks(tick_marks, labels, fontsize=12)
-    plt.xlabel('Predicted Label', fontsize=14)
-    plt.ylabel('True Label', fontsize=14)
-    thresh = cm.max() / 2. if cm.max() > 0 else 0.5 
-    for i, j in np.ndindex(cm.shape):
-        plt.text(j, i, format(cm[i, j], 'd'),
-                 horizontalalignment="center",
-                 color="white" if cm[i, j] > thresh else "black",
-                 fontsize=12)
-    plt.tight_layout(pad=0.5)  # 减少边距，从默认的 1.08 降低到 0.5
-    plt.savefig(save_path, bbox_inches='tight', pad_inches=0.1)  # 添加紧凑保存选项
-    plt.close()
-
 def generate_report_section(title, reg_metrics, cls_metrics_6c):
     """生成Markdown报告的一个区域"""
     section = f"## {title} Metrics\n\n"
@@ -192,13 +112,13 @@ if __name__ == "__main__":
     # 如果找不到，尝试查找是否是 K-Fold 训练的子目录结构
     if not os.path.exists(record_path):
         # 尝试在当前目录找 KFold 记录
-        kfold_record_path = os.path.join(args.run_dir, "KFold_TrainingRecord.json")
+        kfold_record_path = os.path.join(args.run_dir, "TrainingRecord.json")
         if os.path.exists(kfold_record_path):
              record_path = kfold_record_path
         else:
             # 尝试在父目录找 KFold 记录 (标准 K-Fold 结构)
             parent_dir = os.path.dirname(args.run_dir)
-            parent_kfold_record = os.path.join(parent_dir, "KFold_TrainingRecord.json")
+            parent_kfold_record = os.path.join(parent_dir, "TrainingRecord.json")
             if os.path.exists(parent_kfold_record):
                 record_path = parent_kfold_record
 

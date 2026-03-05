@@ -7,7 +7,7 @@ RUNS_DIR = "./InjuryPredict/runs"  # 模型训练结果的保存目录
 
 # 1. 优化与训练相关
 training_params = {
-    "Epochs": 360,
+    "Epochs": 10,
     "Batch_size": 64,
     "Learning_rate": 0.005,
     "Learning_rate_min": 0,
@@ -43,11 +43,30 @@ model_params = {
     "fixed_channel_weight": [0.7, 0.3],  # X, Y 通道的固定权重
 }
 
+# 仅用于“验证集指标跟踪”的可选指标名（train.py / train_KFold.py 通用）
+# 说明：
+# 1) 下列指标名默认都表示 val 指标，不是 train 指标。
+# 2) val_metrics_to_track 中可写 "loss" 或 "val_loss"（其余指标同理），内部会统一按 val 指标处理。
+AVAILABLE_VAL_METRIC_NAMES = (
+    'loss',
+    'accu_head', 'accu_chest', 'accu_neck', 'accu_mais',
+    'mae_hic', 'mae_dmax', 'mae_nij',
+    'rmse_hic', 'rmse_dmax', 'rmse_nij',
+    'r2_hic', 'r2_dmax', 'r2_nij',
+)
+
+
+val_metrics_to_track = [
+    # (指标名, 比较方式)
+    # 指标名均为“验证集指标”语义：推荐写 "val_loss" / "val_accu_mais" 更直观。
+    # 比较方式仅支持 "max" / "min"。
+    # ("val_accu_mais", "max"),
+    ("val_loss", "min"),
+]
+
 # K-Fold 专项设置
 kfold_params = {
     "K": 5, # K-Fold 折数
-    "val_metrics_to_track": [
-        # ("accu_mais", "max"),  # (指标名, 比较方式: "max" 或 "min")
-        ("loss", "min"),
-    ]
+    # KFold 使用的验证集指标跟踪配置（与 train.py 同语义）
+    "val_metrics_to_track": val_metrics_to_track,
 }

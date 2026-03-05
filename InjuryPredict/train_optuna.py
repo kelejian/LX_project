@@ -19,7 +19,7 @@ from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from InjuryPredict.utils import models
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.utils.weighted_loss import weighted_loss
-from InjuryPredict.utils.optimizer_utils import get_parameter_groups
+from InjuryPredict.utils.tools import get_parameter_groups
 from InjuryPredict.config import RUNS_DIR
 
 

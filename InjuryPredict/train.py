@@ -19,8 +19,8 @@ from common.settings import INJURY_PROCESSED_DIR
 from InjuryPredict.utils import models
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.utils.weighted_loss import weighted_loss
-from InjuryPredict.utils.optimizer_utils import get_parameter_groups
-from InjuryPredict.config import RUNS_DIR, training_params, loss_params, model_params
+from InjuryPredict.utils.tools import get_parameter_groups, build_metric_trackers, round_to_significant, round_float_fields, convert_numpy_types
+from InjuryPredict.config import RUNS_DIR, training_params, loss_params, model_params, val_metrics_to_track
 
 # --- 合并 train 和 valid 为一个函数 ---
 def run_one_epoch(model, loader, criterion, device, optimizer=None):
@@ -112,23 +112,6 @@ def run_one_epoch(model, loader, criterion, device, optimizer=None):
     }
     return metrics
 
-def convert_numpy_types(obj):
-        """递归转换NumPy类型为Python原生类型"""
-        if isinstance(obj, dict):
-            return {key: convert_numpy_types(value) for key, value in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_numpy_types(item) for item in obj]
-        elif isinstance(obj, tuple):
-            return tuple(convert_numpy_types(item) for item in obj)
-        elif isinstance(obj, (np.integer, np.int_)):
-            return int(obj)
-        elif isinstance(obj, (np.floating, np.float64)):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        else:
-            return obj
-        
 if __name__ == "__main__":
     set_random_seed()
     ''' 训练损伤预测模型 (TCN-based) 以进行多任务损伤预测 '''
@@ -227,14 +210,25 @@ if __name__ == "__main__":
     optimizer = optim.AdamW(param_groups, lr=Learning_rate)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Epochs, eta_min=Learning_rate_min)
 
-    # 初始化跟踪变量
-    val_loss_history, val_mais_accu_history, val_chest_accu_history, val_head_accu_history, val_neck_accu_history = [], [], [], [], []
-    Best_val_loss = float('inf')
-    Best_mais_accu, Best_chest_accu, Best_head_accu, Best_neck_accu = 0, 0, 0, 0
-    Best_dmax_mae, Best_hic_mae, Best_nij_mae = float('inf'), float('inf'), float('inf')
-    Best_hic_r2, Best_dmax_r2, Best_nij_r2 = float('-inf'), float('-inf'), float('-inf')
-    best_loss_epoch, best_MAIS_accu_epoch, best_dmax_epoch, best_nij_epoch, best_chest_epoch, best_hic_epoch, best_head_epoch, best_neck_epoch = 0, 0, 0, 0, 0, 0, 0, 0
-    best_hic_r2_epoch, best_dmax_r2_epoch, best_nij_r2_epoch = 0, 0, 0
+    # 初始化指标跟踪器（由 val_metrics_to_track 驱动）
+    metric_trackers = build_metric_trackers(
+        val_metrics_to_track,
+        model_filename_fn = lambda metric_name: f"best_val_{metric_name}.pth"
+    )
+    if not metric_trackers:
+        raise ValueError("val_metrics_to_track 不能为空。")
+    tracked_metric_names = [tracker['display_name'] for tracker in metric_trackers.values()]
+    print(f"将跟踪以下验证指标: {tracked_metric_names}")
+
+    metric_states = {
+        metric_name: {
+            'best_value': tracker_info['initial_value'],
+            'best_epoch': 0,
+            'is_better': tracker_info['is_better'],
+            'model_filename': tracker_info['model_filename'],
+        }
+        for metric_name, tracker_info in metric_trackers.items()
+    }
 
     # 保存初始配置到 JSON 文件
     record_path = os.path.join(run_dir, "TrainingRecord.json")
@@ -251,6 +245,7 @@ if __name__ == "__main__":
                 "Epochs": Epochs, "Batch_size": Batch_size, "Learning_rate": Learning_rate,
                 "Learning_rate_min": Learning_rate_min, "weight_decay": weight_decay,
                 "early_stop_start_epochs": early_stop_start_epochs, "Patience": Patience,
+                "val_metrics_to_track": val_metrics_to_track,
             },
             "loss": {
                 "base_loss": base_loss, "weight_factor_classify": weight_factor_classify,
@@ -311,16 +306,14 @@ if __name__ == "__main__":
                     'std': std_weights_val
                 }
         
-        val_loss_history.append(val_metrics['loss'])
-        val_mais_accu_history.append(val_metrics['accu_mais'])
-        val_head_accu_history.append(val_metrics['accu_head'])
-        val_chest_accu_history.append(val_metrics['accu_chest'])
-        val_neck_accu_history.append(val_metrics['accu_neck'])
+        missing_metrics = [name for name in metric_trackers.keys() if name not in val_metrics]
+        if missing_metrics:
+            raise KeyError(f"val_metrics_to_track 中存在无效指标: {missing_metrics}")
 
-        print(f"Epoch {epoch+1}/{Epochs} | Train Loss: {train_metrics['loss']:.3f}")
-        print(f"            | Val Loss: {val_metrics['loss']:.3f} | MAIS Acc: {val_metrics['accu_mais']:.2f}%")
-        print(f"            | Head Acc: {val_metrics['accu_head']:.2f}%, Chest Acc: {val_metrics['accu_chest']:.2f}%, Neck Acc: {val_metrics['accu_neck']:.2f}%")
-        print(f"            | R²: HIC={val_metrics['r2_hic']:.4f}, Dmax={val_metrics['r2_dmax']:.4f}, Nij={val_metrics['r2_nij']:.4f}")
+        print(f"Epoch {epoch+1}/{Epochs} | Train Loss: {train_metrics['loss']:.4g}")
+        print(f"            | Val Loss: {val_metrics['loss']:.4g} | MAIS Acc: {val_metrics['accu_mais']:.4g}%")
+        print(f"            | Head Acc: {val_metrics['accu_head']:.4g}%, Chest Acc: {val_metrics['accu_chest']:.4g}%, Neck Acc: {val_metrics['accu_neck']:.4g}%")
+        print(f"            | R²: HIC={val_metrics['r2_hic']:.4g}, Dmax={val_metrics['r2_dmax']:.4g}, Nij={val_metrics['r2_nij']:.4g}")
         
         scheduler.step()
 
@@ -401,52 +394,28 @@ if __name__ == "__main__":
             # 打印权重信息到控制台
             if epoch % 50 == 0 or epoch == Epochs - 1:
                 # print(f"            | Val Channel Weights: X={mean_weights[0]:.3f}, Y={mean_weights[1]:.3f}, Z={mean_weights[2]:.3f}")
-                print(f"            | Val Channel Weights: X={mean_weights[0]:.3f}, Y={mean_weights[1]:.3f}")
-                print(f"            | Val Weight Variance: {weight_variance:.3f}")
+                print(f"            | Val Channel Weights: X={mean_weights[0]:.4g}, Y={mean_weights[1]:.4g}")
+                print(f"            | Val Weight Variance: {weight_variance:.4g}")
 
 
-        model_save_configs = [
-            # (metric_key, best_var_name, epoch_var_name, filename, format_str, compare_func)
-            ('loss', 'Best_val_loss', 'best_loss_epoch', 'best_val_loss.pth', 'Val Loss: {:.3f}', min),
-            ('accu_mais', 'Best_mais_accu', 'best_MAIS_accu_epoch', 'best_mais_accu.pth', 'MAIS accuracy: {:.2f}%', max),
-            ('mae_dmax', 'Best_dmax_mae', 'best_dmax_epoch', 'best_dmax_mae.pth', 'Dmax MAE: {:.3f}', min),
-            ('accu_chest', 'Best_chest_accu', 'best_chest_epoch', 'best_chest_accu.pth', 'Chest Acc: {:.2f}%', max),
-            ('mae_hic', 'Best_hic_mae', 'best_hic_epoch', 'best_hic_mae.pth', 'HIC MAE: {:.3f}', min),
-            ('accu_head', 'Best_head_accu', 'best_head_epoch', 'best_head_accu.pth', 'Head Acc: {:.2f}%', max),
-            ('mae_nij', 'Best_nij_mae', 'best_nij_epoch', 'best_nij_mae.pth', 'Nij MAE: {:.3f}', min),
-            ('accu_neck', 'Best_neck_accu', 'best_neck_epoch', 'best_neck_accu.pth', 'Neck Acc: {:.2f}%', max),
-            ('r2_hic', 'Best_hic_r2', 'best_hic_r2_epoch', 'best_hic_r2.pth', 'HIC R²: {:.4f}', max),
-            ('r2_dmax', 'Best_dmax_r2', 'best_dmax_r2_epoch', 'best_dmax_r2.pth', 'Dmax R²: {:.4f}', max),
-            ('r2_nij', 'Best_nij_r2', 'best_nij_r2_epoch', 'best_nij_r2.pth', 'Nij R²: {:.4f}', max),
-        ]
-        
-        for metric_key, best_var, epoch_var, filename, format_str, compare_func in model_save_configs:
-            current_value = val_metrics[metric_key]
-            best_value = globals()[best_var]
-            
-            is_better = (compare_func == max and current_value > best_value) or \
-                       (compare_func == min and current_value < best_value)
-            
-            if is_better:
-                globals()[best_var] = current_value
-                globals()[epoch_var] = epoch + 1
-                torch.save(model.state_dict(), os.path.join(run_dir, filename))
-                print(f"Best model saved with val {format_str.format(current_value)} at epoch {epoch+1}")
+        for metric_name, state in metric_states.items():
+            current_value = val_metrics[metric_name]
+            if state['is_better'](current_value, state['best_value']):
+                state['best_value'] = current_value
+                state['best_epoch'] = epoch + 1
+                torch.save(model.state_dict(), os.path.join(run_dir, state['model_filename']))
+                print(f"Best {metric_trackers[metric_name]['display_name']} model saved: {current_value:.4g} at epoch {epoch+1}")
 
         # 早停逻辑
-        if epoch > early_stop_start_epochs and len(val_loss_history) >= Patience:
-            # 检查最佳指标是否在最近 Patience 个 epoch 之外
-            epochs_since_best_loss = epoch + 1 - best_loss_epoch
-            epochs_since_best_mais = epoch + 1 - best_MAIS_accu_epoch
-            epochs_since_best_head = epoch + 1 - best_head_epoch
-            
-            if (epochs_since_best_loss >= Patience and 
-                epochs_since_best_mais >= Patience and 
-                epochs_since_best_head >= Patience):
+        if epoch > early_stop_start_epochs and (epoch + 1) >= Patience:
+            all_stagnant = all(
+                (epoch + 1 - state['best_epoch']) >= Patience
+                for state in metric_states.values()
+            )
+            if all_stagnant:
                 print(f"Early Stop at epoch: {epoch+1}!")
-                print(f"Best Val Loss: {Best_val_loss:.3f} (at epoch {best_loss_epoch})")
-                print(f"Best MAIS accuracy: {Best_mais_accu:.2f}% (at epoch {best_MAIS_accu_epoch})")
-                print(f"Best Head accuracy: {Best_head_accu:.2f}% (at epoch {best_head_epoch})")
+                for metric_name, state in metric_states.items():
+                    print(f"Best {metric_trackers[metric_name]['display_name']}: {state['best_value']:.4g} (at epoch {state['best_epoch']})")
                 break
 
         print(f"            | Time: {time.time()-epoch_start_time:.2f}s")
@@ -461,45 +430,33 @@ if __name__ == "__main__":
     print("训练完成，正在加载初始记录并添加训练结果...")
     
     # 1. 定义训练结果
+    best_metrics_by_tracker = {
+        metric_name: {
+            "best_value": round_to_significant(float(state['best_value']), 4),
+            "best_epoch": int(state['best_epoch']),
+            "model_file": state['model_filename'],
+        }
+        for metric_name, state in metric_states.items()
+    }
+
+    last_epoch_metrics = round_float_fields({
+        "loss": float(val_metrics['loss']),
+        "accu_mais": float(val_metrics['accu_mais']),
+        "accu_head": float(val_metrics['accu_head']),
+        "accu_chest": float(val_metrics['accu_chest']),
+        "accu_neck": float(val_metrics['accu_neck']),
+        "mae_hic": float(val_metrics['mae_hic']),
+        "mae_dmax": float(val_metrics['mae_dmax']),
+        "mae_nij": float(val_metrics['mae_nij']),
+        "r2_hic": float(val_metrics['r2_hic']),
+        "r2_dmax": float(val_metrics['r2_dmax']),
+        "r2_nij": float(val_metrics['r2_nij']),
+    }, digits=4)
+
     training_results = {
         "final_epoch": epoch + 1,
-        "best_mais_accuracy": np.round(float(Best_mais_accu), 2),
-        "best_mais_accuracy_epoch": int(best_MAIS_accu_epoch),
-        "best_chest_accuracy": np.round(float(Best_chest_accu), 2),
-        "best_chest_accuracy_epoch": int(best_chest_epoch),
-        "best_head_accuracy": np.round(float(Best_head_accu), 2),
-        "best_head_accuracy_epoch": int(best_head_epoch),
-        "best_neck_accuracy": np.round(float(Best_neck_accu), 2),
-        "best_neck_accuracy_epoch": int(best_neck_epoch),
-        "best_dmax_mae": np.round(float(Best_dmax_mae), 2),
-        "best_dmax_mae_epoch": int(best_dmax_epoch),
-        "best_hic_mae": np.round(float(Best_hic_mae), 2),
-        "best_hic_mae_epoch": int(best_hic_epoch),
-        "best_nij_mae": np.round(float(Best_nij_mae), 3),
-        "best_nij_mae_epoch": int(best_nij_epoch),
-        "best_hic_r2": np.round(float(Best_hic_r2), 4),
-        "best_hic_r2_epoch": int(best_hic_r2_epoch),
-        "best_dmax_r2": np.round(float(Best_dmax_r2), 4),
-        "best_dmax_r2_epoch": int(best_dmax_r2_epoch),
-        "best_nij_r2": np.round(float(Best_nij_r2), 4),
-        "best_nij_r2_epoch": int(best_nij_r2_epoch),
-
-        "lowest_val_loss": np.round(float(Best_val_loss), 3),
-        "lowest_val_loss_epoch": int(best_loss_epoch),
-
-        "last_epoch_metrics": {
-            "val_loss": np.round(float(val_metrics['loss']), 3),
-            "accu_mais": np.round(float(val_metrics['accu_mais']), 2),
-            "accu_head": np.round(float(val_metrics['accu_head']), 2),
-            "accu_chest": np.round(float(val_metrics['accu_chest']), 2),
-            "accu_neck": np.round(float(val_metrics['accu_neck']), 2),
-            "mae_hic": np.round(float(val_metrics['mae_hic']), 2),
-            "mae_dmax": np.round(float(val_metrics['mae_dmax']), 2),
-            "mae_nij": np.round(float(val_metrics['mae_nij']), 3),
-            "r2_hic": np.round(float(val_metrics['r2_hic']), 4),
-            "r2_dmax": np.round(float(val_metrics['r2_dmax']), 4),
-            "r2_nij": np.round(float(val_metrics['r2_nij']), 4),
-        }
+        "best_metrics_by_tracker": best_metrics_by_tracker,
+        "last_epoch_metrics": last_epoch_metrics
     }
     
     # 2. 加载现有记录
