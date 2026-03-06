@@ -11,13 +11,11 @@
 import warnings
 warnings.filterwarnings('ignore')
 import os, json
-import pandas as pd
 import torch
 import numpy as np
-import argparse
 from torch.utils.data import DataLoader, ConcatDataset
 
-from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
+from InjuryPredict.Injurydata_prepare import load_processed_subset
 from InjuryPredict.utils import models
 from InjuryPredict.utils.tools import (
     get_regression_metrics,

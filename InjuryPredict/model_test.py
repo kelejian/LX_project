@@ -9,14 +9,65 @@
 """
 import warnings
 warnings.filterwarnings('ignore')
+import os
+import json
+import time
+
 import torch
 import torch.nn as nn
 import torch.onnx
 from torchinfo import summary
 from torchviz import make_dot
-import time
+import numpy as np
+from torch.utils.data import DataLoader, ConcatDataset
 
-from InjuryPredict.Injurydata_prepare import InjuryPackedDataset
+from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
+from common.utils.seeding import set_random_seed
+from InjuryPredict.utils import models
+from common.settings import INJURY_PROCESSED_DIR, load_processed_subset
+# ==========================================================================================
+# inference timing utility (merged from test_inference_time.py)
+def test_inference_time(model, loader):
+    """
+    测试模型推理时间
+    参数:
+        model: 模型实例。
+        loader: 数据加载器。
+    """
+    model.eval()
+    total_time = 0.0
+    num_runs = 200  # 推理次数
+
+    with torch.no_grad():
+        for i in range(num_runs):
+            for batch in loader:
+                # 只取模型输入需要的部分，并移动到设备
+                batch_x_acc = batch[0].to(device)
+                batch_x_att_continuous = batch[1].to(device)
+                batch_x_att_discrete = batch[2].to(device)
+
+                # 预热阶段 (仅在第一次迭代时执行)
+                if i == 0:
+                    for _ in range(50):
+                        model(batch_x_acc, batch_x_att_continuous, batch_x_att_discrete)
+
+                # 开始计时
+                if device.type == 'cuda':
+                    torch.cuda.synchronize() # 确保CUDA操作同步
+                start_time = time.time()
+
+                model(batch_x_acc, batch_x_att_continuous, batch_x_att_discrete)
+
+                # 结束计时
+                if device.type == 'cuda':
+                    torch.cuda.synchronize() # 确保CUDA操作同步
+                elapsed_time = time.time() - start_time
+                total_time += elapsed_time
+
+    # 计算平均推理时间
+    avg_time = total_time / (num_runs * len(loader)) # 平均到每个批次
+    print(f"Average inference time per batch: {avg_time:.6f} seconds")
+
 # ==========================================================================================
 # 自定义 FLOPs 计算 Hooks (用于 ptflops 不默认支持的操作)
 # ==========================================================================================
@@ -596,7 +647,8 @@ def _get_output_names(outputs):
     return names, axes
 
 
-if __name__ == "__main__":
+def _run_demo_model_tests():
+    """原先 __main__ 中执行的结构与 FLOPs 等演示逻辑"""
     import os
     import numpy as np
 
@@ -673,3 +725,42 @@ if __name__ == "__main__":
         criterion=criterion,
         print_flops_per_layer=False
     )
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="模型测试脚本，包含结构/推理/ONNX/FLOPs 等功能")
+    parser.add_argument("--mode", choices=["model", "inference"], default="model",
+                        help="运行模式：model - 演示模型结构及FLOPs；inference - 测试推理时间")
+    parser.add_argument("--run_dir", "-r", type=str, default=r'E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_model_injurypredict\runs\InjuryPredictModel_03032051',
+                        help="训练结果目录（仅在 inference 模式下需要）")
+    parser.add_argument("--weight_file", "-w", type=str, default="best_val_loss.pth",
+                        help="模型权重文件名（仅在 inference 模式下需要）")
+    args = parser.parse_args()
+
+    if args.mode == "inference":
+        # copy logic from original test_inference_time main
+        if args.run_dir is None:
+            parser.error("--run_dir required when mode is inference")
+        set_random_seed()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # load training_record json
+        with open(os.path.join(args.run_dir, "TrainingRecord.json"), "r") as f:
+            training_record = json.load(f)
+        model_params = training_record["hyperparameters"]["model"]
+
+        # prepare dataset
+        test_dataset1 = load_processed_subset(INJURY_PROCESSED_DIR / "val_dataset.pt")
+        test_dataset2 = load_processed_subset(INJURY_PROCESSED_DIR / "test_dataset.pt")
+        test_dataset = ConcatDataset([test_dataset1, test_dataset2])
+        test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, num_workers=0)
+
+        model = models.InjuryPredictModel(**model_params).to(device)
+        model.load_state_dict(torch.load(os.path.join(args.run_dir, args.weight_file), map_location=device))
+
+        print(f"Start testing inference time for model: {args.weight_file}")
+        test_inference_time(model, test_loader)
+    else:
+        _run_demo_model_tests()
