@@ -4,7 +4,11 @@
 # 参数空间定义 (Parameter Space Definition)
 # 严格按照 common.settings.FEATURE_ORDER 顺序定义 (0-12)
 # role: control(执行机构) / state(不可控工况)
-# trainable: True(参与梯度寻优) / False(固定参数，必须提供 default)
+# trainable: True(参与梯度寻优) / False(当前阶段固定)
+# 语义约定：
+# - context = state + trainable=False 的 control
+# - 这类固定 control 仍然保留 role=control，不会被降格为 state；未来只需修改 trainable 即可重新纳入优化变量
+# - 任何未由调用方显式覆盖的特征位置，都统一回退到这里的 default
 # ---------------------------------------------------------
 parameters:
   # --- 1. 连续型状态参数 (State) ---
@@ -40,7 +44,7 @@ parameters:
     min: 1.0  
     max: 7.0  
     trainable: False
-    default: 2.5 # trainable=False 时必须有 default
+    default: 2.5 # 当前作为 context 输入与局部精调固定值保留；未来若切为 trainable，无需改 role
 
   - name: "LL2"
     index: 4

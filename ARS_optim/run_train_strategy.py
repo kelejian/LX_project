@@ -7,11 +7,12 @@ import shutil
 import hashlib
 from datetime import datetime
 import csv
+from typing import Optional, Tuple
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
 from common.data_utils.processor import UnifiedDataProcessor
-from common.settings import NORMALIZATION_CONFIG_PATH
+from common.settings import NORMALIZATION_CONFIG_PATH, SPLIT_INDICES_DIR
 from common.utils.seeding import set_random_seed
 
 from ARS_optim.src.core.param_manager import ParamManager
@@ -53,12 +54,42 @@ def parse_args():
     return parser.parse_args()
 
 
+def _normalize_and_validate_train_config(train_cfg: dict) -> Tuple[dict, dict]:
+    train_cfg['batch_size'] = int(train_cfg.get('batch_size', 0))
+    train_cfg['max_iterations'] = int(train_cfg.get('max_iterations', 0))
+    train_cfg['lr'] = float(train_cfg.get('lr', 0.0))
+    train_cfg['weight_decay'] = float(train_cfg.get('weight_decay', 0.0))
+
+    ema_cfg = train_cfg.get('ema', {}) or {}
+    ema_enabled = bool(ema_cfg.get('enabled', True))
+    ema_alpha = float(ema_cfg.get('alpha', 0.98))
+    ema_warmup_iters = int(ema_cfg.get('warmup_iters', 0))
+    ema_log_to_tb = bool(ema_cfg.get('log_to_tensorboard', True))
+
+    validations = [
+        (train_cfg['batch_size'] > 0, "batch_size 必须为正整数"),
+        (train_cfg['max_iterations'] > 0, "max_iterations 必须为正整数"),
+        (train_cfg['lr'] > 0.0, "lr 必须为正数"),
+        (train_cfg['weight_decay'] >= 0.0, "weight_decay 必须为非负数"),
+        (0.0 <= ema_alpha < 1.0, "EMA 配置错误：alpha 必须满足 0<=alpha<1"),
+        (ema_warmup_iters >= 0, "EMA 配置错误：warmup_iters 必须为非负整数"),
+    ]
+    for ok, message in validations:
+        if not ok:
+            raise ValueError(message)
+
+    return train_cfg, {
+        'enabled': ema_enabled,
+        'alpha': ema_alpha,
+        'warmup_iters': ema_warmup_iters,
+        'log_to_tensorboard': ema_log_to_tb,
+    }
+
+
 def main():
     logger = setup_ars_logger(name="TrainStrategy")
     logger.info("初始化自监督摊销优化管线 (Amortized Optimization Pipeline)...")
 
-    # 1) 命令行解析与配置加载
-    # 说明：命令行参数优先级高于 YAML，用于快速做实验对比（例如临时调整 batch_size、lr）。
     args = parse_args()
     base_dir = os.path.dirname(os.path.abspath(__file__))
     cfg_path = args.config if args.config is not None else os.path.join(base_dir, 'configs', 'default_config.yaml')
@@ -73,7 +104,7 @@ def main():
     if 'surrogate' not in config:
         raise KeyError("配置文件中缺失 'surrogate' 部分，请检查配置。")
     if 'optimization' not in config:
-        logger.warning("配置中未包含 'optimization' 部分，使用默认值。")
+        config['optimization'] = {}
 
     # 统一配置来源：CLI 覆盖 YAML
     train_cfg = config['strategy_net']['train']
@@ -89,60 +120,35 @@ def main():
     if args.device is not None:
         config['device'] = args.device
 
-    # 兼容旧配置：历史版本可能把 device 写在 strategy_net.train 下
-    legacy_train_device = train_cfg.get('device', None)
-    if 'device' not in config and legacy_train_device is not None:
-        logger.warning("检测到旧配置 strategy_net.train.device；已迁移为顶层 device 真源。")
-        config['device'] = legacy_train_device
-    elif 'device' in config and legacy_train_device is not None and str(config['device']) != str(legacy_train_device):
-        logger.warning("检测到 strategy_net.train.device 与顶层 device 不一致；将使用顶层 device 作为唯一真源。")
-
     device = torch.device(config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
     logger.info(f"计算设备挂载: {device}")
 
-    # 统一设置随机种子，保证模型初始化、Dropout、数据扰动过程可复现
     seed = int(config.get('seed', 42))
     set_random_seed(seed)
     logger.info(f"全局随机种子已设置: {seed}")
 
-    # 数值型超参转成明确类型，减少 YAML 字面量差异带来的隐式类型问题
-    train_cfg['batch_size'] = int(train_cfg.get('batch_size', 0))
-    train_cfg['max_iterations'] = int(train_cfg.get('max_iterations', 0))
-    train_cfg['lr'] = float(train_cfg.get('lr', 0.0))
-    train_cfg['weight_decay'] = float(train_cfg.get('weight_decay', 0.0))
+    train_cfg, ema_runtime = _normalize_and_validate_train_config(train_cfg)
+    ema_enabled = ema_runtime['enabled']
+    ema_alpha = ema_runtime['alpha']
+    ema_warmup_iters = ema_runtime['warmup_iters']
+    ema_log_to_tb = ema_runtime['log_to_tensorboard']
 
-    if train_cfg.get('batch_size', 0) <= 0:
-        raise ValueError("batch_size 必须为正整数")
-    if train_cfg.get('max_iterations', 0) <= 0:
-        raise ValueError("max_iterations 必须为正整数")
-    if train_cfg.get('lr', 0.0) <= 0.0:
-        raise ValueError("lr 必须为正数")
-    if train_cfg.get('weight_decay', 0.0) < 0.0:
-        raise ValueError("weight_decay 必须为非负数")
-
-    # 2) 核心组件实例化
-    # ParamManager 管理“参数顺序/边界/可调属性”，是后续张量列切片的一致性来源。
     param_space_path = os.path.join(base_dir, 'configs', 'param_space.yaml')
     param_manager = ParamManager(param_space_path)
     constraint_manager = PhysicalConstraintManager(param_manager)
-    
-    # 实例化数据归一化处理器 (依赖根目录全局配置)
     data_processor = UnifiedDataProcessor(str(NORMALIZATION_CONFIG_PATH))
 
-    # 实例化并加载波形与损伤代理模型权重
     pulse_model, injury_model = load_surrogate_models(config=config, device=device)
 
-    # 构建物理环境代理器
     surrogate = SurrogateAdapter(
         pulse_model=pulse_model, 
         injury_model=injury_model, 
         param_manager=param_manager, 
+        constraint_manager=constraint_manager,
         config=config, 
         data_processor=data_processor
     ).to(device)
 
-    # 构建策略网络与优化器
-    # 约定：策略网络输入为 context + pulse 两路特征，输出仅包含 trainable control 参数。
     strat_cfg = config.get('strategy_net', {})
     strategy_net = StrategyNet(
         param_manager=param_manager,
@@ -161,8 +167,6 @@ def main():
         weight_decay=float(train_cfg.get('weight_decay', 0.0))
     )
 
-    # 学习率调度器（可选）
-    # 例：cosine 调度下，学习率会从初值平滑下降到 eta_min。
     max_iters = int(train_cfg.get('max_iterations'))
     scheduler_cfg = train_cfg.get('scheduler', {})
     scheduler_type = str(scheduler_cfg.get('type', 'none')).lower()
@@ -184,8 +188,6 @@ def main():
             gamma=gamma
         )
 
-    # 构建训练数据流（损伤预测训练集 + 扰动）
-    # 每次 next(context_generator) 返回一批 context 参数，形状 [Batch, D_context]。
     data_loader_manager = StateDataLoaderManager(
         param_manager=param_manager, 
         batch_size=int(train_cfg.get('batch_size')), 
@@ -196,22 +198,38 @@ def main():
     )
     context_generator = data_loader_manager.get_infinite_generator()
 
-    # 构建验证集迭代器（损伤预测验证集，不加扰动）
-    from common.settings import SPLIT_INDICES_DIR
-    val_indices_path = SPLIT_INDICES_DIR / 'injury_val_indices.csv'
+    dist_cfg = config.get('optimization', {}).get('distribution_penalty', {})
+    if surrogate.distribution_penalty.enabled:
+        max_ref_samples = int(dist_cfg.get('max_ref_samples', 0))
+        ref_context = data_loader_manager.get_distribution_reference(
+            max_samples=max_ref_samples,
+            shuffle=False,
+            feature_space=surrogate.distribution_penalty.feature_space,
+            trainable_indices=param_manager.get_control_trainable_indices(),
+        )
+        surrogate.fit_distribution_reference(ref_context)
+        logger.info(
+            f"已拟合训练分布参考统计: method={surrogate.distribution_penalty.method}, "
+            f"feature_space={surrogate.distribution_penalty.feature_space}, "
+            f"weight={surrogate.weight_distribution}, n_ref={ref_context.shape[0]}"
+        )
+
+    val_indices_path = SPLIT_INDICES_DIR / 'injury_val_indices.npy'
     val_loader_manager = StateDataLoaderManager(
         param_manager=param_manager,
         batch_size=int(train_cfg.get('val_batch_size', 1024)),
         device=device,
         seed=int(config.get('seed', 42)),
-        train_indices_path=str(val_indices_path),
+        split_indices_path=str(val_indices_path),
         jitter_ratio=0.0,
         jitter_prob=0.0,
     )
 
-    # 3) 摊销训练主循环
-    # 训练目标：最小化代理模型给出的总损失（风险项 + 约束惩罚项）。
     logger.info(f"开始自监督训练，最大迭代次数: {max_iters}, batch_size={train_cfg.get('batch_size')}, lr={train_cfg.get('lr')}, weight_decay={train_cfg.get('weight_decay')}")
+    logger.info(
+        f"EMA 选优配置: enabled={ema_enabled}, alpha={ema_alpha}, "
+        f"warmup_iters={ema_warmup_iters}, log_to_tensorboard={ema_log_to_tb}"
+    )
     if scheduler is not None:
         logger.info(f"启用学习率调度器: {scheduler.__class__.__name__}")
 
@@ -233,28 +251,33 @@ def main():
     final_path = os.path.join(save_dir, 'final_model.pth')
     train_best_loss = float('inf')
     train_best_iter = -1
+    train_best_metric_name = 'ema_train_loss' if ema_enabled else 'train_loss'
     val_best_loss = float('inf')
     val_best_iter = -1
+    ema_train_loss: Optional[float] = None
 
-    # 训练日志记录：逐迭代写入内存，训练结束写 CSV
     history_rows = []
 
-    def evaluate_full_val() -> float:
-        """在完整验证集上评估 val_loss（不更新参数）。"""
+    def evaluate_full_val() -> Tuple[float, float, float]:
+        """在完整验证集上评估 val 指标（不更新参数）。"""
         strategy_net.eval()
-        total = 0.0
+        total_loss = 0.0
+        total_risk = 0.0
+        total_constraint = 0.0
         count = 0
         with torch.no_grad():
             for val_context in val_loader_manager.iter_dataset_batches(batch_size=val_batch_size, shuffle=False):
-                pulse_norm_val = surrogate.generate_pulse(val_context)          # [Bv, 2, Seq_Len]
-                val_actions = strategy_net(val_context, pulse_norm_val)         # [Bv, D_trainable]
-                val_loss_batch, _, _ = surrogate.predict_injury_and_loss(val_context, val_actions, pulse_norm_val)  # [Bv]
-                total += float(val_loss_batch.sum().item())
+                pulse_norm_val = surrogate.generate_pulse(val_context)
+                val_actions = strategy_net(val_context, pulse_norm_val)
+                val_loss_batch, _, val_info = surrogate.predict_injury_and_loss(val_context, val_actions, pulse_norm_val)
+                total_loss += float(val_loss_batch.sum().item())
+                total_risk += float(val_info['loss_risk'].sum().item())
+                total_constraint += float(val_info['loss_constraint'].sum().item())
                 count += int(val_loss_batch.numel())
         strategy_net.train()
         if count <= 0:
             raise ValueError("验证集样本数为0，无法计算 val_loss。")
-        return total / count
+        return total_loss / count, total_risk / count, total_constraint / count
 
     strategy_net.train()
     
@@ -263,27 +286,15 @@ def main():
         for iter_idx in pbar:
             optimizer.zero_grad()
 
-            # Step A: 从经验池采样上下文参数
-            # [Batch, D_context]
-            context_params = next(context_generator) # [Batch, D_context]
-        
-            # Step B: 根据 context 生成碰撞波形特征
-            # 这里用 no_grad 是因为 pulse_model 在策略训练中作为冻结环境，不参与更新。
-            # [Batch, D_context] -> [Batch, 2, Seq_Len]
+            context_params = next(context_generator)
             with torch.no_grad():
-                pulse_norm = surrogate.generate_pulse(context_params) # [Batch, 2, Seq_Len]
-            
-            # Step C: 策略网络前向，输出可调控制参数
-            # [Batch, D_context] + [Batch, 2, Seq_Len] -> [Batch, D_trainable]
-            actions = strategy_net(context_params, pulse_norm) # [Batch, D_trainable]
-        
-            # Step D: 计算总损失
-            # total_loss 是逐样本向量，例如 Batch=3 时可能是 [0.31, 0.27, 0.29]。
+                pulse_norm = surrogate.generate_pulse(context_params)
+
+            actions = strategy_net(context_params, pulse_norm)
             total_loss, _, info = surrogate.predict_injury_and_loss(context_params, actions, pulse_norm)
-        
+
             loss_mean = total_loss.mean()
 
-            # 防御性保护：若当前批次损失异常（NaN/Inf），跳过本次更新
             if torch.isnan(loss_mean) or torch.isinf(loss_mean):
                 logger.warning(f"iter={iter_idx}: loss 出现 NaN/Inf，已跳过本次参数更新。")
                 optimizer.zero_grad(set_to_none=True)
@@ -300,58 +311,90 @@ def main():
             loss_value = float(loss_mean.item())
             loss_risk_value = float(info['loss_risk'].mean().item())
             loss_penalty_value = float(info['loss_constraint'].mean().item())
+            loss_distribution_value = float(info.get('loss_distribution', torch.zeros_like(total_loss)).mean().item())
             current_lr = float(optimizer.param_groups[0]['lr'])
+
+            if ema_train_loss is None:
+                ema_train_loss = loss_value
+            else:
+                ema_train_loss = ema_alpha * ema_train_loss + (1.0 - ema_alpha) * loss_value
+
+            ema_is_warmed = (iter_idx + 1) >= max(1, ema_warmup_iters) if ema_enabled else True
+            train_select_metric = ema_train_loss if ema_enabled else loss_value
 
             writer.add_scalar("Train/Loss", loss_value, iter_idx)
             writer.add_scalar("Train/LossRisk", loss_risk_value, iter_idx)
             writer.add_scalar("Train/LossPenalty", loss_penalty_value, iter_idx)
+            writer.add_scalar("Train/LossDistribution", loss_distribution_value, iter_idx)
             writer.add_scalar("Train/LR", current_lr, iter_idx)
+            if ema_log_to_tb and ema_train_loss is not None:
+                writer.add_scalar("Train/EMA_Loss", float(ema_train_loss), iter_idx)
 
             current_val_loss = None
-            # 周期性验证：每隔 val_interval 在完整验证集上计算一次均值损失
+            current_val_loss_risk = None
+            current_val_loss_constraint = None
             if val_interval > 0 and ((iter_idx + 1) % val_interval == 0):
-                current_val_loss = evaluate_full_val()
+                current_val_loss, current_val_loss_risk, current_val_loss_constraint = evaluate_full_val()
                 writer.add_scalar("Val/Loss", current_val_loss, iter_idx)
+                writer.add_scalar("Val/LossRisk", current_val_loss_risk, iter_idx)
+                writer.add_scalar("Val/LossConstraint", current_val_loss_constraint, iter_idx)
 
                 if current_val_loss < val_best_loss:
                     val_best_loss = current_val_loss
                     val_best_iter = iter_idx + 1
                     torch.save(strategy_net.state_dict(), val_best_path)
 
-            if save_best and loss_value < train_best_loss:
-                train_best_loss = loss_value
+            if save_best and ema_is_warmed and train_select_metric < train_best_loss:
+                train_best_loss = float(train_select_metric)
                 train_best_iter = iter_idx + 1
                 torch.save(strategy_net.state_dict(), train_best_path)
 
             history_rows.append({
                 'iteration': int(iter_idx + 1),
                 'train_loss': float(loss_value),
+                'train_ema_loss': float(ema_train_loss) if ema_train_loss is not None else None,
                 'train_loss_risk': float(loss_risk_value),
                 'train_loss_constraint': float(loss_penalty_value),
+                'train_loss_distribution': float(loss_distribution_value),
                 'val_loss': float(current_val_loss) if current_val_loss is not None else None,
+                'val_loss_risk': float(current_val_loss_risk) if current_val_loss_risk is not None else None,
+                'val_loss_constraint': float(current_val_loss_constraint) if current_val_loss_constraint is not None else None,
                 'lr': float(current_lr),
             })
 
             if iter_idx % max(1, log_interval) == 0:
                 pbar.set_postfix({
                     "Loss": f"{loss_value:.4f}", 
+                    "EMA": f"{ema_train_loss:.4f}" if ema_train_loss is not None else "nan",
                     "Risk": f"{loss_risk_value:.4f}",
                     "Penalty": f"{loss_penalty_value:.4f}",
+                    "Dist": f"{loss_distribution_value:.4f}",
                     "LR": f"{current_lr:.2e}"
                 })
 
-        # 4) 保存模型与训练记录
         if save_last:
             torch.save(strategy_net.state_dict(), final_path)
 
-        # 训练历史 CSV 记录
         history_csv_path = os.path.join(save_dir, 'training_history.csv')
         with open(history_csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer_csv = csv.DictWriter(f, fieldnames=['iteration', 'train_loss', 'train_loss_risk', 'train_loss_constraint', 'val_loss', 'lr'])
+            writer_csv = csv.DictWriter(
+                f,
+                fieldnames=[
+                    'iteration',
+                    'train_loss',
+                    'train_ema_loss',
+                    'train_loss_risk',
+                    'train_loss_constraint',
+                    'train_loss_distribution',
+                    'val_loss',
+                    'val_loss_risk',
+                    'val_loss_constraint',
+                    'lr'
+                ]
+            )
             writer_csv.writeheader()
             writer_csv.writerows(history_rows)
 
-        # 训练摘要 YAML
         summary_path = os.path.join(save_dir, 'training_summary.yaml')
         with open(summary_path, 'w', encoding='utf-8') as f:
             yaml.safe_dump(
@@ -359,9 +402,25 @@ def main():
                     'max_iterations': max_iters,
                     'val_interval': val_interval,
                     'val_batch_size': val_batch_size,
+                    'ema': {
+                        'enabled': bool(ema_enabled),
+                        'alpha': float(ema_alpha),
+                        'warmup_iters': int(ema_warmup_iters),
+                    },
+                    'distribution_penalty': {
+                        'enabled': bool(surrogate.distribution_penalty.enabled),
+                        'method': surrogate.distribution_penalty.method,
+                        'feature_space': surrogate.distribution_penalty.feature_space,
+                        'weight': float(surrogate.weight_distribution),
+                        'k': int(surrogate.distribution_penalty.k),
+                        'eps': float(surrogate.distribution_penalty.eps),
+                        'clip_max': float(surrogate.distribution_penalty.clip_max),
+                        'normalize_by_train_stats': bool(surrogate.distribution_penalty.normalize_by_train_stats),
+                    },
                     'train_best': {
                         'iter': int(train_best_iter),
                         'loss': float(train_best_loss),
+                        'metric': train_best_metric_name,
                         'ckpt': os.path.basename(train_best_path),
                     },
                     'val_best': {
@@ -379,8 +438,6 @@ def main():
                 sort_keys=False,
             )
 
-        # 额外保存配置与关键文件哈希
-        # 用途：评估阶段可以检查“当前环境是否与训练时一致”（尤其是归一化配置）。
         try:
             cfg_path = os.path.join(save_dir, 'config_used.yaml')
             with open(cfg_path, 'w', encoding='utf-8') as f:
@@ -391,10 +448,6 @@ def main():
             with open(str(NORMALIZATION_CONFIG_PATH), 'rb') as f:
                 normalization_sha = hashlib.sha1(f.read()).hexdigest()
 
-            # 保存关键配置指纹（示例文件：sha_checksums.yaml）
-            # 内容示例：
-            # param_space_sha1: <40位hex>
-            # normalization_config_sha1: <40位hex>
             sha_info_path = os.path.join(save_dir, 'sha_checksums.yaml')
             with open(sha_info_path, 'w', encoding='utf-8') as f:
                 yaml.safe_dump(
@@ -408,7 +461,10 @@ def main():
                 )
 
             if save_best and train_best_iter > 0:
-                logger.info(f"训练集最优权重: {train_best_path} (iter={train_best_iter}, train_loss={train_best_loss:.6f})")
+                logger.info(
+                    f"训练集最优权重: {train_best_path} "
+                    f"(iter={train_best_iter}, {train_best_metric_name}={train_best_loss:.6f})"
+                )
             if val_best_iter > 0:
                 logger.info(f"验证集最优权重: {val_best_path} (iter={val_best_iter}, val_loss={val_best_loss:.6f})")
             if save_last:

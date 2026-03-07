@@ -46,6 +46,11 @@ strategy_net:
     gradient_clip_max_norm: 1.0 # 梯度裁剪阈值
     jitter_ratio: 0.01      # 经验池连续参数扰动幅度（占参数范围比例）
     jitter_prob: 1.0        # 每个连续参数施加扰动的概率
+    ema:
+      enabled: true          # 是否启用 EMA 作为 train_best 的判据
+      alpha: 0.98            # EMA 平滑系数，越大越平滑
+      warmup_iters: 100      # EMA 选优预热步数，预热前不更新 train_best
+      log_to_tensorboard: true
 
 # ===========================
 # 4. 在线寻优(Online Optimization) - 策略网络直推和局部精调超参
@@ -64,3 +69,23 @@ optimization:
     weight_dmax: 1.0
     weight_nij: 1.0
     weight_penalty: 10.0   # 物理约束惩罚项系数
+
+  # 训练分布偏离惩罚项（用于抑制策略输出落入经验池稀疏区域）
+  distribution_penalty:
+    enabled: true
+    method: "mahalanobis"     # mahalanobis | knn
+    weight: 0.01               # 默认小权重，避免策略过于保守
+    feature_space: "context"  # context | context_control
+    k: 8                       # knn 模式的近邻数量
+    eps: 1.0e-6                # 数值稳定项
+    clip_max: 10.0             # 单样本惩罚上限，避免极端值主导训练
+    max_ref_samples: 20000     # 构建参考分布时使用的最大样本数，0表示不截断
+    normalize_by_train_stats: true
+
+# ===========================
+# 5. 评估(Evaluation)
+# ===========================
+evaluation:
+  eval_batch_size: 512   # 评估时分批推理的批大小，用于降低显存峰值
+  default_strategy_ckpt: null  # 可选：默认策略权重路径（绝对路径或相对 ARS_optim 目录）
+  strict_default_ckpt: true  # true时仅允许自动加载 val_best_model.pth；找不到则直接报错

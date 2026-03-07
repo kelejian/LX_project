@@ -10,7 +10,7 @@ from common.data_utils.processor import UnifiedDataProcessor
 
 class StrategyNet(nn.Module):
     """
-    自适应寻优策略网络 (Adaptive Optimization Strategy Network)
+    自适应寻优策略网络。
     
     架构设计:
     本网络充当了寻优系统中的“智能体(Agent)”。
@@ -44,8 +44,8 @@ class StrategyNet(nn.Module):
         self.context_dim = self.param_manager.get_context_dim()
         self.output_dim = self.param_manager.get_trainable_dim()
         self.context_names = self.param_manager.get_context_names()
-        # 记录波形编码器输出维度，方便在 forward 中做一致性检查
         self.pulse_embed_dim = pulse_embed_dim
+        self._pulse_shape_checked = False
         
         if self.output_dim == 0:
             raise ValueError("[致命错误] 策略网络初始化失败：没有设置任何 trainable=True 的可调参数！")
@@ -66,7 +66,7 @@ class StrategyNet(nn.Module):
             nn.BatchNorm1d(pulse_embed_dim),
             act_layer_cls(inplace=True),
             
-            # 引入自适应平均池化，彻底解耦序列长度的硬性依赖
+            # 引入自适应平均池化，减少对固定序列长度的依赖
             # [Batch, pulse_embed_dim, Seq_Len / 4] -> [Batch, pulse_embed_dim, 1]
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten() # -> [Batch, pulse_embed_dim]
@@ -139,7 +139,9 @@ class StrategyNet(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
         # 输出层特殊初始化：让未训练网络在任意输入下逼近 param_space 默认值
-        # 公式：sigmoid(z)=r, r=(default-min)/(max-min), z=log(r/(1-r))
+        # 公式：sigmoid(z)=r, r=(default-min)/(max-min)
+        # 因而 z=log(r/(1-r))（即 sigmoid 的反函数 logit）。
+        # 这样初始化后，即使网络尚未训练，输出也会稳定落在各参数 default 附近。
         out_layer = self.mlp[-1]
         if isinstance(out_layer, nn.Linear):
             with torch.no_grad():
@@ -156,12 +158,22 @@ class StrategyNet(nn.Module):
 
     def _normalize_context(self, context_features: torch.Tensor) -> torch.Tensor:
         """按全局 normalization_config 对 context 参数做归一化。"""
-        normalized = self.data_processor.process_by_name(
+        return self.data_processor.process_by_name(
             values=context_features,
             feature_names=self.context_names,
             inverse=False
         )
-        return normalized
+
+    def _validate_pulse_shape_once(self, pulse_features: torch.Tensor) -> None:
+        if self._pulse_shape_checked:
+            return
+        expected_channels = self.pulse_encoder[0].in_channels
+        if pulse_features.dim() != 3 or pulse_features.size(1) != expected_channels:
+            raise ValueError(f"pulse_features should be [B, {expected_channels}, Seq]")
+        pulse_embed = self.pulse_encoder(pulse_features)
+        if pulse_embed.size(1) != self.pulse_embed_dim:
+            raise ValueError("pulse_encoder output dimension mismatch")
+        self._pulse_shape_checked = True
 
     def forward(self, context_features: torch.Tensor, pulse_features: torch.Tensor) -> torch.Tensor:
         """
@@ -174,42 +186,19 @@ class StrategyNet(nn.Module):
         返回:
             final_actions: [Batch, D_trainable] 绝对合法的物理决策参数，并保留完整的梯度传播链
         """
-        # 1. 提取波形动态特征
-        # [Batch, 2, Seq_Len] -> [Batch, pulse_embed_dim]
-        # 校验输入波形的通道数和序列长度
-        assert pulse_features.dim() == 3 and pulse_features.size(1) == self.pulse_encoder[0].in_channels, \
-            f"pulse_features should be [B, {self.pulse_encoder[0].in_channels}, Seq]"
+        self._validate_pulse_shape_once(pulse_features)
         pulse_embed = self.pulse_encoder(pulse_features)
-        assert pulse_embed.size(1) == self.pulse_embed_dim, \
-            "pulse_encoder output dimension mismatch"
-        
-        # 2. 上下文归一化（与训练时全局归一化规则保持一致）
-        # [Batch, D_context] 物理尺度 -> [Batch, D_context] 归一化尺度
-        context_norm = self._normalize_context(context_features)
 
-        # 3. 多模态特征级联
-        # [Batch, D_context] ⊕ [Batch, pulse_embed_dim] -> [Batch, D_context + pulse_embed_dim]
+        context_norm = self._normalize_context(context_features)
         combined_features = torch.cat([context_norm, pulse_embed], dim=1)
-        
-        # 4. 骨干网络非线性决策映射
-        # [Batch, D_context + pulse_embed_dim] -> [Batch, D_trainable]
         raw_output = self.mlp(combined_features)
-        
-        # 5. 绝对极值范围逆映射 (Sigmoid + Affine Transform)
-        # 利用 Sigmoid 将输出强制压入 (0, 1) 区间，随后按对应参数的 Min-Max 拉伸至真实物理标度
         norm_actions = torch.sigmoid(raw_output)
         range_span = self.max_bounds - self.min_bounds
-        # 防止某些维度 min==max 导致 0 乘法
         safe_span = torch.where(range_span > 0, range_span, torch.ones_like(range_span))
-        # [Batch, D_trainable] * [1, D_trainable] + [1, D_trainable]
         abs_actions = norm_actions * safe_span.unsqueeze(0) + self.min_bounds.unsqueeze(0)
-        
-        # 输出数值检查，某些激活和归一化组合在训练初期可能产生 NaN/Inf
+
         if torch.isnan(abs_actions).any() or torch.isinf(abs_actions).any():
             self.logger.warning("策略网络输出包含 NaN/Inf，可能发生梯度爆炸或数据异常。")
-        
-        # 6. 混合状态物理法则硬投影 (Hard Constraint Projection)
-        # 依赖于 PhysicalConstraintManager，融入 context_features 上下文以解析混合参数耦合限制
+
         final_actions = self.constraint_manager.project_forward(abs_actions, context_features)
-        
         return final_actions

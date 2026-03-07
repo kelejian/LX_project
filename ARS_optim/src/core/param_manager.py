@@ -51,12 +51,16 @@ class ParamManager:
         self.control_trainable_params = []
         self.control_fixed_params = []
         
-        # 依次执行解析与极其严格的校验机制
+        # 依次执行解析与一致性校验
         self._parse_parameters()
         self._validate_feature_order()
         self._validate_and_override_bounds()
         # 额外校验：每个连续变量在归一化配置中必须存在统计边界
         self._check_norm_presence()
+
+        # 统一建立名称/索引查找表，避免各处重新扫描 all_params。
+        self.params_by_name = {p['name']: p for p in self.all_params}
+        self.params_by_index = {p['index']: p for p in self.all_params}
 
     def _parse_parameters(self):
         """
@@ -158,10 +162,42 @@ class ParamManager:
     def get_state_dim(self) -> int:
         return len(self.state_params)
 
+    def get_state_params(self) -> List[dict]:
+        """返回按全局 index 排序的 state 参数定义。"""
+        return sorted(self.state_params, key=lambda x: x['index'])
+
+    def get_state_names(self) -> List[str]:
+        return [p['name'] for p in self.get_state_params()]
+
+    def get_control_params(self) -> List[dict]:
+        """返回全部 control 参数定义，便于统一处理未来 trainable 切换场景。"""
+        params = self.control_fixed_params + self.control_trainable_params
+        return sorted(params, key=lambda x: x['index'])
+
+    def get_control_names(self) -> List[str]:
+        return [p['name'] for p in self.get_control_params()]
+
+    def get_control_fixed_names(self) -> List[str]:
+        return [p['name'] for p in self.control_fixed_params]
+
+    def get_control_trainable_names(self) -> List[str]:
+        return [p['name'] for p in self.control_trainable_params]
+
+    def get_param(self, name: str) -> dict:
+        if name not in self.params_by_name:
+            raise KeyError(f"未知参数名: {name}")
+        return self.params_by_name[name]
+
     def get_context_params(self) -> List[dict]:
         """
         获取上下文参数列表：state + trainable=False 的 control，按全局 index 升序。
-        该顺序用于策略网络输入与经验池切片，必须稳定。
+
+        这里把“不可控状态”和“当前不可调的 control”统一视为 context，原因是：
+        - 两者都会作为策略网络输入条件；
+        - 两者都会在局部精调时保持固定；
+        - 但 control 的 role 不会因此变成 state，未来只需改 trainable 配置即可切回优化变量。
+
+        该顺序用于策略网络输入、经验池切片和评估 CSV 组装，必须稳定。
         """
         params = self.state_params + self.control_fixed_params
         return sorted(params, key=lambda x: x['index'])
@@ -198,6 +234,27 @@ class ParamManager:
         # 由于在 _parse_parameters 中已做硬校验，此处 p['default'] 必然存在，直接提取
         defaults = [p['default'] for p in self.control_fixed_params]
         return indices, torch.tensor(defaults, dtype=torch.float32, device=device)
+
+    def get_default_feature_vector(self, device: torch.device = torch.device('cpu')) -> torch.Tensor:
+        """
+        返回完整 13 维特征的默认值向量。
+
+        语义约定：
+        - 任何“未由调用方显式覆盖”的位置，都回退到 param_space.yaml 中的 default；
+        - 若未来某个参数被移除 default，这里会在初始化阶段直接报错，而不是在运行时静默填 0。
+        """
+        missing = [p['name'] for p in self.all_params if 'default' not in p]
+        if missing:
+            raise ValueError(f"以下参数缺失 default，无法构造统一默认向量: {missing}")
+        defaults = [float(p['default']) for p in self.all_params]
+        return torch.tensor(defaults, dtype=torch.float32, device=device)
+
+    def get_default_feature_matrix(self, batch_size: int, device: torch.device = torch.device('cpu')) -> torch.Tensor:
+        """把完整默认向量扩展成批量矩阵，供特征组装统一复用。"""
+        if batch_size < 0:
+            raise ValueError("batch_size 不能为负数")
+        base = self.get_default_feature_vector(device=device)
+        return base.unsqueeze(0).expand(batch_size, -1).clone()
 
     def get_sampling_rules(self) -> dict:
         """获取参数空间中集中定义的采样/约束规则。"""

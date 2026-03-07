@@ -4,26 +4,32 @@ from typing import List
 
 # 严格执行绝对路径引用规范
 from ARS_optim.src.core.param_manager import ParamManager
+from ARS_optim.src.core.rule_engine import RuleEngine
 
 class PhysicalConstraintManager:
     """
-    物理约束管理器 (Differentiable Physical Constraint Manager)
+    物理约束投影与软惩罚管理器。
     
-    功能设计:
-    本模块负责在连续参数空间中执行刚性物理法则的数学约束。通过纯张量操作（如 torch.min, torch.max）
-    替代传统的控制流（if-else/原地赋值），确保约束过程全流程可微，从而允许损失函数的梯度无损穿透
-    约束层，指导上层策略网络或底层决策变量进行分布优化。
+    功能：
+        本模块负责在连续参数空间中执行刚性物理法则的数学约束，并提供训练时使用的软惩罚。
+
+        这里需要区分两类规则：
+        - 连续不等式规则（如 AFT/BTF、LLATTF/BTF、LL2/LL1）使用 torch.min/torch.max 做硬投影，
+            梯度语义清晰，可直接服务于策略训练和局部精调；
+        - 离散档位和几何可行域规则（如 RA、SP/SH）当前采用确定性硬修复，目标是保证物理可行性，
+            不把它们伪装成光滑几何层。未来若这些参数改成 trainable，需要单独升级其优化策略。
     
-    混合状态支持 (Mixed-State Resolution):
+    混合状态支持：
     系统支持任意参数的可调性组合。通过动态上下文寻址，即使约束公式中的某些参数被固化（trainable=False）
-    或属于不可控的环境状态（State），系统也能自动从状态张量或默认值字典中提取有效物理值进行边界判定，
-    彻底消除了“仅当所有相关参数均可调时才执行约束”的同源可调性局限与静默失效风险。
+    或属于不可控的环境状态（State），系统也能从状态张量或默认值字典中提取物理值进行边界判定，
+    以避免约束只在“相关参数全可调”时才生效。
     """
     def __init__(self, param_manager: ParamManager):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.param_manager = param_manager
-        self.rules = param_manager.get_sampling_rules() if hasattr(param_manager, 'get_sampling_rules') else {}
-        coupling = self.rules.get('coupling', {}) if isinstance(self.rules, dict) else {}
+        self.rule_engine = RuleEngine(param_manager)
+        self.rules = param_manager.get_sampling_rules()
+        coupling = self.rules.get('coupling', {})
         self.aft_btf_delta_max = float(coupling.get('aft_btf_delta_max', 25.0))
         self.epsilon = float(coupling.get('epsilon', 1e-3))
         
@@ -35,13 +41,13 @@ class PhysicalConstraintManager:
 
     def _get_param_col(self, name: str, cols: List[torch.Tensor], context_params: torch.Tensor, device: torch.device) -> torch.Tensor:
         """
-        动态张量列寻址器 (Dynamic Tensor Column Resolver)
+        动态张量列寻址器。
         
-        接口设计:
+        接口说明：
         根据特征名称的注册属性，动态路由并提取对应的物理列张量。
-        - 若为可调参数 (Trainable)，直接从解包后的 cols 列表中提取，维持前向计算图与级联修改。
-        - 若为状态参数 (State)，从输入的 state_params 中切片提取。
-        - 若为固定参数 (Fixed)，则动态构建形状为 [Batch] 的常数张量。
+        - 若为可调参数，直接从解包后的 cols 列表中提取，保持前向计算图可导。
+        - 若为状态参数，从输入的 context_params 中切片提取。
+        - 若为固定参数，动态构建形状为 [Batch] 的常数张量。
         """
         if name in self.trainable_names:
             return cols[self.trainable_names[name]]
@@ -53,13 +59,22 @@ class PhysicalConstraintManager:
         else:
             raise ValueError(f"[物理约束异常] 试图检索未知的系统参数: {name}")
 
+    def _set_param_col(self, name: str, values: torch.Tensor, cols: List[torch.Tensor]) -> None:
+        """
+        仅当参数当前可调时写回动作列；不可调参数由上下文/默认值提供，不做写回。
+        """
+        if name in self.trainable_names:
+            cols[self.trainable_names[name]] = values
+
     def project_forward(self, actions: torch.Tensor, context_params: torch.Tensor) -> torch.Tensor:
         """
-        前向硬投影 (Hard Projection)
+        前向硬投影。
         
-        功能设计:
+        功能：
         应用可微的次梯度算子强制纠正违反物理耦合关系的参数。
         采用“对称双向投影”：对于不等式 A < B，不仅在 A 可调时限制 A，当 B 可调时也会反向限制 B。
+        双向投影按照固定顺序执行，可在一次前向中把相关变量拉回同一可行域；
+        通过 min/max 的可微算子替代 if-else，可避免硬分支导致的梯度中断。
         
         参数:
             actions: [Batch, D_trainable] 策略网络输出的绝对尺度决策参数
@@ -121,8 +136,16 @@ class PhysicalConstraintManager:
         if 'LL1' in self.trainable_names:
             cols[self.trainable_names['LL1']] = torch.max(ll1, ll2)
 
-        # 梯度安全重组：重新堆叠回张量 [Batch, D_trainable]
         projected_actions = torch.stack(cols, dim=1)
+
+        # 双向耦合投影后，将完整特征交给 RuleEngine 统一处理 RA/SP/SH 与边界 clamp。
+        # 此时 sanitize 中的单向耦合投影对已满足约束的样本是幂等操作，不会破坏双向结果。
+        full_features = self.rule_engine.compose_full_features(
+            context_params=context_params,
+            control_trainable=projected_actions,
+        )
+        full_features = self.rule_engine.sanitize_full_features(full_features)
+        _, projected_actions = self.rule_engine.split_from_full(full_features)
 
         # 轻量一致性检查：若投影后仍有耦合约束残差，提示存在不可满足的参数组合
         with torch.no_grad():
@@ -138,9 +161,9 @@ class PhysicalConstraintManager:
 
     def compute_soft_penalty(self, actions: torch.Tensor, context_params: torch.Tensor) -> torch.Tensor:
         """
-        软惩罚计算 (Soft Penalty for Objective Function)
+        软惩罚计算。
         
-        功能设计:
+        功能：
         在摊销寻优的目标函数中提供平滑的导数指引。对于超出物理边界的部分施加 ReLU 惩罚，
         驱使神经网络在训练阶段自发地将参数分布收敛至安全的物理可行域内部。
         
@@ -171,5 +194,46 @@ class PhysicalConstraintManager:
 
         # 惩罚项 3: 约束 LL2 <= LL1 越界
         penalty += torch.relu(ll2 - ll1)
+
+        # 惩罚项 4: RA 离散档偏离（未来 RA 可调时自动激活）
+        has_side_ot = 'is_driver_side' in self.context_names and 'OT' in self.context_names
+        if has_side_ot:
+            side = torch.round(context_params[:, self.context_names['is_driver_side']]).to(torch.int64)
+            ot = torch.round(context_params[:, self.context_names['OT']]).to(torch.int64)
+        else:
+            side = ot = None
+            self.logger.warning("当前 context 缺少 is_driver_side 或 OT，RA/SP/SH 软惩罚将被跳过。")
+
+        if side is not None and self.rule_engine.ra_cache and 'RA' in (self.trainable_names.keys() | self.context_names.keys() | self.fixed_defaults.keys()):
+            ra = self._get_param_col('RA', cols, context_params, device)
+            ra_pen = torch.zeros_like(penalty)
+            for (side_i, ot_i), allowed_cpu in self.rule_engine.ra_cache.items():
+                mask = (side == side_i) & (ot == ot_i)
+                if not mask.any():
+                    continue
+                allowed = allowed_cpu.to(device=device, dtype=torch.float32)
+                vals = ra[mask]
+                dmin = (vals.unsqueeze(1) - allowed.unsqueeze(0)).abs().min(dim=1).values
+                ra_pen[mask] = dmin
+            penalty += ra_pen
+
+        # 惩罚项 5: SP/SH 多边形约束（软惩罚采用可微的边界框超界距离）
+        if side is not None and self.rule_engine.seat_cache:
+            if 'SP' in (self.trainable_names.keys() | self.context_names.keys() | self.fixed_defaults.keys()) and \
+               'SH' in (self.trainable_names.keys() | self.context_names.keys() | self.fixed_defaults.keys()):
+                sp = self._get_param_col('SP', cols, context_params, device)
+                sh = self._get_param_col('SH', cols, context_params, device)
+                seat_pen = torch.zeros_like(penalty)
+                for (side_i, ot_i), info in self.rule_engine.seat_cache.items():
+                    mask = (side == side_i) & (ot == ot_i)
+                    if not mask.any():
+                        continue
+                    sp_min, sp_max, sh_min, sh_max = info['bbox']
+                    sp_m = sp[mask]
+                    sh_m = sh[mask]
+                    p = torch.relu(sp_min - sp_m) + torch.relu(sp_m - sp_max) + \
+                        torch.relu(sh_min - sh_m) + torch.relu(sh_m - sh_max)
+                    seat_pen[mask] = p
+                penalty += seat_pen
 
         return penalty

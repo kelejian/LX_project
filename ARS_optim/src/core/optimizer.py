@@ -112,13 +112,14 @@ class ARSLocalOptimizer:
                 'trajectory': []
             }
             ret_info.update(init_info)
+            if 'joint_risk' in ret_info:
+                ret_info['joint_risk_batch'] = ret_info['joint_risk']
             return init_actions.detach(), init_preds.detach(), ret_info
 
         # 阶段 2：局部精调
         # 可选择在归一化空间或物理空间更新参数：
         # - 归一化空间便于不同量纲参数共享学习率。
         actions = init_actions.clone().detach()
-        actions.requires_grad = True
         if self.optimize_in_normalized:
             # normalized 变量作为可学习叶子张量；后续 optimizer 直接更新该变量
             norm_actions = self.surrogate._normalize_control(actions, device=device)
@@ -126,6 +127,9 @@ class ARSLocalOptimizer:
             norm_actions.requires_grad = True
             opt_var = norm_actions
         else:
+            # 仅在物理空间优化时才需要把 actions 标记为可训练变量。
+            # 在归一化模式下优化变量是 norm_actions，给 actions 开梯度属于冗余。
+            actions.requires_grad = True
             opt_var = actions
 
         # 只对动作变量建优化器，不更新任何代理模型权重
@@ -175,6 +179,8 @@ class ARSLocalOptimizer:
                 actions = opt_var
             final_loss, final_preds, final_info = self.surrogate.predict_injury_and_loss(context_params, actions, pulse_norm)
             final_info['final_loss_batch'] = final_loss.detach()
+            if 'joint_risk' in final_info:
+                final_info['joint_risk_batch'] = final_info['joint_risk']
         
         final_info['initial'] = {
             'actions': init_actions.detach(),
