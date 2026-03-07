@@ -22,7 +22,7 @@ import numpy as np
 from torch.utils.data import DataLoader, ConcatDataset
 
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
-from common.utils.seeding import set_random_seed
+from common.tools.seeding import set_random_seed
 from InjuryPredict.utils import models
 from common.settings import INJURY_PROCESSED_DIR, load_processed_subset
 # ==========================================================================================

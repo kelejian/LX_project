@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from typing import List, Tuple, Dict, Optional, Sequence
-from common.utils.seeding import GLOBAL_SEED
+from common.tools.seeding import GLOBAL_SEED
 from sklearn.model_selection import train_test_split
 
 

@@ -1,10 +1,5 @@
 # ARS_optim/configs/default_config.yaml
 
-# ===========================
-# 1. 项目基础设置
-# ===========================
-project_name: "LX-ARS-optim"
-version: "1.0.0"
 seed: 42
 device: "cuda" # 或 "cpu"
 
@@ -60,8 +55,7 @@ optimization:
   direct_inference: False # True: 需要进行策略网络直推；False: 使用默认参数作为初始解进行局部精调，不进行策略网络直推
   # 直推后的精调迭代参数
   refine_steps: 50         # 局部精调迭代次数 k. 若为0，则仅依赖策略网络直接推理
-  lr: 0.05                 # 代理模型梯度下降步长 (针对归一化后的参数)
-  optimize_in_normalized: False  # 是否在归一化空间进行局部精调
+  lr: 0.05                 # 局部精调阶段在物理参数空间中的 Adam 步长
   
   # 综合目标函数(Loss)各部位风险权重
   objectives:

@@ -9,7 +9,7 @@ from typing import Dict, Any, Tuple, Optional
 import numpy as np
 import pandas as pd
 
-from common.utils.seeding import GLOBAL_SEED
+from common.tools.seeding import GLOBAL_SEED
 from common.settings import REQUIRED_COLUMNS_FOR_PACKING, FEATURE_ORDER
 from common.settings import RAW_DATA_DIR, SPLIT_INDICES_DIR, NORMALIZATION_CONFIG_PATH, ensure_dirs
 from common.settings import WAVEFORM_LENGTH, WAVEFORM_CHANNELS_XY, WAVEFORM_CHANNELS_XYZ

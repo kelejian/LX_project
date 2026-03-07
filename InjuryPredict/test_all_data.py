@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 
 from common.settings import INJURY_PROCESSED_DIR
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
-from common.utils.seeding import set_random_seed
+from common.tools.seeding import set_random_seed
 
 from InjuryPredict.utils import models
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset

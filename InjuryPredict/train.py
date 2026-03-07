@@ -13,7 +13,7 @@ import torch.optim as optim
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error, accuracy_score, r2_score
 
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
-from common.utils.seeding import set_random_seed, GLOBAL_SEED
+from common.tools.seeding import set_random_seed, GLOBAL_SEED
 from common.settings import INJURY_PROCESSED_DIR
 
 from InjuryPredict.utils import models

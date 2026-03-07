@@ -25,7 +25,7 @@ from InjuryPredict.utils.tools import (
 )
 
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
-from common.utils.seeding import set_random_seed
+from common.tools.seeding import set_random_seed
 from common.settings import INJURY_PROCESSED_DIR
 
 def test(model, loader):

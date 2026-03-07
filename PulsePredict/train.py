@@ -13,7 +13,7 @@ import PulsePredict.model.model as module_arch
 from PulsePredict.parse_config import ConfigParser
 from PulsePredict.trainer import Trainer
 from PulsePredict.utils import prepare_device, get_parameter_groups
-from common.utils.seeding import set_random_seed
+from common.tools.seeding import set_random_seed
 
 def main(config):
     logger = config.get_logger('train')
