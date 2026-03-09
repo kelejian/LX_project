@@ -18,7 +18,7 @@ from ARS_optim.src.constraints import ConstraintEngine
 from ARS_optim.src.data_sampler import StateDataSampler
 from ARS_optim.src.optimizer import LocalRefiner
 from ARS_optim.src.param_manager import ParamManager
-from ARS_optim.src.strategy_net import StrategyNet
+from ARS_optim.src.strategy_net import build_strategy_net_from_config
 from ARS_optim.src.surrogate import SurrogateAdapter, load_surrogate_models
 
 
@@ -50,23 +50,10 @@ def _resolve_strategy_ckpt(args, base_dir: Path, config: Dict) -> Optional[Path]
         return Path(args.strategy_ckpt).resolve()
 
     eval_cfg = config.get("evaluation", {}) or {}
-    configured = eval_cfg.get("default_strategy_ckpt")
+    configured = eval_cfg.get("strategy_checkpoint")
     if configured:
         candidate = Path(str(configured))
         return candidate if candidate.is_absolute() else (base_dir / candidate).resolve()
-
-    strict = bool(eval_cfg.get("strict_default_ckpt", False))
-    run_dirs = sorted(
-        [path for path in (base_dir / "saved_models").glob("strategy_net_*") if path.is_dir()],
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    priorities = ["val_best_model.pth"] if strict else ["val_best_model.pth", "train_best_model.pth", "final_model.pth"]
-    for run_dir in run_dirs:
-        for filename in priorities:
-            candidate = run_dir / filename
-            if candidate.is_file():
-                return candidate
     return None
 
 
@@ -89,47 +76,190 @@ def _write_yaml(path: Path, content: Dict) -> None:
         yaml.safe_dump(content, file, allow_unicode=True, sort_keys=False)
 
 
-def _compute_joint_risk(prob_head: np.ndarray, prob_chest: np.ndarray, prob_neck: np.ndarray) -> np.ndarray:
-    return 1.0 - (1.0 - prob_head) * (1.0 - prob_chest) * (1.0 - prob_neck)
-
-
 def _safe_nanmean(series: pd.Series) -> float:
     values = np.asarray(series, dtype=np.float32)
     return float(np.nan) if np.isnan(values).all() else float(np.nanmean(values))
 
 
-def _build_param_dataframe(df_input: pd.DataFrame, params: List[dict], logger, missing_message: str) -> tuple[pd.DataFrame, List[str]]:
+def _build_param_dataframe(
+    df_input: pd.DataFrame,
+    params: List[dict],
+    logger,
+    missing_message: str,
+) -> tuple[pd.DataFrame, List[str], List[str]]:
     output_df = pd.DataFrame(index=df_input.index)
     missing = []
+    provided = []
     for param in params:
         name = param["name"]
         if name in df_input.columns:
             output_df[name] = pd.to_numeric(df_input[name], errors="raise")
+            provided.append(name)
         else:
             output_df[name] = float(param["default"])
             missing.append(name)
     if missing:
         logger.warning(missing_message.format(missing=missing))
-    return output_df, missing
+    return output_df, missing, provided
 
 
-def _fit_distribution_reference_if_needed(surrogate: SurrogateAdapter, sampler: StateDataSampler, param_manager: ParamManager, config: dict, logger) -> Optional[str]:
-    if not surrogate.distribution_penalty.enabled:
-        return None
-    try:
-        max_ref_samples = int(config.get("optimization", {}).get("distribution_penalty", {}).get("max_ref_samples", 0))
-        reference = sampler.get_distribution_reference(
-            max_samples=max_ref_samples,
-            shuffle=False,
-            feature_space=surrogate.distribution_penalty.feature_space,
-            trainable_indices=param_manager.get_control_trainable_indices(),
+def _validate_provided_values(
+    param_manager: ParamManager,
+    raw_df: pd.DataFrame,
+    sanitized_df: pd.DataFrame,
+    provided_names: List[str],
+    label: str,
+    strict: bool,
+    logger,
+) -> None:
+    issues = []
+    for name in provided_names:
+        param = param_manager.get_param(name)
+        raw_values = raw_df[name].to_numpy()
+        sanitized_values = sanitized_df[name].to_numpy()
+        if param.get("type") == "discrete":
+            invalid_mask = raw_values.astype(np.int64) != sanitized_values.astype(np.int64)
+        else:
+            invalid_mask = ~np.isclose(raw_values.astype(np.float64), sanitized_values.astype(np.float64), atol=1e-5, rtol=1e-5)
+        if np.any(invalid_mask):
+            first_idx = int(np.flatnonzero(invalid_mask)[0])
+            issues.append(
+                f"{label}.{name}[row={first_idx}]={raw_values[first_idx]!r} 不合法，修正后应为 {sanitized_values[first_idx]!r}"
+            )
+        if len(issues) >= 12:
+            break
+
+    if not issues:
+        return
+
+    issue_message = (
+        "输入中存在不合法参数值或硬约束冲突。缺失列会自动回填 default，但已提供的列必须本身合法。\n"
+        + "\n".join(issues)
+    )
+    if strict:
+        raise ValueError(
+            issue_message
         )
-        surrogate.fit_distribution_reference(reference)
-        return None
-    except Exception as exc:
-        logger.warning(f"评估阶段拟合分布参考失败，将关闭分布惩罚: {exc}")
-        surrogate.distribution_penalty.enabled = False
-        return str(exc)
+    logger.warning(
+        "当前评估输入来自内部测试集，将对非规范值执行 sanitize 后继续。首批修正项如下：\n%s",
+        "\n".join(issues),
+    )
+
+
+def _prepare_eval_inputs(
+    df_input: pd.DataFrame,
+    param_manager: ParamManager,
+    constraint_engine: ConstraintEngine,
+    device: torch.device,
+    logger,
+    strict_provided_validation: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame, List[str], List[str]]:
+    context_params = param_manager.get_context_params()
+    trainable_params = param_manager.get_trainable_params()
+    context_names = param_manager.get_context_names()
+    trainable_names = param_manager.get_trainable_names()
+
+    context_df_raw, missing_context, provided_context = _build_param_dataframe(
+        df_input,
+        context_params,
+        logger,
+        "输入缺失部分 context 参数，已回退 default: {missing}",
+    )
+    baseline_df_raw, missing_trainable, provided_trainable = _build_param_dataframe(
+        df_input,
+        trainable_params,
+        logger,
+        "输入未提供部分可调参数，baseline 已回退 default: {missing}",
+    )
+
+    context_tensor_raw = torch.tensor(context_df_raw[context_names].values, dtype=torch.float32, device=device)
+    baseline_tensor_raw = torch.tensor(baseline_df_raw[trainable_names].values, dtype=torch.float32, device=device)
+    context_tensor, baseline_tensor = constraint_engine.sanitize_context_and_trainable(context_tensor_raw, baseline_tensor_raw)
+
+    context_df = pd.DataFrame(context_tensor.detach().cpu().numpy(), columns=context_names, index=df_input.index)
+    baseline_df = pd.DataFrame(baseline_tensor.detach().cpu().numpy(), columns=trainable_names, index=df_input.index)
+
+    _validate_provided_values(
+        param_manager,
+        context_df_raw,
+        context_df,
+        provided_context,
+        label="context",
+        strict=strict_provided_validation,
+        logger=logger,
+    )
+    _validate_provided_values(
+        param_manager,
+        baseline_df_raw,
+        baseline_df,
+        provided_trainable,
+        label="baseline",
+        strict=strict_provided_validation,
+        logger=logger,
+    )
+    return context_df, baseline_df, missing_context, missing_trainable
+
+
+def _choose_report_stage(stage_outputs: Dict[str, object]) -> str:
+    if stage_outputs["Opt2"]["preds"] is not None:
+        return "Opt2"
+    if stage_outputs["Opt1"]["preds"] is not None:
+        return "Opt1"
+    raise ValueError("当前配置下未生成任何优化阶段结果，无法组织评估输出")
+
+
+def _fit_distribution_reference_if_needed(surrogate: SurrogateAdapter, sampler: StateDataSampler, param_manager: ParamManager, config: dict) -> None:
+    if not surrogate.distribution_penalty.enabled:
+        return
+    max_ref_samples = int(config.get("optimization", {}).get("distribution_penalty", {}).get("max_ref_samples", 0))
+    reference = sampler.get_distribution_reference(
+        max_samples=max_ref_samples,
+        shuffle=False,
+        feature_space=surrogate.distribution_penalty.feature_space,
+        trainable_indices=param_manager.get_control_trainable_indices(),
+    )
+    surrogate.fit_distribution_reference(reference)
+
+
+def _load_eval_input(args, logger) -> tuple[pd.DataFrame, Dict[str, np.ndarray], Dict[str, str]]:
+    """装载评估输入与可选真值列。
+
+    该函数只负责确定评估样本和可选真值从哪里读取，
+    不参与参数修复、baseline 回填或模型推理，避免 main 里混杂两类职责。
+    """
+    truth_arrays: Dict[str, np.ndarray] = {}
+    if args.input_csv:
+        input_csv_path = Path(args.input_csv)
+        if not input_csv_path.is_file():
+            raise FileNotFoundError(f"input_csv 不存在: {input_csv_path}")
+        df_input = pd.read_csv(str(input_csv_path))
+        input_source = {"type": "input_csv", "path": str(input_csv_path.resolve())}
+        for key in ["y_HIC", "y_Dmax", "y_Nij"]:
+            if key in df_input.columns:
+                truth_arrays[key] = df_input[key].to_numpy(dtype=np.float32)
+        return df_input, truth_arrays, input_source
+
+    pool_path = RAW_DATA_DIR / "raw_data_packed.npz"
+    test_idx_path = SPLIT_INDICES_DIR / "injury_test_indices.npy"
+    if not pool_path.exists() or not test_idx_path.exists():
+        raise FileNotFoundError("自动测试集模式需要 raw_data_packed.npz 和 injury_test_indices.npy")
+
+    test_indices = np.load(str(test_idx_path)).astype(np.int64)
+    with np.load(str(pool_path), allow_pickle=True) as data:
+        x_att_raw = data["x_att_raw"][test_indices]
+        df_input = pd.DataFrame(x_att_raw, columns=FEATURE_ORDER)
+        case_ids = data["case_ids"][test_indices] if "case_ids" in data else np.arange(len(test_indices))
+        df_input.insert(0, "case_id", case_ids)
+        for key in ["y_HIC", "y_Dmax", "y_Nij", "ais_head", "ais_chest", "ais_neck"]:
+            if key in data:
+                truth_arrays[key] = np.asarray(data[key][test_indices])
+    logger.info(f"未指定 input_csv，自动加载测试集: {len(df_input)} 条")
+    input_source = {
+        "type": "test_split",
+        "path": str(test_idx_path.resolve()),
+        "raw_data_npz_path": str(pool_path.resolve()),
+    }
+    return df_input, truth_arrays, input_source
 
 
 def _compute_predictions_batch(
@@ -202,86 +332,90 @@ def _compute_predictions_batch(
     return output
 
 
+def _build_stage_metric_dataframe(
+    stage_label: str,
+    stage: Dict[str, object],
+    row_count: int,
+    ot_array: np.ndarray,
+) -> pd.DataFrame:
+    preds = stage["preds"]
+    info = stage["info"]
+
+    if preds is None:
+        nan_array = np.full(row_count, np.nan, dtype=np.float32)
+        return pd.DataFrame(
+            {
+                f"{stage_label}_HIC": nan_array.copy(),
+                f"{stage_label}_Dmax": nan_array.copy(),
+                f"{stage_label}_Nij": nan_array.copy(),
+                f"{stage_label}_Phead": nan_array.copy(),
+                f"{stage_label}_Pchest": nan_array.copy(),
+                f"{stage_label}_Pneck": nan_array.copy(),
+                f"{stage_label}_JointRisk": nan_array.copy(),
+                f"{stage_label}_AIS_head": nan_array.copy(),
+                f"{stage_label}_AIS_chest": nan_array.copy(),
+                f"{stage_label}_AIS_neck": nan_array.copy(),
+                f"{stage_label}_AIS_max": nan_array.copy(),
+            }
+        )
+
+    pred_array = preds.detach().cpu().numpy()
+    info_arrays = {name: info[name].detach().cpu().numpy() for name in ["p_head", "p_chest", "p_neck", "joint_risk"]}
+
+    stage_df = pd.DataFrame(
+        {
+            f"{stage_label}_HIC": pred_array[:, 0],
+            f"{stage_label}_Dmax": pred_array[:, 1],
+            f"{stage_label}_Nij": pred_array[:, 2],
+            f"{stage_label}_Phead": info_arrays["p_head"],
+            f"{stage_label}_Pchest": info_arrays["p_chest"],
+            f"{stage_label}_Pneck": info_arrays["p_neck"],
+            f"{stage_label}_JointRisk": info_arrays["joint_risk"],
+        }
+    )
+    stage_df[f"{stage_label}_AIS_head"] = AIS_cal_head(stage_df[f"{stage_label}_HIC"].to_numpy(dtype=np.float32))
+    stage_df[f"{stage_label}_AIS_chest"] = AIS_cal_chest(stage_df[f"{stage_label}_Dmax"].to_numpy(dtype=np.float32), ot_array)
+    stage_df[f"{stage_label}_AIS_neck"] = AIS_cal_neck(stage_df[f"{stage_label}_Nij"].to_numpy(dtype=np.float32))
+    stage_df[f"{stage_label}_AIS_max"] = np.maximum.reduce(
+        [
+            stage_df[f"{stage_label}_AIS_head"].to_numpy(dtype=np.float32),
+            stage_df[f"{stage_label}_AIS_chest"].to_numpy(dtype=np.float32),
+            stage_df[f"{stage_label}_AIS_neck"].to_numpy(dtype=np.float32),
+        ]
+    )
+    return stage_df
+
+
 def _build_result_dataframe(
     df_input: pd.DataFrame,
     context_df: pd.DataFrame,
+    baseline_df: pd.DataFrame,
     stage_outputs: Dict[str, object],
     truth_arrays: Dict[str, np.ndarray],
     trainable_names: List[str],
-) -> tuple[pd.DataFrame, Dict[str, float]]:
+) -> tuple[pd.DataFrame, Dict[str, float], str]:
     excluded_input_cols = set(FEATURE_ORDER) | {"y_HIC", "y_Dmax", "y_Nij", "ais_head", "ais_chest", "ais_neck"}
     metadata_cols = [col for col in df_input.columns if col not in excluded_input_cols]
     metadata_df = df_input[metadata_cols].reset_index(drop=True)
     frame_parts = [metadata_df, context_df.reset_index(drop=True)]
 
     ot_array = context_df["OT"].to_numpy(dtype=np.float32)
+    optimized_stage_name = _choose_report_stage(stage_outputs)
+    optimized_stage = stage_outputs[optimized_stage_name]
 
-    for prefix in ["Base", "Opt1", "Opt2"]:
-        stage = stage_outputs[prefix]
-        preds = stage["preds"]
-        actions = stage["actions"]
-        loss = stage["loss"]
-        info = stage["info"]
+    baseline_df = baseline_df.reset_index(drop=True).rename(columns={name: f"Base_{name}" for name in trainable_names})
+    frame_parts.append(baseline_df)
 
-        if preds is None:
-            nan_array = np.full(len(df_input), np.nan, dtype=np.float32)
-            stage_data = {
-                f"{prefix}_HIC": nan_array.copy(),
-                f"{prefix}_Dmax": nan_array.copy(),
-                f"{prefix}_Nij": nan_array.copy(),
-                f"{prefix}_Loss": nan_array.copy(),
-                f"{prefix}_Phead": nan_array.copy(),
-                f"{prefix}_Pchest": nan_array.copy(),
-                f"{prefix}_Pneck": nan_array.copy(),
-                f"{prefix}_JointRisk": nan_array.copy(),
-                f"{prefix}_AIS_head": nan_array.copy(),
-                f"{prefix}_AIS_chest": nan_array.copy(),
-                f"{prefix}_AIS_neck": nan_array.copy(),
-                f"{prefix}_AIS_max": nan_array.copy(),
-            }
-        else:
-            pred_array = preds.detach().cpu().numpy()
+    opt_actions = optimized_stage["actions"]
+    if opt_actions is None:
+        opt_action_df = pd.DataFrame({f"Opt_{name}": np.full(len(df_input), np.nan, dtype=np.float32) for name in trainable_names})
+    else:
+        opt_array = opt_actions.detach().cpu().numpy()
+        opt_action_df = pd.DataFrame({f"Opt_{name}": opt_array[:, idx] for idx, name in enumerate(trainable_names)})
+    frame_parts.append(opt_action_df.reset_index(drop=True))
 
-            info_arrays = {}
-            for name in ["p_head", "p_chest", "p_neck", "joint_risk"]:
-                info_arrays[name] = info[name].detach().cpu().numpy()
-            joint_risk = info_arrays["joint_risk"]
-            if np.isnan(joint_risk).all():
-                joint_risk = _compute_joint_risk(info_arrays["p_head"], info_arrays["p_chest"], info_arrays["p_neck"])
-
-            stage_data = {
-                f"{prefix}_HIC": pred_array[:, 0],
-                f"{prefix}_Dmax": pred_array[:, 1],
-                f"{prefix}_Nij": pred_array[:, 2],
-                f"{prefix}_Loss": loss.detach().cpu().numpy(),
-                f"{prefix}_Phead": info_arrays["p_head"],
-                f"{prefix}_Pchest": info_arrays["p_chest"],
-                f"{prefix}_Pneck": info_arrays["p_neck"],
-                f"{prefix}_JointRisk": joint_risk,
-            }
-            stage_data[f"{prefix}_AIS_head"] = AIS_cal_head(stage_data[f"{prefix}_HIC"].astype(np.float32))
-            stage_data[f"{prefix}_AIS_chest"] = AIS_cal_chest(stage_data[f"{prefix}_Dmax"].astype(np.float32), ot_array)
-            stage_data[f"{prefix}_AIS_neck"] = AIS_cal_neck(stage_data[f"{prefix}_Nij"].astype(np.float32))
-            stage_data[f"{prefix}_AIS_max"] = np.nanmax(
-                np.vstack(
-                    [
-                        stage_data[f"{prefix}_AIS_head"].astype(np.float32),
-                        stage_data[f"{prefix}_AIS_chest"].astype(np.float32),
-                        stage_data[f"{prefix}_AIS_neck"].astype(np.float32),
-                    ]
-                ),
-                axis=0,
-            )
-
-        if actions is None:
-            for name in trainable_names:
-                stage_data[f"{prefix}_{name}"] = np.full(len(df_input), np.nan, dtype=np.float32)
-        else:
-            action_array = actions.detach().cpu().numpy()
-            for idx, name in enumerate(trainable_names):
-                stage_data[f"{prefix}_{name}"] = action_array[:, idx]
-
-        frame_parts.append(pd.DataFrame(stage_data, index=df_input.index).reset_index(drop=True))
+    frame_parts.append(_build_stage_metric_dataframe("Base", stage_outputs["Base"], len(df_input), ot_array).reset_index(drop=True))
+    frame_parts.append(_build_stage_metric_dataframe("Opt", optimized_stage, len(df_input), ot_array).reset_index(drop=True))
 
     result_df = pd.concat(frame_parts, axis=1)
 
@@ -310,56 +444,119 @@ def _build_result_dataframe(
                 truth_df["True_AIS_neck"].to_numpy(dtype=np.float32),
             ]
         )
-        for prefix in ["Base", "Opt2"]:
+        for prefix in ["Base", "Opt"]:
             for name in ["HIC", "Dmax", "Nij"]:
                 truth_df[f"True_vs_{prefix}_{name}"] = truth_df[f"True_{name}"] - result_df[f"{prefix}_{name}"]
         result_df = pd.concat([result_df, truth_df], axis=1)
 
-    eps = 1e-8
     reduction_specs = [
-        ("HIC", "Base_HIC", "Opt2_HIC", True),
-        ("Dmax", "Base_Dmax", "Opt2_Dmax", True),
-        ("Nij", "Base_Nij", "Opt2_Nij", True),
-        ("Phead", "Base_Phead", "Opt2_Phead", False),
-        ("Pchest", "Base_Pchest", "Opt2_Pchest", False),
-        ("Pneck", "Base_Pneck", "Opt2_Pneck", False),
-        ("JointRisk", "Base_JointRisk", "Opt2_JointRisk", False),
-        ("AIS_head", "Base_AIS_head", "Opt2_AIS_head", False),
-        ("AIS_chest", "Base_AIS_chest", "Opt2_AIS_chest", False),
-        ("AIS_neck", "Base_AIS_neck", "Opt2_AIS_neck", False),
-        ("AIS_max", "Base_AIS_max", "Opt2_AIS_max", False),
-        ("Loss", "Base_Loss", "Opt2_Loss", True),
+        ("HIC", "Base_HIC", "Opt_HIC"),
+        ("Dmax", "Base_Dmax", "Opt_Dmax"),
+        ("Nij", "Base_Nij", "Opt_Nij"),
+        ("Phead", "Base_Phead", "Opt_Phead"),
+        ("Pchest", "Base_Pchest", "Opt_Pchest"),
+        ("Pneck", "Base_Pneck", "Opt_Pneck"),
+        ("JointRisk", "Base_JointRisk", "Opt_JointRisk"),
+        ("AIS_head", "Base_AIS_head", "Opt_AIS_head"),
+        ("AIS_chest", "Base_AIS_chest", "Opt_AIS_chest"),
+        ("AIS_neck", "Base_AIS_neck", "Opt_AIS_neck"),
+        ("AIS_max", "Base_AIS_max", "Opt_AIS_max"),
     ]
     reduction_data = {}
-    for alias, base_col, opt_col, with_pct in reduction_specs:
+    for alias, base_col, opt_col in reduction_specs:
         reduction_abs = result_df[base_col] - result_df[opt_col]
-        reduction_data[f"Reduction_{alias}_abs"] = reduction_abs
-        if with_pct:
-            reduction_data[f"Reduction_{alias}_pct"] = reduction_abs / np.maximum(np.abs(result_df[base_col]), eps)
+        reduction_data[f"Reduction_{alias}"] = reduction_abs
 
     if reduction_data:
         result_df = pd.concat([result_df, pd.DataFrame(reduction_data, index=df_input.index).reset_index(drop=True)], axis=1)
 
     summary = {
-        "mean_reduction_HIC": _safe_nanmean(result_df["Reduction_HIC_abs"]),
-        "mean_reduction_Dmax": _safe_nanmean(result_df["Reduction_Dmax_abs"]),
-        "mean_reduction_Nij": _safe_nanmean(result_df["Reduction_Nij_abs"]),
-        "mean_reduction_Phead": _safe_nanmean(result_df["Reduction_Phead_abs"]),
-        "mean_reduction_Pchest": _safe_nanmean(result_df["Reduction_Pchest_abs"]),
-        "mean_reduction_Pneck": _safe_nanmean(result_df["Reduction_Pneck_abs"]),
-        "mean_reduction_joint_risk": _safe_nanmean(result_df["Reduction_JointRisk_abs"]),
-        "mean_base_loss": _safe_nanmean(result_df["Base_Loss"]),
-        "mean_opt1_loss": _safe_nanmean(result_df["Opt1_Loss"]),
-        "mean_opt2_loss": _safe_nanmean(result_df["Opt2_Loss"]),
+        "optimized_stage_source": optimized_stage_name,
+        "mean_reduction_HIC": _safe_nanmean(result_df["Reduction_HIC"]),
+        "mean_reduction_Dmax": _safe_nanmean(result_df["Reduction_Dmax"]),
+        "mean_reduction_Nij": _safe_nanmean(result_df["Reduction_Nij"]),
+        "mean_reduction_Phead": _safe_nanmean(result_df["Reduction_Phead"]),
+        "mean_reduction_Pchest": _safe_nanmean(result_df["Reduction_Pchest"]),
+        "mean_reduction_Pneck": _safe_nanmean(result_df["Reduction_Pneck"]),
+        "mean_reduction_joint_risk": _safe_nanmean(result_df["Reduction_JointRisk"]),
         "mean_base_joint_risk": _safe_nanmean(result_df["Base_JointRisk"]),
-        "mean_opt1_joint_risk": _safe_nanmean(result_df["Opt1_JointRisk"]),
-        "mean_opt2_joint_risk": _safe_nanmean(result_df["Opt2_JointRisk"]),
+        "mean_opt_joint_risk": _safe_nanmean(result_df["Opt_JointRisk"]),
         "mean_base_ais_max": _safe_nanmean(result_df["Base_AIS_max"]),
-        "mean_opt1_ais_max": _safe_nanmean(result_df["Opt1_AIS_max"]),
-        "mean_opt2_ais_max": _safe_nanmean(result_df["Opt2_AIS_max"]),
+        "mean_opt_ais_max": _safe_nanmean(result_df["Opt_AIS_max"]),
         "n_samples": int(len(result_df)),
     }
-    return result_df, summary
+    return result_df, summary, optimized_stage_name
+
+
+def _build_eval_info(
+    args,
+    output_dir: Path,
+    output_csv_path: Path,
+    input_source: Dict[str, str],
+    strategy_ckpt_path: Optional[Path],
+    cfg_path: Path,
+    param_space_path: Path,
+    config: dict,
+    param_manager: ParamManager,
+    context_names: List[str],
+    trainable_names: List[str],
+    missing_context: List[str],
+    missing_trainable: List[str],
+    opt1_generated: bool,
+    opt2_generated: bool,
+    optimized_stage_name: str,
+    surrogate: SurrogateAdapter,
+    summary_metrics: Dict[str, float],
+    stage_outputs: Dict[str, object],
+    result_row_count: int,
+) -> Dict[str, object]:
+    return {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "output_dir": str(output_dir),
+        "output_csv": str(output_csv_path),
+        "input_source": input_source,
+        "strategy_checkpoint_path": str(strategy_ckpt_path) if strategy_ckpt_path is not None else None,
+        "direct_inference": bool(config.get("optimization", {}).get("direct_inference", False)),
+        "config_files": _copy_config_snapshots(cfg_path, param_space_path, output_dir),
+        "evaluation_config": config.get("evaluation", {}),
+        "optimization_config": config.get("optimization", {}),
+        "parameter_roles": {
+            "context": context_names,
+            "trainable_control": trainable_names,
+            "fixed_control": param_manager.get_fixed_control_names(),
+        },
+        "missing_context_filled_by_default": missing_context,
+        "missing_trainable_filled_by_default": missing_trainable,
+        "input_validation_policy": {
+            "input_csv": "strict_provided_values" if args.input_csv else None,
+            "test_split": "allow_internal_sanitize" if not args.input_csv else None,
+        },
+        "stage_definition": {
+            "Base": "输入 CSV 提供的 baseline control；缺失时回填 default",
+            "Opt1": "策略网络直推结果；仅在 direct_inference=True 且权重可用时存在",
+            "Opt2": "局部精调结果；仅在 refine_steps>0 时存在",
+        },
+        "stage_status": {
+            "base_generated": True,
+            "opt1_generated": opt1_generated,
+            "opt2_generated": opt2_generated,
+            "reported_optimized_stage": optimized_stage_name,
+        },
+        "distribution_penalty": {
+            "enabled_after_fit": bool(surrogate.distribution_penalty.enabled),
+            "feature_space": surrogate.distribution_penalty.feature_space,
+        },
+        "summary_metrics": summary_metrics,
+        "formulas": {
+            "joint_risk": "L_risk = 1 - Π_k (1 - P_k)",
+            "reported_reduction": "mean(Base - ReportedOpt)",
+        },
+        "runtime": {
+            "total_time_cost_sec": float(stage_outputs["total_time_cost"]),
+            "avg_time_cost_sec": float(stage_outputs["total_time_cost"] / max(1, result_row_count)),
+            "trajectory_steps_logged": len(stage_outputs["trajectory_all"]),
+        },
+    }
 
 
 def main():
@@ -404,44 +601,25 @@ def main():
         jitter_ratio=0.0,
         jitter_prob=0.0,
     )
-    dist_fit_error = _fit_distribution_reference_if_needed(surrogate, ref_sampler, param_manager, config, logger)
-
-    strat_cfg = config.get("strategy_net", {})
-    strategy_net = StrategyNet(
-        param_manager=param_manager,
-        constraint_engine=constraint_engine,
-        data_processor=data_processor,
-        hidden_dims=strat_cfg.get("hidden_dims", [128, 256, 128]),
-        activation=strat_cfg.get("activation", "LeakyReLU"),
-        dropout=float(strat_cfg.get("dropout", 0.1)),
-        pulse_channels=int(strat_cfg.get("pulse_channels", 2)),
-        pulse_embed_dim=int(strat_cfg.get("pulse_embed_dim", 32)),
-    ).to(device)
+    _fit_distribution_reference_if_needed(surrogate, ref_sampler, param_manager, config)
 
     strategy_ckpt_path = _resolve_strategy_ckpt(args, base_dir, config)
-    strict_default_ckpt = bool(config.get("evaluation", {}).get("strict_default_ckpt", False))
-    strategy_fallback_reason = None
-    if strategy_ckpt_path is not None:
+    strategy_net = None
+    if bool(config.get("optimization", {}).get("direct_inference", False)):
+        if strategy_ckpt_path is None:
+            raise ValueError("direct_inference=True 时必须显式提供 strategy_checkpoint 或 --strategy_ckpt")
         if not strategy_ckpt_path.is_file():
             raise FileNotFoundError(f"策略权重不存在: {strategy_ckpt_path}")
+        strategy_net = build_strategy_net_from_config(
+            param_manager=param_manager,
+            constraint_engine=constraint_engine,
+            data_processor=data_processor,
+            config=config,
+        ).to(device)
         try:
             strategy_net.load_state_dict(torch.load(str(strategy_ckpt_path), map_location=device, weights_only=True))
-            config["optimization"]["direct_inference"] = True
         except Exception as exc:
-            if strict_default_ckpt:
-                raise RuntimeError(f"策略权重加载失败: {strategy_ckpt_path}") from exc
-            strategy_fallback_reason = (
-                f"策略权重与当前 trainable 配置不兼容，已降级为不生成 Opt1: {strategy_ckpt_path}; {exc}"
-            )
-            logger.warning(strategy_fallback_reason)
-            config["optimization"]["direct_inference"] = False
-            strategy_ckpt_path = None
-    elif strict_default_ckpt:
-        raise FileNotFoundError("strict_default_ckpt=true 且未找到默认策略权重")
-    else:
-        strategy_fallback_reason = "未找到策略权重，已降级为不生成 Opt1；若 refine_steps>0，则仅输出 Base 和 Opt2"
-        logger.warning(strategy_fallback_reason)
-        config["optimization"]["direct_inference"] = False
+            raise RuntimeError(f"策略权重与当前参数空间不兼容: {strategy_ckpt_path}") from exc
 
     optimizer = LocalRefiner(
         config=config,
@@ -451,58 +629,23 @@ def main():
         strategy_net=strategy_net,
     )
 
-    truth_arrays: Dict[str, np.ndarray] = {}
-    if args.input_csv:
-        input_csv_path = Path(args.input_csv)
-        if not input_csv_path.is_file():
-            raise FileNotFoundError(f"input_csv 不存在: {input_csv_path}")
-        df_input = pd.read_csv(str(input_csv_path))
-        input_source = {"type": "input_csv", "path": str(input_csv_path.resolve())}
-        for key in ["y_HIC", "y_Dmax", "y_Nij"]:
-            if key in df_input.columns:
-                truth_arrays[key] = df_input[key].to_numpy(dtype=np.float32)
-    else:
-        pool_path = RAW_DATA_DIR / "raw_data_packed.npz"
-        test_idx_path = SPLIT_INDICES_DIR / "injury_test_indices.npy"
-        if not pool_path.exists() or not test_idx_path.exists():
-            raise FileNotFoundError("自动测试集模式需要 raw_data_packed.npz 和 injury_test_indices.npy")
-        test_indices = np.load(str(test_idx_path)).astype(np.int64)
-        with np.load(str(pool_path), allow_pickle=True) as data:
-            x_att_raw = data["x_att_raw"][test_indices]
-            df_input = pd.DataFrame(x_att_raw, columns=FEATURE_ORDER)
-            case_ids = data["case_ids"][test_indices] if "case_ids" in data else np.arange(len(test_indices))
-            df_input.insert(0, "case_id", case_ids)
-            for key in ["y_HIC", "y_Dmax", "y_Nij", "ais_head", "ais_chest", "ais_neck"]:
-                if key in data:
-                    truth_arrays[key] = np.asarray(data[key][test_indices])
-        input_source = {
-            "type": "test_split",
-            "path": str(test_idx_path.resolve()),
-            "raw_data_npz_path": str(pool_path.resolve()),
-        }
-        logger.info(f"未指定 input_csv，自动加载测试集: {len(df_input)} 条")
+    df_input, truth_arrays, input_source = _load_eval_input(args, logger)
 
     if "case_id" not in df_input.columns:
         df_input.insert(0, "case_id", np.arange(len(df_input), dtype=np.int64))
 
-    context_df, missing_context = _build_param_dataframe(
-        df_input,
-        param_manager.get_context_params(),
-        logger,
-        "输入缺失部分 context 参数，已回退 default: {missing}",
-    )
-    baseline_df, missing_trainable = _build_param_dataframe(
-        df_input,
-        param_manager.control_trainable_params,
-        logger,
-        "输入未提供部分可调参数，baseline 已回退 default: {missing}",
+    context_df, baseline_df, missing_context, missing_trainable = _prepare_eval_inputs(
+        df_input=df_input,
+        param_manager=param_manager,
+        constraint_engine=constraint_engine,
+        device=device,
+        logger=logger,
+        strict_provided_validation=bool(args.input_csv),
     )
     context_names = param_manager.get_context_names()
-    trainable_names = [param["name"] for param in param_manager.control_trainable_params]
-    context_tensor_raw = torch.tensor(context_df[context_names].values, dtype=torch.float32, device=device)
-    baseline_tensor_raw = torch.tensor(baseline_df[trainable_names].values, dtype=torch.float32, device=device)
-    context_tensor, baseline_tensor = constraint_engine.sanitize_context_and_trainable(context_tensor_raw, baseline_tensor_raw)
-    context_df = pd.DataFrame(context_tensor.detach().cpu().numpy(), columns=context_names, index=df_input.index)
+    trainable_names = param_manager.get_trainable_names()
+    context_tensor = torch.tensor(context_df[context_names].values, dtype=torch.float32, device=device)
+    baseline_tensor = torch.tensor(baseline_df[trainable_names].values, dtype=torch.float32, device=device)
 
     eval_batch_size = int(config.get("evaluation", {}).get("eval_batch_size", 512))
     if eval_batch_size <= 0:
@@ -515,54 +658,40 @@ def main():
         eval_batch_size=eval_batch_size,
     )
 
-    result_df, summary_metrics = _build_result_dataframe(
+    result_df, summary_metrics, optimized_stage_name = _build_result_dataframe(
         df_input=df_input,
         context_df=context_df,
+        baseline_df=baseline_df,
         stage_outputs=stage_outputs,
         truth_arrays=truth_arrays,
         trainable_names=trainable_names,
     )
     result_df.to_csv(str(output_csv_path), index=False)
+    opt1_generated = stage_outputs["Opt1"]["preds"] is not None
+    opt2_generated = stage_outputs["Opt2"]["preds"] is not None
 
-    eval_info = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "output_dir": str(output_dir),
-        "output_csv": str(output_csv_path),
-        "input_source": input_source,
-        "strategy_checkpoint_path": str(strategy_ckpt_path) if strategy_ckpt_path is not None else None,
-        "strategy_stage_fallback_reason": strategy_fallback_reason,
-        "direct_inference": bool(config.get("optimization", {}).get("direct_inference", False)),
-        "config_files": _copy_config_snapshots(cfg_path, param_space_path, output_dir),
-        "evaluation_config": config.get("evaluation", {}),
-        "optimization_config": config.get("optimization", {}),
-        "parameter_roles": {
-            "context": context_names,
-            "trainable_control": trainable_names,
-            "fixed_control": [param["name"] for param in param_manager.control_fixed_params],
-        },
-        "missing_context_filled_by_default": missing_context,
-        "missing_trainable_filled_by_default": missing_trainable,
-        "stage_definition": {
-            "Base": "输入 CSV 提供的 baseline control；缺失时回填 default",
-            "Opt1": "策略网络直推结果；仅在 direct_inference=True 且权重可用时存在",
-            "Opt2": "局部精调结果；仅在 refine_steps>0 时存在",
-        },
-        "distribution_penalty": {
-            "enabled_after_fit": bool(surrogate.distribution_penalty.enabled),
-            "feature_space": surrogate.distribution_penalty.feature_space,
-            "fit_error": dist_fit_error,
-        },
-        "summary_metrics": summary_metrics,
-        "formulas": {
-            "joint_risk": "L_risk = 1 - Π_k (1 - P_k)",
-            "reported_reduction": "mean(Base - Opt2)",
-        },
-        "runtime": {
-            "total_time_cost_sec": float(stage_outputs["total_time_cost"]),
-            "avg_time_cost_sec": float(stage_outputs["total_time_cost"] / max(1, len(result_df))),
-            "trajectory_steps_logged": len(stage_outputs["trajectory_all"]),
-        },
-    }
+    eval_info = _build_eval_info(
+        args=args,
+        output_dir=output_dir,
+        output_csv_path=output_csv_path,
+        input_source=input_source,
+        strategy_ckpt_path=strategy_ckpt_path,
+        cfg_path=cfg_path,
+        param_space_path=param_space_path,
+        config=config,
+        param_manager=param_manager,
+        context_names=context_names,
+        trainable_names=trainable_names,
+        missing_context=missing_context,
+        missing_trainable=missing_trainable,
+        opt1_generated=opt1_generated,
+        opt2_generated=opt2_generated,
+        optimized_stage_name=optimized_stage_name,
+        surrogate=surrogate,
+        summary_metrics=summary_metrics,
+        stage_outputs=stage_outputs,
+        result_row_count=len(result_df),
+    )
     _write_yaml(output_dir / "eval_info.yaml", eval_info)
     logger.info(f"评估完成，结果目录: {output_dir}")
     logger.info(f"结果 CSV: {output_csv_path}")

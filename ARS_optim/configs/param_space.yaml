@@ -44,7 +44,7 @@ parameters:
     min: 1.0  
     max: 7.0  
     trainable: False
-    default: 2.5 # 当前作为 context 输入与局部精调固定值保留；未来若切为 trainable，无需改 role
+    default: 2.5
 
   - name: "LL2"
     index: 4
@@ -89,7 +89,7 @@ parameters:
     type: "continuous"
     min: -110.0
     max: 110.0
-    trainable: False
+    trainable: True
     default: 0.0
 
   - name: "SH"
@@ -98,7 +98,7 @@ parameters:
     type: "continuous"
     min: 0.0
     max: 60.0
-    trainable: False
+    trainable: True
     default: 0.0
 
   - name: "RA"
@@ -107,7 +107,7 @@ parameters:
     type: "continuous"
     min: 15.0
     max: 40.0
-    trainable: False
+    trainable: True
     default: 25.0
 
   # --- 4. 离散型状态参数 (State) ---
@@ -115,12 +115,14 @@ parameters:
     index: 11
     role: "state"
     type: "discrete"
+    values: [0, 1]
     default: 1 # 1=主驾，0=副驾
 
   - name: "OT"
     index: 12
     role: "state"
     type: "discrete"
+    values: [1, 2, 3]
     default: 2 # 1=5th，2=50th，3=95th
 
 # ---------------------------------------------------------

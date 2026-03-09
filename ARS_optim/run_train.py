@@ -19,7 +19,7 @@ from common.tools.seeding import set_random_seed
 from ARS_optim.src.constraints import ConstraintEngine
 from ARS_optim.src.data_sampler import StateDataSampler
 from ARS_optim.src.param_manager import ParamManager
-from ARS_optim.src.strategy_net import StrategyNet
+from ARS_optim.src.strategy_net import build_strategy_net_from_config
 from ARS_optim.src.surrogate import SurrogateAdapter, load_surrogate_models
 
 
@@ -50,6 +50,107 @@ def _build_scheduler(optimizer, train_cfg: dict, max_iters: int):
             gamma=float(scheduler_cfg.get("gamma", 0.5)),
         )
     return None
+
+
+def _build_training_summary(
+    train_cfg: dict,
+    val_interval: int,
+    val_batch_size: int,
+    ema_enabled: bool,
+    ema_alpha: float,
+    ema_warmup_iters: int,
+    tensorboard_enabled: bool,
+    surrogate: SurrogateAdapter,
+    param_manager: ParamManager,
+    train_sampler: StateDataSampler,
+    val_sampler: StateDataSampler,
+    dist_ref_sample_count: Optional[int],
+    run_norm_snapshot_path: Path,
+    config: dict,
+    train_best_iter: int,
+    train_best_loss: float,
+    train_metric_name: str,
+    train_best_path: Path,
+    val_best_iter: int,
+    val_best_loss: float,
+    val_best_path: Path,
+    final_path: Path,
+) -> dict:
+    return {
+        "max_iterations": train_cfg["max_iterations"],
+        "val_interval": val_interval,
+        "val_batch_size": val_batch_size,
+        "ema": {
+            "enabled": ema_enabled,
+            "alpha": ema_alpha,
+            "warmup_iters": ema_warmup_iters,
+            "tensorboard": tensorboard_enabled,
+        },
+        "data_flow": {
+            "train_sampler": train_sampler.get_source_info(),
+            "val_sampler": val_sampler.get_source_info(),
+            "train_stream_semantics": "从 injury_train 经验池按批采样并做连续 context 扰动，不使用 epoch 概念",
+            "val_stream_semantics": "每个 val_interval 在 injury_val 全量样本上评估一次，不加扰动",
+        },
+        "distribution_penalty": {
+            "enabled": bool(surrogate.distribution_penalty.enabled),
+            "method": surrogate.distribution_penalty.method,
+            "feature_space": surrogate.distribution_penalty.feature_space,
+            "weight": surrogate.weight_distribution,
+            "k": surrogate.distribution_penalty.k,
+            "eps": surrogate.distribution_penalty.eps,
+            "clip_max": surrogate.distribution_penalty.clip_max,
+            "normalize_by_train_stats": surrogate.distribution_penalty.normalize_by_train_stats,
+            "reference_sample_count": dist_ref_sample_count,
+        },
+        "parameter_roles": {
+            "context": param_manager.get_context_names(),
+            "trainable_control": param_manager.get_trainable_names(),
+            "fixed_control": param_manager.get_fixed_control_names(),
+        },
+        "external_artifacts": {
+            "normalization_config": run_norm_snapshot_path.name,
+            "pulse_checkpoint": config.get("surrogate", {}).get("pulse_checkpoint"),
+            "injury_checkpoint": config.get("surrogate", {}).get("checkpoint_rel_path"),
+        },
+        "train_best": {
+            "iter": train_best_iter,
+            "loss": None if train_best_iter < 0 else float(train_best_loss),
+            "metric": train_metric_name,
+            "ckpt": train_best_path.name,
+        },
+        "val_best": {
+            "iter": val_best_iter,
+            "loss": None if val_best_iter < 0 else float(val_best_loss),
+            "ckpt": val_best_path.name,
+        },
+        "final_model": {
+            "iter": train_cfg["max_iterations"],
+            "ckpt": final_path.name,
+        },
+    }
+
+
+def _evaluate_strategy_batch(
+    strategy_net,
+    surrogate: SurrogateAdapter,
+    context_params: torch.Tensor,
+) -> tuple[torch.Tensor, dict]:
+    """统一一批 context 上的策略前向与代理评估。
+
+    训练批和验证批都走同一条链路：先基于 context 生成 pulse，再由策略网络产出动作，
+    最后交给代理模型计算逐样本 loss 与风险拆解。
+
+    这样做的目的不是增加封装层，而是避免训练循环和验证循环各自维护一套相同的前向逻辑。
+    """
+    pulse_norm = surrogate.generate_pulse(context_params)
+    actions = strategy_net(context_params, pulse_norm)
+    loss_batch, _, info, _ = surrogate.evaluate_actions(
+        context_params=context_params,
+        control_trainable=actions,
+        pulse_norm=pulse_norm,
+    )
+    return loss_batch, info
 
 
 def main():
@@ -119,16 +220,11 @@ def main():
         data_processor=data_processor,
     ).to(device)
 
-    strat_cfg = config.get("strategy_net", {})
-    strategy_net = StrategyNet(
+    strategy_net = build_strategy_net_from_config(
         param_manager=param_manager,
         constraint_engine=constraint_engine,
         data_processor=data_processor,
-        hidden_dims=strat_cfg.get("hidden_dims", [128, 256, 128]),
-        activation=strat_cfg.get("activation", "LeakyReLU"),
-        dropout=float(strat_cfg.get("dropout", 0.1)),
-        pulse_channels=int(strat_cfg.get("pulse_channels", 2)),
-        pulse_embed_dim=int(strat_cfg.get("pulse_embed_dim", 32)),
+        config=config,
     ).to(device)
 
     optimizer = optim.Adam(strategy_net.parameters(), lr=train_cfg["lr"], weight_decay=train_cfg["weight_decay"])
@@ -140,6 +236,7 @@ def main():
         batch_size=train_cfg["batch_size"],
         device=device,
         seed=seed,
+        split_indices_path=str(SPLIT_INDICES_DIR / "injury_train_indices.npy"),
         jitter_ratio=float(train_cfg.get("jitter_ratio", 0.01)),
         jitter_prob=float(train_cfg.get("jitter_prob", 1.0)),
     )
@@ -154,6 +251,7 @@ def main():
         jitter_prob=0.0,
     )
     train_generator = train_sampler.get_infinite_generator()
+    dist_ref_sample_count = None
 
     if surrogate.distribution_penalty.enabled:
         dist_cfg = config.get("optimization", {}).get("distribution_penalty", {})
@@ -163,6 +261,7 @@ def main():
             feature_space=surrogate.distribution_penalty.feature_space,
             trainable_indices=param_manager.get_control_trainable_indices(),
         )
+        dist_ref_sample_count = int(ref_context.shape[0])
         surrogate.fit_distribution_reference(ref_context)
 
     tensorboard_enabled = bool(train_cfg.get("tensorboard", True))
@@ -194,9 +293,7 @@ def main():
         sample_count = 0
         with torch.no_grad():
             for batch_context in val_sampler.iter_dataset_batches(batch_size=int(train_cfg.get("val_batch_size", 1024)), shuffle=False):
-                pulse_norm = surrogate.generate_pulse(batch_context)
-                actions = strategy_net(batch_context, pulse_norm)
-                loss_batch, _, info = surrogate.predict_injury_and_loss(batch_context, actions, pulse_norm)
+                loss_batch, info = _evaluate_strategy_batch(strategy_net, surrogate, batch_context)
                 total_loss += float(loss_batch.sum().item())
                 total_risk += float(info["loss_risk"].sum().item())
                 total_constraint += float(info["loss_constraint"].sum().item())
@@ -225,15 +322,10 @@ def main():
         for iter_idx in tqdm(range(train_cfg["max_iterations"]), desc="Training StrategyNet"):
             optimizer.zero_grad()
             context_params = next(train_generator)
-            with torch.no_grad():
-                pulse_norm = surrogate.generate_pulse(context_params)
-            actions = strategy_net(context_params, pulse_norm)
-            total_loss, _, info = surrogate.predict_injury_and_loss(context_params, actions, pulse_norm)
+            total_loss, info = _evaluate_strategy_batch(strategy_net, surrogate, context_params)
             loss_mean = total_loss.mean()
             if torch.isnan(loss_mean) or torch.isinf(loss_mean):
-                logger.warning(f"iter={iter_idx}: loss 出现 NaN/Inf，跳过本次更新")
-                optimizer.zero_grad(set_to_none=True)
-                continue
+                raise RuntimeError(f"iter={iter_idx + 1}: loss 出现 NaN/Inf，请检查当前配置、数据流或代理模型输出")
 
             loss_mean.backward()
             torch.nn.utils.clip_grad_norm_(strategy_net.parameters(), max_norm=grad_clip)
@@ -312,52 +404,30 @@ def main():
 
         with open(run_dir / "training_summary.yaml", "w", encoding="utf-8") as file:
             yaml.safe_dump(
-                {
-                    "max_iterations": train_cfg["max_iterations"],
-                    "val_interval": val_interval,
-                    "val_batch_size": val_batch_size,
-                    "ema": {
-                        "enabled": ema_enabled,
-                        "alpha": ema_alpha,
-                        "warmup_iters": ema_warmup_iters,
-                        "tensorboard": tensorboard_enabled,
-                    },
-                    "distribution_penalty": {
-                        "enabled": bool(surrogate.distribution_penalty.enabled),
-                        "method": surrogate.distribution_penalty.method,
-                        "feature_space": surrogate.distribution_penalty.feature_space,
-                        "weight": surrogate.weight_distribution,
-                        "k": surrogate.distribution_penalty.k,
-                        "eps": surrogate.distribution_penalty.eps,
-                        "clip_max": surrogate.distribution_penalty.clip_max,
-                        "normalize_by_train_stats": surrogate.distribution_penalty.normalize_by_train_stats,
-                    },
-                    "parameter_roles": {
-                        "context": param_manager.get_context_names(),
-                        "trainable_control": [param["name"] for param in param_manager.control_trainable_params],
-                        "fixed_control": [param["name"] for param in param_manager.control_fixed_params],
-                    },
-                    "external_artifacts": {
-                        "normalization_config": run_norm_snapshot_path.name,
-                        "pulse_checkpoint": config.get("surrogate", {}).get("pulse_checkpoint"),
-                        "injury_checkpoint": config.get("surrogate", {}).get("checkpoint_rel_path"),
-                    },
-                    "train_best": {
-                        "iter": train_best_iter,
-                        "loss": None if train_best_iter < 0 else float(train_best_loss),
-                        "metric": train_metric_name,
-                        "ckpt": train_best_path.name,
-                    },
-                    "val_best": {
-                        "iter": val_best_iter,
-                        "loss": None if val_best_iter < 0 else float(val_best_loss),
-                        "ckpt": val_best_path.name,
-                    },
-                    "final_model": {
-                        "iter": train_cfg["max_iterations"],
-                        "ckpt": final_path.name,
-                    },
-                },
+                _build_training_summary(
+                    train_cfg=train_cfg,
+                    val_interval=val_interval,
+                    val_batch_size=val_batch_size,
+                    ema_enabled=ema_enabled,
+                    ema_alpha=ema_alpha,
+                    ema_warmup_iters=ema_warmup_iters,
+                    tensorboard_enabled=tensorboard_enabled,
+                    surrogate=surrogate,
+                    param_manager=param_manager,
+                    train_sampler=train_sampler,
+                    val_sampler=val_sampler,
+                    dist_ref_sample_count=dist_ref_sample_count,
+                    run_norm_snapshot_path=run_norm_snapshot_path,
+                    config=config,
+                    train_best_iter=train_best_iter,
+                    train_best_loss=train_best_loss,
+                    train_metric_name=train_metric_name,
+                    train_best_path=train_best_path,
+                    val_best_iter=val_best_iter,
+                    val_best_loss=val_best_loss,
+                    val_best_path=val_best_path,
+                    final_path=final_path,
+                ),
                 file,
                 allow_unicode=True,
                 sort_keys=False,

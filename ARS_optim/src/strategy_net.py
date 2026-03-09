@@ -8,6 +8,30 @@ from ARS_optim.src.param_manager import ParamManager
 from common.data_utils.processor import UnifiedDataProcessor
 
 
+def build_strategy_net_from_config(
+    param_manager: ParamManager,
+    constraint_engine: ConstraintEngine,
+    data_processor: UnifiedDataProcessor,
+    config: dict,
+) -> "StrategyNet":
+    """根据配置构造策略网络。
+
+    训练与评估必须读取同一份策略网络超参数，否则同名权重可能在两端对应到不同结构。
+    这里保留一个很薄的构造函数，只负责把 config 中的结构参数解包出来，避免入口脚本各自重复拼装。
+    """
+    strat_cfg = config.get("strategy_net", {})
+    return StrategyNet(
+        param_manager=param_manager,
+        constraint_engine=constraint_engine,
+        data_processor=data_processor,
+        hidden_dims=strat_cfg.get("hidden_dims", [128, 256, 128]),
+        activation=strat_cfg.get("activation", "LeakyReLU"),
+        dropout=float(strat_cfg.get("dropout", 0.1)),
+        pulse_channels=int(strat_cfg.get("pulse_channels", 2)),
+        pulse_embed_dim=int(strat_cfg.get("pulse_embed_dim", 32)),
+    )
+
+
 class StrategyNet(nn.Module):
     """策略网络：context + pulse -> trainable controls。"""
 
@@ -29,6 +53,7 @@ class StrategyNet(nn.Module):
         self.context_dim = self.param_manager.get_context_dim()
         self.output_dim = self.param_manager.get_trainable_dim()
         self.context_names = self.param_manager.get_context_names()
+        self.trainable_params = self.param_manager.get_trainable_params()
         self.pulse_embed_dim = int(pulse_embed_dim)
 
         if hidden_dims is None:
@@ -66,7 +91,7 @@ class StrategyNet(nn.Module):
         min_bounds, max_bounds = self.param_manager.get_trainable_bounds()
         self.register_buffer("min_bounds", min_bounds)
         self.register_buffer("max_bounds", max_bounds)
-        defaults = [param["default"] for param in self.param_manager.control_trainable_params]
+        defaults = self.param_manager.get_default_values(self.trainable_params)
         self.register_buffer("default_actions", torch.tensor(defaults, dtype=torch.float32))
         self._initialize_weights()
 
@@ -92,13 +117,24 @@ class StrategyNet(nn.Module):
     def _normalize_context(self, context_features: torch.Tensor) -> torch.Tensor:
         return self.data_processor.process_by_name(context_features, self.context_names, inverse=False)
 
+    def _decode_actions_from_logits(self, raw_output: torch.Tensor, context_features: torch.Tensor) -> torch.Tensor:
+        """将网络输出的无界 logits 还原为物理参数，并做连续可微投影。
+
+        这里把“网络回归”和“动作约束”拆成两个连续步骤：
+        1. 先用 sigmoid 和边界盒把输出限制在 trainable 参数的基础物理范围内；
+        2. 再调用约束引擎处理 AFT/BTF、LLATTF/BTF、LL1/LL2 这类连续耦合关系。
+
+        这样做的目的不是增加层次，而是避免让网络直接学习一整套硬规则；
+        策略网络只负责学习从状态到动作的映射，参数合法化仍然由统一的约束层定义。
+        """
+        norm_actions = torch.sigmoid(raw_output)
+        span = torch.where(self.max_bounds > self.min_bounds, self.max_bounds - self.min_bounds, torch.ones_like(self.max_bounds))
+        actions = norm_actions * span.unsqueeze(0) + self.min_bounds.unsqueeze(0)
+        return self.constraint_engine.project_forward(actions, context_features)
+
     def forward(self, context_features: torch.Tensor, pulse_features: torch.Tensor) -> torch.Tensor:
         pulse_embed = self.pulse_encoder(pulse_features)
         context_norm = self._normalize_context(context_features)
         combined = torch.cat([context_norm, pulse_embed], dim=1)
         raw_output = self.mlp(combined)
-        # 先用 sigmoid 把网络输出压到 [0, 1]，再线性映射回物理参数边界盒。最后再通过约束引擎修正 AFT/BTF、LL1/LL2、LLATTF 等耦合关系，避免网络直接回归物理量时频繁输出越界或违反硬约束的解。
-        norm_actions = torch.sigmoid(raw_output)
-        span = torch.where(self.max_bounds > self.min_bounds, self.max_bounds - self.min_bounds, torch.ones_like(self.max_bounds))
-        actions = norm_actions * span.unsqueeze(0) + self.min_bounds.unsqueeze(0)
-        return self.constraint_engine.project_forward(actions, context_features)
+        return self._decode_actions_from_logits(raw_output, context_features)

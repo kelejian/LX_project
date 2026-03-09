@@ -56,7 +56,13 @@ def load_surrogate_models(config: dict, device: torch.device) -> Tuple[HybridPul
 
 
 class SurrogateAdapter(nn.Module):
-    """封装波形预测、损伤预测与寻优目标计算。"""
+    """封装波形生成、损伤预测与优化目标计算。
+
+    这里的职责边界是：
+    - 负责把 context/control 组织成代理模型真正需要的输入；
+    - 负责计算逐样本损伤风险和优化目标；
+    - 不负责动作合法化。动作是否合法由 ConstraintEngine 或 LocalRefiner 决定。
+    """
 
     def __init__(
         self,
@@ -95,6 +101,7 @@ class SurrogateAdapter(nn.Module):
         # impact 参数在完整 FEATURE_ORDER 中的索引固定不变，初始化时缓存可避免高频推理阶段重复查找。
         self._impact_names = ["impact_velocity", "impact_angle", "overlap"]
         self._impact_indices = [FEATURE_ORDER.index(name) for name in self._impact_names]
+        self._ot_index = self.param_manager.get_param("OT")["index"]
 
     def fit_distribution_reference(self, reference_features: torch.Tensor) -> None:
         if self.distribution_penalty.enabled:
@@ -118,13 +125,15 @@ class SurrogateAdapter(nn.Module):
         hic15 = predictions_phys[:, 0]
         dmax = predictions_phys[:, 1]
         nij = predictions_phys[:, 2]
-        ot_tensor = combined_phys[:, self.param_manager.params_by_name["OT"]["index"]]
+        ot_tensor = combined_phys[:, self._ot_index]
 
         p_head = torch.clamp(injury_risk.Injury_prob_cal_head(hic15), 1e-6, 1.0 - 1e-6)
         p_chest = torch.clamp(injury_risk.Injury_prob_cal_chest(dmax, OT=ot_tensor), 1e-6, 1.0 - 1e-6)
         p_neck = torch.clamp(injury_risk.Injury_prob_cal_neck(nij), 1e-6, 1.0 - 1e-6)
 
-        # 这里对应 ARS.md 步骤三中的联合损伤风险项。训练时允许对头/胸/颈三部分别加权，以便在不改变整体乘法结构的前提下调节不同部位在优化目标中的相对重要性。
+        # 这里对应 ARS.md 步骤三中的联合损伤风险项。
+        # 头/胸/颈仍保持乘法结构，只允许通过指数权重调节三部分的相对重要性，
+        # 这样不会把“联合风险”改写成另一套完全不同的目标函数。
         loss_risk = 1.0 - (
             torch.pow(1.0 - p_head, self.w_head)
             * torch.pow(1.0 - p_chest, self.w_chest)
@@ -150,21 +159,39 @@ class SurrogateAdapter(nn.Module):
         }
         return total_loss, predictions_phys, info
 
+    def evaluate_actions(
+        self,
+        context_params: torch.Tensor,
+        control_trainable: torch.Tensor,
+        pulse_norm: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict, torch.Tensor]:
+        """统一的动作评估入口。
+
+        若调用方未预先提供 pulse，这里会基于 context 生成同一份归一化波形；
+        然后只做代理评估本身，返回损伤预测、逐样本 loss 和风险拆解。
+
+        该接口不修复动作，目的是避免把“代理评估”和“动作合法化”写在同一处，
+        让调用方难以判断当前拿到的是原始动作还是修复后的动作。
+        """
+        if pulse_norm is None:
+            pulse_norm = self.generate_pulse(context_params)
+        loss_batch, predictions, info = self.predict_injury_and_loss(context_params, control_trainable, pulse_norm)
+        return loss_batch, predictions, info, pulse_norm
+
     def generate_pulse(self, context_params: torch.Tensor) -> torch.Tensor:
-        # context_params 只包含 context 子集，列顺序并不等于 FEATURE_ORDER。先补全到完整特征向量，再按完整索引抽取 impact 参数，才能保证送入 PulsePredict 的速度/角度/重叠率与全项目统一数据接口严格对齐。
+        # context_params 只包含 context 子集，列顺序并不等于 FEATURE_ORDER。
+        # 这里先补全为完整特征向量，再按 FEATURE_ORDER 中的固定索引抽取 impact 参数，
+        # 目的是确保送入 PulsePredict 的速度/角度/重叠率与全项目统一特征接口保持一致。
         full = self.constraint_engine.compose_full_features(context_params=context_params)
         impact_phys = full[:, self._impact_indices]
         impact_norm = self.data_processor.process_by_name(impact_phys, self._impact_names, inverse=False)
         pulse_output_raw = self.pulse_model(impact_norm)
-        if hasattr(self.pulse_model, "get_metrics_output"):
-            waveform_norm = self.pulse_model.get_metrics_output(pulse_output_raw)
-        else:
-            waveform_norm = pulse_output_raw[-1][0] if isinstance(pulse_output_raw, (list, tuple)) else pulse_output_raw
+        waveform_norm = self.pulse_model.get_metrics_output(pulse_output_raw)
         pulse_xy = waveform_norm[:, 0:2, :]
         if pulse_xy.dim() != 3 or pulse_xy.size(1) != 2 or pulse_xy.size(2) != WAVEFORM_LENGTH:
             raise ValueError(f"generate_pulse 输出形状异常: {tuple(pulse_xy.shape)}")
         return pulse_xy
 
     def forward(self, context_params: torch.Tensor, control_trainable: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
-        pulse_norm = self.generate_pulse(context_params)
-        return self.predict_injury_and_loss(context_params, control_trainable, pulse_norm)
+        loss_batch, predictions, info, _ = self.evaluate_actions(context_params, control_trainable)
+        return loss_batch, predictions, info

@@ -45,7 +45,7 @@ strategy_net:
     ema:
       enabled: true          # 是否启用 EMA 作为 train_best 的判据
       alpha: 0.98            # EMA 平滑系数，越大越平滑
-      warmup_iters: 100      # EMA 选优预热步数，预热前不更新 train_best
+      warmup_iters: 500     # EMA 选优预热步数，预热前不更新 train_best
       log_to_tensorboard: true
 
 # ===========================
@@ -53,7 +53,7 @@ strategy_net:
 # ===========================
 optimization:
   # 是否直推
-  direct_inference: True # True: 生成策略直推阶段 Opt1；False: 不生成 Opt1，局部精调直接从 default/baseline 初值开始
+  direct_inference: false # 当前默认关闭；仅在显式提供且确认兼容的策略权重后再开启 Opt1
   # 直推后的精调迭代参数
   refine_steps: 50         # 局部精调迭代次数 k。若为 0，则不生成 Opt2；若大于 0，则输出局部精调后的 Opt2
   lr: 0.05                 # 局部精调阶段在物理参数空间中的 Adam 步长
@@ -82,5 +82,4 @@ optimization:
 # ===========================
 evaluation:
   eval_batch_size: 512   # 评估时分批推理的批大小，用于降低显存峰值
-  default_strategy_ckpt: null  # 可选：默认策略权重路径（绝对路径或相对 ARS_optim 目录）
-  strict_default_ckpt: false  # true 时找不到策略权重就报错；false 时降级为不生成 Opt1，仅保留 Base 和可能存在的 Opt2
+  strategy_checkpoint: null  # 可选：仅在需要策略直推时显式指定兼容当前参数空间的权重

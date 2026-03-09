@@ -30,6 +30,7 @@ class ParamManager:
         self.all_params = self._parse_parameters(config.get("parameters", []))
 
         self.state_params = [param for param in self.all_params if param["role"] == "state"]
+        self.control_params = [param for param in self.all_params if param["role"] == "control"]
         self.control_trainable_params = [
             param for param in self.all_params if param["role"] == "control" and bool(param.get("trainable", False))
         ]
@@ -59,6 +60,12 @@ class ParamManager:
                 raise ValueError(f"参数 {param.get('name')} 缺少 default")
             if param.get("type") == "continuous" and ("min" not in param or "max" not in param):
                 raise ValueError(f"连续参数 {param.get('name')} 缺少 min/max")
+            if param.get("type") == "discrete":
+                values = param.get("values")
+                if not isinstance(values, list) or not values:
+                    raise ValueError(f"离散参数 {param.get('name')} 缺少非空 values 列表")
+                if param["default"] not in values:
+                    raise ValueError(f"离散参数 {param.get('name')} 的 default={param['default']} 不在 values={values} 中")
         return params
 
     def _validate_feature_order(self) -> None:
@@ -113,6 +120,36 @@ class ParamManager:
     def get_total_feature_dim(self) -> int:
         return len(self.all_params)
 
+    def get_all_params(self) -> List[dict]:
+        return list(self.all_params)
+
+    def get_all_names(self) -> List[str]:
+        return [param["name"] for param in self.all_params]
+
+    def get_all_indices(self) -> List[int]:
+        return [param["index"] for param in self.all_params]
+
+    def get_param(self, name: str) -> dict:
+        if name not in self.params_by_name:
+            raise KeyError(f"未知参数: {name}")
+        return self.params_by_name[name]
+
+    def get_control_params(self) -> List[dict]:
+        return list(self.control_params)
+
+    def get_control_names(self) -> List[str]:
+        return [param["name"] for param in self.control_params]
+
+    def get_control_indices(self) -> List[int]:
+        return [param["index"] for param in self.control_params]
+
+    def get_discrete_index_value_map(self) -> dict[int, List[float]]:
+        return {
+            param["index"]: [float(value) for value in param["values"]]
+            for param in self.all_params
+            if param.get("type") == "discrete"
+        }
+
     def get_context_params(self) -> List[dict]:
         params = self.state_params + self.control_fixed_params
         return sorted(params, key=lambda item: item["index"])
@@ -129,11 +166,32 @@ class ParamManager:
     def get_trainable_dim(self) -> int:
         return len(self.control_trainable_params)
 
+    def get_trainable_params(self) -> List[dict]:
+        return list(self.control_trainable_params)
+
+    def get_trainable_names(self) -> List[str]:
+        return [param["name"] for param in self.control_trainable_params]
+
     def get_control_trainable_indices(self) -> List[int]:
         return [param["index"] for param in self.control_trainable_params]
 
+    def get_fixed_control_params(self) -> List[dict]:
+        return list(self.control_fixed_params)
+
+    def get_fixed_control_names(self) -> List[str]:
+        return [param["name"] for param in self.control_fixed_params]
+
+    def get_fixed_control_indices(self) -> List[int]:
+        return [param["index"] for param in self.control_fixed_params]
+
     def get_sampling_rules(self) -> dict:
         return self.sampling_rules
+
+    def get_default_value(self, name: str) -> float:
+        return float(self.get_param(name)["default"])
+
+    def get_default_values(self, params: List[dict]) -> List[float]:
+        return [float(param["default"]) for param in params]
 
     def get_trainable_bounds(self, device: torch.device = torch.device("cpu")) -> Tuple[torch.Tensor, torch.Tensor]:
         mins = [float(param["min"]) for param in self.control_trainable_params]
@@ -142,6 +200,10 @@ class ParamManager:
             torch.tensor(mins, dtype=torch.float32, device=device),
             torch.tensor(maxs, dtype=torch.float32, device=device),
         )
+
+    def get_trainable_defaults_tensor(self, device: torch.device = torch.device("cpu")) -> torch.Tensor:
+        defaults = self.get_default_values(self.control_trainable_params)
+        return torch.tensor(defaults, dtype=torch.float32, device=device)
 
     def get_default_feature_vector(self, device: torch.device = torch.device("cpu")) -> torch.Tensor:
         defaults = [float(param["default"]) for param in self.all_params]

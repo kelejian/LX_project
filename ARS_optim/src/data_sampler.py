@@ -14,7 +14,7 @@ from ARS_optim.src.param_manager import ParamManager
 class StateDataSampler:
     """从 InjuryPredict 训练经验池中按行采样上下文数据。
 
-    训练期只做两件事：
+    训练期只保留两项职责：
     1. 从经验池复刻边际分布；
     2. 在连续 context 上加轻微扰动，再统一交给约束引擎收敛回可行域。
     """
@@ -48,14 +48,16 @@ class StateDataSampler:
 
         pool_path = Path(pool_npz_path) if pool_npz_path else (RAW_DATA_DIR / "raw_data_packed.npz")
         split_path = Path(split_indices_path) if split_indices_path else (SPLIT_INDICES_DIR / "injury_train_indices.npy")
+        if not split_path.exists():
+            raise FileNotFoundError(f"经验池切分索引不存在: {split_path}")
+        self.pool_path = pool_path
+        self.split_path = split_path
+        self.using_split_indices = True
 
         full_features = self._load_feature_matrix_from_pool(pool_path)
-        if split_path.exists():
-            split_indices = np.load(split_path)
-            full_features = full_features[split_indices]
-            self.logger.info(f"经验池使用切分索引: {split_path}，样本数={full_features.shape[0]}")
-        else:
-            self.logger.warning(f"未找到切分索引: {split_path}，将使用全量经验池")
+        split_indices = np.load(split_path)
+        full_features = full_features[split_indices]
+        self.logger.info(f"经验池使用切分索引: {split_path}，样本数={full_features.shape[0]}")
         if full_features.shape[0] == 0:
             raise ValueError("经验池为空，无法构建数据流")
 
@@ -117,6 +119,28 @@ class StateDataSampler:
 
     def get_dataset_tensor(self) -> torch.Tensor:
         return self.pool_context
+
+    def get_dataset_size(self) -> int:
+        return int(self.pool_size)
+
+    def get_source_info(self) -> dict:
+        """返回当前采样器的数据流元信息。
+
+        训练虽然按无限流取样，但数据来源并不是开放集合，而是固定的 injury 经验池切片。
+        这里显式记录经验池路径、切分索引和扰动配置，便于训练摘要准确复现本次数据流语义。
+        """
+        return {
+            "pool_npz_path": str(self.pool_path.resolve()),
+            "split_indices_path": str(self.split_path.resolve()) if self.using_split_indices else None,
+            "using_split_indices": bool(self.using_split_indices),
+            "dataset_size": int(self.pool_size),
+            "batch_size": int(self.batch_size),
+            "jitter_ratio": float(self.jitter_ratio),
+            "jitter_prob": float(self.jitter_prob),
+            "continuous_context_names": [
+                self.context_params[idx]["name"] for idx in self.context_cont_local_indices
+            ],
+        }
 
     def get_distribution_reference(self, max_samples: int = 0, shuffle: bool = False, feature_space: str = "context", trainable_indices: Optional[list] = None) -> torch.Tensor:
         if feature_space == "context":

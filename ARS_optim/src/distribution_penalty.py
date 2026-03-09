@@ -1,4 +1,3 @@
-import logging
 from typing import Optional
 
 import torch
@@ -7,14 +6,14 @@ import torch
 class DistributionPenalty:
     """训练分布偏离惩罚。
 
-    这里保持简单：
-    - `fit` 只缓存参考分布统计；
-    - `compute` 返回逐样本惩罚；
-    - 不把它扩展成独立训练器或复杂特征工程模块。
+    该类只做两件事：
+    - `fit` 根据训练参考样本缓存统计量；
+    - `compute` 对当前 batch 返回逐样本惩罚。
+
+    它不负责采样、也不负责动作修复，只负责度量“当前样本离训练分布有多远”。
     """
 
     def __init__(self, config: dict):
-        self.logger = logging.getLogger(self.__class__.__name__)
         dist_cfg = config.get("optimization", {}).get("distribution_penalty", {})
 
         self.enabled = bool(dist_cfg.get("enabled", False))
@@ -93,8 +92,7 @@ class DistributionPenalty:
         if not self.enabled:
             return torch.zeros(context_params.shape[0], device=context_params.device, dtype=torch.float32)
         if not self.is_ready:
-            self.logger.warning("分布惩罚已启用但尚未拟合参考分布，本批次返回 0")
-            return torch.zeros(context_params.shape[0], device=context_params.device, dtype=torch.float32)
+            raise RuntimeError("分布惩罚已启用，但尚未先调用 fit(reference_features)")
 
         if self.feature_space == "context_control":
             if control_trainable is None:

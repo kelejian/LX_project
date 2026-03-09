@@ -3,7 +3,7 @@ from .data_sampler import StateDataSampler
 from .distribution_penalty import DistributionPenalty
 from .optimizer import LocalRefiner
 from .param_manager import ParamManager
-from .strategy_net import StrategyNet
+from .strategy_net import StrategyNet, build_strategy_net_from_config
 from .surrogate import SurrogateAdapter, load_surrogate_models
 
 __all__ = [
@@ -13,6 +13,7 @@ __all__ = [
 	"ParamManager",
 	"StateDataSampler",
 	"StrategyNet",
+	"build_strategy_net_from_config",
 	"SurrogateAdapter",
 	"load_surrogate_models",
 ]

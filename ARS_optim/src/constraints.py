@@ -27,17 +27,22 @@ class ConstraintEngine:
         self.context_indices = param_manager.get_context_indices()
         self.trainable_indices = param_manager.get_control_trainable_indices()
         context_params = param_manager.get_context_params()
-        self.trainable_names = {param["name"]: idx for idx, param in enumerate(param_manager.control_trainable_params)}
+        trainable_params = param_manager.get_trainable_params()
+        self.trainable_names = {param["name"]: idx for idx, param in enumerate(trainable_params)}
         self.context_names = {param["name"]: idx for idx, param in enumerate(context_params)}
-        self.fixed_defaults = {param["name"]: float(param["default"]) for param in param_manager.control_fixed_params}
 
-        self.name_to_index = {param["name"]: param["index"] for param in param_manager.all_params}
+        all_params = param_manager.get_all_params()
+        self.name_to_index = {param["name"]: param["index"] for param in all_params}
         self.continuous_indices = [
-            param["index"] for param in param_manager.all_params if param.get("type") == "continuous"
+            param["index"] for param in all_params if param.get("type") == "continuous"
         ]
+        self.discrete_values = {
+            idx: torch.tensor(values, dtype=torch.float32)
+            for idx, values in param_manager.get_discrete_index_value_map().items()
+        }
         self.continuous_bounds = {
             param["index"]: (float(param["min"]), float(param["max"]))
-            for param in param_manager.all_params
+            for param in all_params
             if param.get("type") == "continuous"
         }
 
@@ -81,6 +86,37 @@ class ConstraintEngine:
             if arr.size == 0:
                 continue
             self.ra_cache[(side, ot)] = torch.tensor(arr, dtype=torch.float32)
+
+    @staticmethod
+    def _project_points_to_polygon_boundary(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
+        """将多边形外部点投影到最近的边界点上。
+
+        这里使用边段投影而不是“最近顶点吸附”，原因是座椅可行域本质上是二维连续区域。
+        若只吸附到顶点，很多明明应该落到边上的样本会被额外推向角点，既偏离 step0 的几何语义，
+        也会在人为制造局部聚集。边界投影仍然足够简单，不会引入额外的复杂依赖。
+        """
+        edge_start = polygon
+        edge_end = np.roll(polygon, shift=-1, axis=0)
+        projected = np.empty_like(points, dtype=np.float32)
+
+        for point_idx, point in enumerate(points):
+            best_point = None
+            best_dist_sq = None
+            for start, end in zip(edge_start, edge_end):
+                segment = end - start
+                denom = float(np.dot(segment, segment))
+                if denom <= 1e-12:
+                    candidate = start
+                else:
+                    t = float(np.dot(point - start, segment) / denom)
+                    t = min(1.0, max(0.0, t))
+                    candidate = start + t * segment
+                dist_sq = float(np.sum((point - candidate) ** 2))
+                if best_dist_sq is None or dist_sq < best_dist_sq:
+                    best_dist_sq = dist_sq
+                    best_point = candidate
+            projected[point_idx] = best_point.astype(np.float32)
+        return projected
 
     def _ensure_2d(self, tensor: torch.Tensor, dim: int, name: str) -> torch.Tensor:
         if tensor.ndim != 2 or tensor.shape[1] != dim:
@@ -130,8 +166,6 @@ class ConstraintEngine:
             return cols[self.trainable_names[name]]
         if name in self.context_names:
             return context_params[:, self.context_names[name]]
-        if name in self.fixed_defaults:
-            return torch.full((context_params.shape[0],), self.fixed_defaults[name], device=device, dtype=torch.float32)
         raise KeyError(f"未知参数: {name}")
 
     def project_forward(self, actions: torch.Tensor, context_params: torch.Tensor) -> torch.Tensor:
@@ -145,25 +179,16 @@ class ConstraintEngine:
         btf = self._get_param_col("BTF", cols, context_params, device)
         if "AFT" in self.trainable_names:
             cols[self.trainable_names["AFT"]] = torch.min(aft, btf + self.aft_btf_delta_max - self.epsilon)
-        aft = self._get_param_col("AFT", cols, context_params, device)
-        if "BTF" in self.trainable_names:
-            cols[self.trainable_names["BTF"]] = torch.max(btf, aft - self.aft_btf_delta_max + self.epsilon)
 
         llattf = self._get_param_col("LLATTF", cols, context_params, device)
         btf = self._get_param_col("BTF", cols, context_params, device)
         if "LLATTF" in self.trainable_names:
             cols[self.trainable_names["LLATTF"]] = torch.max(llattf, btf + self.llattf_btf_delta_min)
-        llattf = self._get_param_col("LLATTF", cols, context_params, device)
-        if "BTF" in self.trainable_names:
-            cols[self.trainable_names["BTF"]] = torch.min(btf, llattf - self.llattf_btf_delta_min)
 
         ll1 = self._get_param_col("LL1", cols, context_params, device)
         ll2 = self._get_param_col("LL2", cols, context_params, device)
         if "LL2" in self.trainable_names:
             cols[self.trainable_names["LL2"]] = torch.min(ll2, ll1 + self.ll2_ll1_delta_max)
-        ll2 = self._get_param_col("LL2", cols, context_params, device)
-        if "LL1" in self.trainable_names:
-            cols[self.trainable_names["LL1"]] = torch.max(ll1, ll2 - self.ll2_ll1_delta_max)
 
         if self.seat_cache and "is_driver_side" in self.context_names and "OT" in self.context_names:
             has_trainable_sp = "SP" in self.trainable_names
@@ -209,7 +234,7 @@ class ConstraintEngine:
         side = torch.round(context_params[:, self.context_names["is_driver_side"]]).to(torch.int64)
         ot = torch.round(context_params[:, self.context_names["OT"]]).to(torch.int64)
 
-        if self.ra_cache and {"RA"} & (set(self.trainable_names) | set(self.context_names) | set(self.fixed_defaults)):
+        if self.ra_cache and ("RA" in self.trainable_names or "RA" in self.context_names):
             ra = self._get_param_col("RA", cols, context_params, device)
             ra_penalty = torch.zeros_like(penalty)
             for (rule_side, rule_ot), allowed_cpu in self.ra_cache.items():
@@ -221,8 +246,8 @@ class ConstraintEngine:
                 ra_penalty[mask] = (ra_values.unsqueeze(1) - allowed.unsqueeze(0)).abs().min(dim=1).values
             penalty += ra_penalty
 
-        has_sp = "SP" in self.trainable_names or "SP" in self.context_names or "SP" in self.fixed_defaults
-        has_sh = "SH" in self.trainable_names or "SH" in self.context_names or "SH" in self.fixed_defaults
+        has_sp = "SP" in self.trainable_names or "SP" in self.context_names
+        has_sh = "SH" in self.trainable_names or "SH" in self.context_names
         if has_sp and has_sh and self.seat_cache:
             sp = self._get_param_col("SP", cols, context_params, device)
             sh = self._get_param_col("SH", cols, context_params, device)
@@ -244,10 +269,11 @@ class ConstraintEngine:
         return penalty
 
     def _clamp_discrete(self, x: torch.Tensor) -> None:
-        side_idx = self.name_to_index.get("is_driver_side")
-        ot_idx = self.name_to_index.get("OT")
-        x[:, side_idx] = torch.clamp(torch.round(x[:, side_idx]), 0, 1)
-        x[:, ot_idx] = torch.clamp(torch.round(x[:, ot_idx]), 1, 3)
+        for idx, allowed_cpu in self.discrete_values.items():
+            allowed = allowed_cpu.to(device=x.device)
+            values = x[:, idx]
+            nearest = (values.unsqueeze(1) - allowed.unsqueeze(0)).abs().argmin(dim=1)
+            x[:, idx] = allowed[nearest]
 
     def _clamp_continuous_bounds(self, x: torch.Tensor) -> None:
         for idx in self.continuous_indices:
@@ -389,14 +415,11 @@ class ConstraintEngine:
             inside = path.contains_points(points, radius=1e-9)
             outside_local = np.where(~inside)[0]
             if outside_local.size > 0:
-                vertices = torch.tensor(polygon, dtype=torch.float32, device=x.device)
+                snapped = self._project_points_to_polygon_boundary(points[outside_local], polygon)
+                snapped_tensor = torch.tensor(snapped, dtype=torch.float32, device=x.device)
                 outside_indices = torch.tensor(outside_local, dtype=torch.long, device=x.device)
-                outside_points = torch.stack([sp[outside_indices], sh[outside_indices]], dim=1)
-                distances = torch.cdist(outside_points.unsqueeze(0), vertices.unsqueeze(0)).squeeze(0)
-                nearest = distances.argmin(dim=1)
-                snapped = vertices[nearest]
-                sp[outside_indices] = snapped[:, 0]
-                sh[outside_indices] = snapped[:, 1]
+                sp[outside_indices] = snapped_tensor[:, 0]
+                sh[outside_indices] = snapped_tensor[:, 1]
 
             x[indices, sp_idx] = sp
             x[indices, sh_idx] = sh
