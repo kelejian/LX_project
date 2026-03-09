@@ -73,12 +73,14 @@ def _resolve_strategy_ckpt(args, base_dir: Path, config: Dict) -> Optional[Path]
 def _copy_config_snapshots(cfg_path: Path, param_space_path: Path, output_dir: Path) -> Dict[str, str]:
     cfg_snapshot = output_dir / "config_used.yaml"
     param_snapshot = output_dir / "param_space.yaml"
+    norm_snapshot = output_dir / "normalization_config.json"
     shutil.copy2(str(cfg_path), str(cfg_snapshot))
     shutil.copy2(str(param_space_path), str(param_snapshot))
+    shutil.copy2(str(NORMALIZATION_CONFIG_PATH), str(norm_snapshot))
     return {
         "config_used": str(cfg_snapshot),
         "param_space_used": str(param_snapshot),
-        "normalization_config": str(NORMALIZATION_CONFIG_PATH),
+        "normalization_config": str(norm_snapshot),
     }
 
 
@@ -89,6 +91,11 @@ def _write_yaml(path: Path, content: Dict) -> None:
 
 def _compute_joint_risk(prob_head: np.ndarray, prob_chest: np.ndarray, prob_neck: np.ndarray) -> np.ndarray:
     return 1.0 - (1.0 - prob_head) * (1.0 - prob_chest) * (1.0 - prob_neck)
+
+
+def _safe_nanmean(series: pd.Series) -> float:
+    values = np.asarray(series, dtype=np.float32)
+    return float(np.nan) if np.isnan(values).all() else float(np.nanmean(values))
 
 
 def _build_param_dataframe(df_input: pd.DataFrame, params: List[dict], logger, missing_message: str) -> tuple[pd.DataFrame, List[str]]:
@@ -106,9 +113,9 @@ def _build_param_dataframe(df_input: pd.DataFrame, params: List[dict], logger, m
     return output_df, missing
 
 
-def _fit_distribution_reference_if_needed(surrogate: SurrogateAdapter, sampler: StateDataSampler, param_manager: ParamManager, config: dict, logger) -> None:
+def _fit_distribution_reference_if_needed(surrogate: SurrogateAdapter, sampler: StateDataSampler, param_manager: ParamManager, config: dict, logger) -> Optional[str]:
     if not surrogate.distribution_penalty.enabled:
-        return
+        return None
     try:
         max_ref_samples = int(config.get("optimization", {}).get("distribution_penalty", {}).get("max_ref_samples", 0))
         reference = sampler.get_distribution_reference(
@@ -118,9 +125,11 @@ def _fit_distribution_reference_if_needed(surrogate: SurrogateAdapter, sampler: 
             trainable_indices=param_manager.get_control_trainable_indices(),
         )
         surrogate.fit_distribution_reference(reference)
+        return None
     except Exception as exc:
         logger.warning(f"评估阶段拟合分布参考失败，将关闭分布惩罚: {exc}")
         surrogate.distribution_penalty.enabled = False
+        return str(exc)
 
 
 def _compute_predictions_batch(
@@ -128,7 +137,6 @@ def _compute_predictions_batch(
     baseline_trainable: torch.Tensor,
     surrogate: SurrogateAdapter,
     optimizer: LocalRefiner,
-    constraint_engine: ConstraintEngine,
     eval_batch_size: int,
 ) -> Dict[str, object]:
     sample_count = context_tensor.shape[0]
@@ -140,7 +148,7 @@ def _compute_predictions_batch(
             "loss": [],
             "info": {name: [] for name in ["p_head", "p_chest", "p_neck", "joint_risk"]},
         }
-        for key in ["Base", "Init", "Opt"]
+        for key in ["Base", "Opt1", "Opt2"]
     }
     total_time_cost = 0.0
     trajectory_all: List[float] = []
@@ -162,30 +170,26 @@ def _compute_predictions_batch(
         for key in stage_parts["Base"]["info"]:
             stage_parts["Base"]["info"][key].append(base_info[key].detach())
 
-        opt_actions, opt_preds, opt_info = optimizer.optimize(context_batch, pulse_norm=pulse_batch)
-        _, opt_actions = constraint_engine.sanitize_context_and_trainable(context_batch, opt_actions)
-        stage_parts["Opt"]["preds"].append(opt_preds.detach())
-        stage_parts["Opt"]["actions"].append(opt_actions.detach())
-        stage_parts["Opt"]["loss"].append(opt_info["final_loss_batch"].detach())
-        for key in stage_parts["Opt"]["info"]:
-            stage_parts["Opt"]["info"][key].append(opt_info[key].detach())
+        if optimizer.direct_inference or optimizer.refine_steps > 0:
+            opt_actions, opt_preds, opt_info = optimizer.optimize(context_batch, pulse_norm=pulse_batch)
+            direct_stage = opt_info.get("direct_stage", {})
+            if direct_stage.get("enabled") and direct_stage.get("actions") is not None:
+                stage_parts["Opt1"]["actions"].append(direct_stage["actions"].detach())
+                stage_parts["Opt1"]["preds"].append(direct_stage["preds"].detach())
+                stage_parts["Opt1"]["loss"].append(direct_stage["loss_batch"].detach())
+                direct_detail = direct_stage.get("detail", {})
+                for key in stage_parts["Opt1"]["info"]:
+                    stage_parts["Opt1"]["info"][key].append(direct_detail[key].detach())
 
-        init_data = opt_info.get("initial", {})
-        if init_data.get("actions") is not None:
-            init_actions = init_data["actions"].detach()
-            _, init_actions = constraint_engine.sanitize_context_and_trainable(context_batch, init_actions)
-            stage_parts["Init"]["actions"].append(init_actions)
-        if init_data.get("preds") is not None:
-            stage_parts["Init"]["preds"].append(init_data["preds"].detach())
-        if init_data.get("loss_batch") is not None:
-            stage_parts["Init"]["loss"].append(init_data["loss_batch"].detach())
-        init_detail = init_data.get("detail", {})
-        for key in stage_parts["Init"]["info"]:
-            if key in init_detail:
-                stage_parts["Init"]["info"][key].append(init_detail[key].detach())
+            if opt_info.get("refine_stage_enabled", False):
+                stage_parts["Opt2"]["preds"].append(opt_preds.detach())
+                stage_parts["Opt2"]["actions"].append(opt_actions.detach())
+                stage_parts["Opt2"]["loss"].append(opt_info["final_loss_batch"].detach())
+                for key in stage_parts["Opt2"]["info"]:
+                    stage_parts["Opt2"]["info"][key].append(opt_info[key].detach())
 
-        total_time_cost += float(opt_info.get("time_cost", 0.0))
-        trajectory_all.extend(opt_info.get("trajectory", []))
+            total_time_cost += float(opt_info.get("time_cost", 0.0))
+            trajectory_all.extend(opt_info.get("trajectory", []))
 
     output = {"total_time_cost": total_time_cost, "trajectory_all": trajectory_all}
     for prefix, content in stage_parts.items():
@@ -204,62 +208,78 @@ def _build_result_dataframe(
     stage_outputs: Dict[str, object],
     truth_arrays: Dict[str, np.ndarray],
     trainable_names: List[str],
-    fixed_names: List[str],
 ) -> tuple[pd.DataFrame, Dict[str, float]]:
-    frame_parts = [df_input.reset_index(drop=True), context_df.reset_index(drop=True)]
+    excluded_input_cols = set(FEATURE_ORDER) | {"y_HIC", "y_Dmax", "y_Nij", "ais_head", "ais_chest", "ais_neck"}
+    metadata_cols = [col for col in df_input.columns if col not in excluded_input_cols]
+    metadata_df = df_input[metadata_cols].reset_index(drop=True)
+    frame_parts = [metadata_df, context_df.reset_index(drop=True)]
 
     ot_array = context_df["OT"].to_numpy(dtype=np.float32)
-    fixed_array = context_df[fixed_names].to_numpy(dtype=np.float32) if fixed_names else None
 
-    for prefix in ["Base", "Init", "Opt"]:
+    for prefix in ["Base", "Opt1", "Opt2"]:
         stage = stage_outputs[prefix]
         preds = stage["preds"]
         actions = stage["actions"]
         loss = stage["loss"]
         info = stage["info"]
 
-        pred_array = np.full((len(df_input), 3), np.nan, dtype=np.float32) if preds is None else preds.detach().cpu().numpy()
+        if preds is None:
+            nan_array = np.full(len(df_input), np.nan, dtype=np.float32)
+            stage_data = {
+                f"{prefix}_HIC": nan_array.copy(),
+                f"{prefix}_Dmax": nan_array.copy(),
+                f"{prefix}_Nij": nan_array.copy(),
+                f"{prefix}_Loss": nan_array.copy(),
+                f"{prefix}_Phead": nan_array.copy(),
+                f"{prefix}_Pchest": nan_array.copy(),
+                f"{prefix}_Pneck": nan_array.copy(),
+                f"{prefix}_JointRisk": nan_array.copy(),
+                f"{prefix}_AIS_head": nan_array.copy(),
+                f"{prefix}_AIS_chest": nan_array.copy(),
+                f"{prefix}_AIS_neck": nan_array.copy(),
+                f"{prefix}_AIS_max": nan_array.copy(),
+            }
+        else:
+            pred_array = preds.detach().cpu().numpy()
 
-        info_arrays = {}
-        for name in ["p_head", "p_chest", "p_neck", "joint_risk"]:
-            info_arrays[name] = info[name].detach().cpu().numpy()
-        joint_risk = info_arrays["joint_risk"]
-        if np.isnan(joint_risk).all():
-            joint_risk = _compute_joint_risk(info_arrays["p_head"], info_arrays["p_chest"], info_arrays["p_neck"])
+            info_arrays = {}
+            for name in ["p_head", "p_chest", "p_neck", "joint_risk"]:
+                info_arrays[name] = info[name].detach().cpu().numpy()
+            joint_risk = info_arrays["joint_risk"]
+            if np.isnan(joint_risk).all():
+                joint_risk = _compute_joint_risk(info_arrays["p_head"], info_arrays["p_chest"], info_arrays["p_neck"])
 
-        stage_data = {
-            f"{prefix}_HIC": pred_array[:, 0],
-            f"{prefix}_Dmax": pred_array[:, 1],
-            f"{prefix}_Nij": pred_array[:, 2],
-            f"{prefix}_Loss": loss.detach().cpu().numpy(),
-            f"{prefix}_Phead": info_arrays["p_head"],
-            f"{prefix}_Pchest": info_arrays["p_chest"],
-            f"{prefix}_Pneck": info_arrays["p_neck"],
-            f"{prefix}_JointRisk": joint_risk,
-        }
-        stage_data[f"{prefix}_AIS_head"] = AIS_cal_head(stage_data[f"{prefix}_HIC"].astype(np.float32))
-        stage_data[f"{prefix}_AIS_chest"] = AIS_cal_chest(stage_data[f"{prefix}_Dmax"].astype(np.float32), ot_array)
-        stage_data[f"{prefix}_AIS_neck"] = AIS_cal_neck(stage_data[f"{prefix}_Nij"].astype(np.float32))
-        stage_data[f"{prefix}_AIS_max"] = np.nanmax(
-            np.vstack(
-                [
-                    stage_data[f"{prefix}_AIS_head"].astype(np.float32),
-                    stage_data[f"{prefix}_AIS_chest"].astype(np.float32),
-                    stage_data[f"{prefix}_AIS_neck"].astype(np.float32),
-                ]
-            ),
-            axis=0,
-        )
+            stage_data = {
+                f"{prefix}_HIC": pred_array[:, 0],
+                f"{prefix}_Dmax": pred_array[:, 1],
+                f"{prefix}_Nij": pred_array[:, 2],
+                f"{prefix}_Loss": loss.detach().cpu().numpy(),
+                f"{prefix}_Phead": info_arrays["p_head"],
+                f"{prefix}_Pchest": info_arrays["p_chest"],
+                f"{prefix}_Pneck": info_arrays["p_neck"],
+                f"{prefix}_JointRisk": joint_risk,
+            }
+            stage_data[f"{prefix}_AIS_head"] = AIS_cal_head(stage_data[f"{prefix}_HIC"].astype(np.float32))
+            stage_data[f"{prefix}_AIS_chest"] = AIS_cal_chest(stage_data[f"{prefix}_Dmax"].astype(np.float32), ot_array)
+            stage_data[f"{prefix}_AIS_neck"] = AIS_cal_neck(stage_data[f"{prefix}_Nij"].astype(np.float32))
+            stage_data[f"{prefix}_AIS_max"] = np.nanmax(
+                np.vstack(
+                    [
+                        stage_data[f"{prefix}_AIS_head"].astype(np.float32),
+                        stage_data[f"{prefix}_AIS_chest"].astype(np.float32),
+                        stage_data[f"{prefix}_AIS_neck"].astype(np.float32),
+                    ]
+                ),
+                axis=0,
+            )
 
         if actions is None:
-            for name in trainable_names + fixed_names:
+            for name in trainable_names:
                 stage_data[f"{prefix}_{name}"] = np.full(len(df_input), np.nan, dtype=np.float32)
         else:
             action_array = actions.detach().cpu().numpy()
             for idx, name in enumerate(trainable_names):
                 stage_data[f"{prefix}_{name}"] = action_array[:, idx]
-            for idx, name in enumerate(fixed_names):
-                stage_data[f"{prefix}_{name}"] = fixed_array[:, idx]
 
         frame_parts.append(pd.DataFrame(stage_data, index=df_input.index).reset_index(drop=True))
 
@@ -290,25 +310,25 @@ def _build_result_dataframe(
                 truth_df["True_AIS_neck"].to_numpy(dtype=np.float32),
             ]
         )
-        for prefix in ["Base", "Opt"]:
+        for prefix in ["Base", "Opt2"]:
             for name in ["HIC", "Dmax", "Nij"]:
                 truth_df[f"True_vs_{prefix}_{name}"] = truth_df[f"True_{name}"] - result_df[f"{prefix}_{name}"]
         result_df = pd.concat([result_df, truth_df], axis=1)
 
     eps = 1e-8
     reduction_specs = [
-        ("HIC", "Base_HIC", "Opt_HIC", True),
-        ("Dmax", "Base_Dmax", "Opt_Dmax", True),
-        ("Nij", "Base_Nij", "Opt_Nij", True),
-        ("Phead", "Base_Phead", "Opt_Phead", False),
-        ("Pchest", "Base_Pchest", "Opt_Pchest", False),
-        ("Pneck", "Base_Pneck", "Opt_Pneck", False),
-        ("JointRisk", "Base_JointRisk", "Opt_JointRisk", False),
-        ("AIS_head", "Base_AIS_head", "Opt_AIS_head", False),
-        ("AIS_chest", "Base_AIS_chest", "Opt_AIS_chest", False),
-        ("AIS_neck", "Base_AIS_neck", "Opt_AIS_neck", False),
-        ("AIS_max", "Base_AIS_max", "Opt_AIS_max", False),
-        ("Loss", "Base_Loss", "Opt_Loss", True),
+        ("HIC", "Base_HIC", "Opt2_HIC", True),
+        ("Dmax", "Base_Dmax", "Opt2_Dmax", True),
+        ("Nij", "Base_Nij", "Opt2_Nij", True),
+        ("Phead", "Base_Phead", "Opt2_Phead", False),
+        ("Pchest", "Base_Pchest", "Opt2_Pchest", False),
+        ("Pneck", "Base_Pneck", "Opt2_Pneck", False),
+        ("JointRisk", "Base_JointRisk", "Opt2_JointRisk", False),
+        ("AIS_head", "Base_AIS_head", "Opt2_AIS_head", False),
+        ("AIS_chest", "Base_AIS_chest", "Opt2_AIS_chest", False),
+        ("AIS_neck", "Base_AIS_neck", "Opt2_AIS_neck", False),
+        ("AIS_max", "Base_AIS_max", "Opt2_AIS_max", False),
+        ("Loss", "Base_Loss", "Opt2_Loss", True),
     ]
     reduction_data = {}
     for alias, base_col, opt_col, with_pct in reduction_specs:
@@ -321,15 +341,22 @@ def _build_result_dataframe(
         result_df = pd.concat([result_df, pd.DataFrame(reduction_data, index=df_input.index).reset_index(drop=True)], axis=1)
 
     summary = {
-        "mean_reduction_HIC": float(np.nanmean(result_df["Reduction_HIC_abs"])),
-        "mean_reduction_Dmax": float(np.nanmean(result_df["Reduction_Dmax_abs"])),
-        "mean_reduction_Nij": float(np.nanmean(result_df["Reduction_Nij_abs"])),
-        "mean_reduction_Phead": float(np.nanmean(result_df["Reduction_Phead_abs"])),
-        "mean_reduction_Pchest": float(np.nanmean(result_df["Reduction_Pchest_abs"])),
-        "mean_reduction_Pneck": float(np.nanmean(result_df["Reduction_Pneck_abs"])),
-        "mean_reduction_joint_risk": float(np.nanmean(result_df["Reduction_JointRisk_abs"])),
-        "mean_base_joint_risk": float(np.nanmean(result_df["Base_JointRisk"])),
-        "mean_opt_joint_risk": float(np.nanmean(result_df["Opt_JointRisk"])),
+        "mean_reduction_HIC": _safe_nanmean(result_df["Reduction_HIC_abs"]),
+        "mean_reduction_Dmax": _safe_nanmean(result_df["Reduction_Dmax_abs"]),
+        "mean_reduction_Nij": _safe_nanmean(result_df["Reduction_Nij_abs"]),
+        "mean_reduction_Phead": _safe_nanmean(result_df["Reduction_Phead_abs"]),
+        "mean_reduction_Pchest": _safe_nanmean(result_df["Reduction_Pchest_abs"]),
+        "mean_reduction_Pneck": _safe_nanmean(result_df["Reduction_Pneck_abs"]),
+        "mean_reduction_joint_risk": _safe_nanmean(result_df["Reduction_JointRisk_abs"]),
+        "mean_base_loss": _safe_nanmean(result_df["Base_Loss"]),
+        "mean_opt1_loss": _safe_nanmean(result_df["Opt1_Loss"]),
+        "mean_opt2_loss": _safe_nanmean(result_df["Opt2_Loss"]),
+        "mean_base_joint_risk": _safe_nanmean(result_df["Base_JointRisk"]),
+        "mean_opt1_joint_risk": _safe_nanmean(result_df["Opt1_JointRisk"]),
+        "mean_opt2_joint_risk": _safe_nanmean(result_df["Opt2_JointRisk"]),
+        "mean_base_ais_max": _safe_nanmean(result_df["Base_AIS_max"]),
+        "mean_opt1_ais_max": _safe_nanmean(result_df["Opt1_AIS_max"]),
+        "mean_opt2_ais_max": _safe_nanmean(result_df["Opt2_AIS_max"]),
         "n_samples": int(len(result_df)),
     }
     return result_df, summary
@@ -377,7 +404,7 @@ def main():
         jitter_ratio=0.0,
         jitter_prob=0.0,
     )
-    _fit_distribution_reference_if_needed(surrogate, ref_sampler, param_manager, config, logger)
+    dist_fit_error = _fit_distribution_reference_if_needed(surrogate, ref_sampler, param_manager, config, logger)
 
     strat_cfg = config.get("strategy_net", {})
     strategy_net = StrategyNet(
@@ -393,13 +420,28 @@ def main():
 
     strategy_ckpt_path = _resolve_strategy_ckpt(args, base_dir, config)
     strict_default_ckpt = bool(config.get("evaluation", {}).get("strict_default_ckpt", False))
+    strategy_fallback_reason = None
     if strategy_ckpt_path is not None:
         if not strategy_ckpt_path.is_file():
             raise FileNotFoundError(f"策略权重不存在: {strategy_ckpt_path}")
-        strategy_net.load_state_dict(torch.load(str(strategy_ckpt_path), map_location=device, weights_only=True))
-        config["optimization"]["direct_inference"] = True
+        try:
+            strategy_net.load_state_dict(torch.load(str(strategy_ckpt_path), map_location=device, weights_only=True))
+            config["optimization"]["direct_inference"] = True
+        except Exception as exc:
+            if strict_default_ckpt:
+                raise RuntimeError(f"策略权重加载失败: {strategy_ckpt_path}") from exc
+            strategy_fallback_reason = (
+                f"策略权重与当前 trainable 配置不兼容，已降级为不生成 Opt1: {strategy_ckpt_path}; {exc}"
+            )
+            logger.warning(strategy_fallback_reason)
+            config["optimization"]["direct_inference"] = False
+            strategy_ckpt_path = None
     elif strict_default_ckpt:
         raise FileNotFoundError("strict_default_ckpt=true 且未找到默认策略权重")
+    else:
+        strategy_fallback_reason = "未找到策略权重，已降级为不生成 Opt1；若 refine_steps>0，则仅输出 Base 和 Opt2"
+        logger.warning(strategy_fallback_reason)
+        config["optimization"]["direct_inference"] = False
 
     optimizer = LocalRefiner(
         config=config,
@@ -457,8 +499,6 @@ def main():
     )
     context_names = param_manager.get_context_names()
     trainable_names = [param["name"] for param in param_manager.control_trainable_params]
-    fixed_names = [param["name"] for param in param_manager.control_fixed_params]
-
     context_tensor_raw = torch.tensor(context_df[context_names].values, dtype=torch.float32, device=device)
     baseline_tensor_raw = torch.tensor(baseline_df[trainable_names].values, dtype=torch.float32, device=device)
     context_tensor, baseline_tensor = constraint_engine.sanitize_context_and_trainable(context_tensor_raw, baseline_tensor_raw)
@@ -472,7 +512,6 @@ def main():
         baseline_trainable=baseline_tensor,
         surrogate=surrogate,
         optimizer=optimizer,
-        constraint_engine=constraint_engine,
         eval_batch_size=eval_batch_size,
     )
 
@@ -482,7 +521,6 @@ def main():
         stage_outputs=stage_outputs,
         truth_arrays=truth_arrays,
         trainable_names=trainable_names,
-        fixed_names=fixed_names,
     )
     result_df.to_csv(str(output_csv_path), index=False)
 
@@ -492,16 +530,32 @@ def main():
         "output_csv": str(output_csv_path),
         "input_source": input_source,
         "strategy_checkpoint_path": str(strategy_ckpt_path) if strategy_ckpt_path is not None else None,
+        "strategy_stage_fallback_reason": strategy_fallback_reason,
         "direct_inference": bool(config.get("optimization", {}).get("direct_inference", False)),
         "config_files": _copy_config_snapshots(cfg_path, param_space_path, output_dir),
         "evaluation_config": config.get("evaluation", {}),
         "optimization_config": config.get("optimization", {}),
+        "parameter_roles": {
+            "context": context_names,
+            "trainable_control": trainable_names,
+            "fixed_control": [param["name"] for param in param_manager.control_fixed_params],
+        },
         "missing_context_filled_by_default": missing_context,
         "missing_trainable_filled_by_default": missing_trainable,
+        "stage_definition": {
+            "Base": "输入 CSV 提供的 baseline control；缺失时回填 default",
+            "Opt1": "策略网络直推结果；仅在 direct_inference=True 且权重可用时存在",
+            "Opt2": "局部精调结果；仅在 refine_steps>0 时存在",
+        },
+        "distribution_penalty": {
+            "enabled_after_fit": bool(surrogate.distribution_penalty.enabled),
+            "feature_space": surrogate.distribution_penalty.feature_space,
+            "fit_error": dist_fit_error,
+        },
         "summary_metrics": summary_metrics,
         "formulas": {
             "joint_risk": "L_risk = 1 - Π_k (1 - P_k)",
-            "reported_reduction": "mean(Baseline - Optimized)",
+            "reported_reduction": "mean(Base - Opt2)",
         },
         "runtime": {
             "total_time_cost_sec": float(stage_outputs["total_time_cost"]),

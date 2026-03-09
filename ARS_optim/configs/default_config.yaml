@@ -41,6 +41,7 @@ strategy_net:
     gradient_clip_max_norm: 1.0 # 梯度裁剪阈值
     jitter_ratio: 0.01      # 经验池连续参数扰动幅度（占参数范围比例）
     jitter_prob: 1.0        # 每个连续参数施加扰动的概率
+    tensorboard: true       # 若工作目录不允许写入 events 文件，可临时关闭
     ema:
       enabled: true          # 是否启用 EMA 作为 train_best 的判据
       alpha: 0.98            # EMA 平滑系数，越大越平滑
@@ -52,9 +53,9 @@ strategy_net:
 # ===========================
 optimization:
   # 是否直推
-  direct_inference: False # True: 需要进行策略网络直推；False: 使用默认参数作为初始解进行局部精调，不进行策略网络直推
+  direct_inference: True # True: 生成策略直推阶段 Opt1；False: 不生成 Opt1，局部精调直接从 default/baseline 初值开始
   # 直推后的精调迭代参数
-  refine_steps: 50         # 局部精调迭代次数 k. 若为0，则仅依赖策略网络直接推理
+  refine_steps: 50         # 局部精调迭代次数 k。若为 0，则不生成 Opt2；若大于 0，则输出局部精调后的 Opt2
   lr: 0.05                 # 局部精调阶段在物理参数空间中的 Adam 步长
   
   # 综合目标函数(Loss)各部位风险权重
@@ -82,4 +83,4 @@ optimization:
 evaluation:
   eval_batch_size: 512   # 评估时分批推理的批大小，用于降低显存峰值
   default_strategy_ckpt: null  # 可选：默认策略权重路径（绝对路径或相对 ARS_optim 目录）
-  strict_default_ckpt: true  # true时仅允许自动加载 val_best_model.pth；找不到则直接报错
+  strict_default_ckpt: false  # true 时找不到策略权重就报错；false 时降级为不生成 Opt1，仅保留 Base 和可能存在的 Opt2

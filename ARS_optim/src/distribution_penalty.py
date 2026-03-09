@@ -31,6 +31,7 @@ class DistributionPenalty:
         self.ref_features: Optional[torch.Tensor] = None
         self.ref_mean: Optional[torch.Tensor] = None
         self.ref_inv_cov: Optional[torch.Tensor] = None
+        self.ref_feature_dim: Optional[int] = None
         self.scale_maha: Optional[float] = None
         self.scale_knn: Optional[float] = None
 
@@ -49,6 +50,7 @@ class DistributionPenalty:
             raise ValueError("knn 模式下参考样本数不能小于 k")
 
         self.ref_features = reference_features.detach()
+        self.ref_feature_dim = int(reference_features.shape[1])
         if self.method == "mahalanobis":
             centered = self.ref_features - self.ref_features.mean(dim=0, keepdim=True)
             cov = (centered.T @ centered) / max(1, centered.shape[0] - 1)
@@ -101,8 +103,10 @@ class DistributionPenalty:
         else:
             x = context_params
 
-        if self.ref_features is not None and self.ref_features.shape[1] != x.shape[1]:
-            raise ValueError("分布惩罚输入维度与参考分布不一致")
+        if self.ref_feature_dim is not None and self.ref_feature_dim != x.shape[1]:
+            raise ValueError(
+                f"分布惩罚输入维度与参考分布不一致: current={x.shape[1]}, reference={self.ref_feature_dim}"
+            )
 
         if self.method == "mahalanobis":
             penalty = self._compute_mahalanobis(x)

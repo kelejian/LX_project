@@ -1,5 +1,4 @@
 import json
-import logging
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -18,8 +17,6 @@ from ARS_optim.src.param_manager import ParamManager
 
 def _resolve_checkpoint_path(base_dir: Path, cfg_value: str) -> Path:
     raw = str(cfg_value or "").strip()
-    if (raw.startswith("r'") and raw.endswith("'")) or (raw.startswith('r"') and raw.endswith('"')):
-        raw = raw[2:-1]
     candidate = Path(raw).expanduser()
     return candidate if candidate.is_absolute() else (base_dir / candidate).resolve()
 
@@ -71,7 +68,6 @@ class SurrogateAdapter(nn.Module):
         data_processor,
     ):
         super().__init__()
-        self.logger = logging.getLogger(self.__class__.__name__)
         self.pulse_model = pulse_model
         self.injury_model = injury_model
         self.param_manager = param_manager
@@ -96,6 +92,9 @@ class SurrogateAdapter(nn.Module):
         self.weight_penalty = float(obj_cfg.get("weight_penalty", 10.0))
         self.distribution_penalty = DistributionPenalty(config)
         self.weight_distribution = float(config.get("optimization", {}).get("distribution_penalty", {}).get("weight", 0.0))
+        # impact 参数在完整 FEATURE_ORDER 中的索引固定不变，初始化时缓存可避免高频推理阶段重复查找。
+        self._impact_names = ["impact_velocity", "impact_angle", "overlap"]
+        self._impact_indices = [FEATURE_ORDER.index(name) for name in self._impact_names]
 
     def fit_distribution_reference(self, reference_features: torch.Tensor) -> None:
         if self.distribution_penalty.enabled:
@@ -125,6 +124,7 @@ class SurrogateAdapter(nn.Module):
         p_chest = torch.clamp(injury_risk.Injury_prob_cal_chest(dmax, OT=ot_tensor), 1e-6, 1.0 - 1e-6)
         p_neck = torch.clamp(injury_risk.Injury_prob_cal_neck(nij), 1e-6, 1.0 - 1e-6)
 
+        # 这里对应 ARS.md 步骤三中的联合损伤风险项。训练时允许对头/胸/颈三部分别加权，以便在不改变整体乘法结构的前提下调节不同部位在优化目标中的相对重要性。
         loss_risk = 1.0 - (
             torch.pow(1.0 - p_head, self.w_head)
             * torch.pow(1.0 - p_chest, self.w_chest)
@@ -140,7 +140,6 @@ class SurrogateAdapter(nn.Module):
             "loss_risk": loss_risk.detach(),
             "loss_constraint": loss_constraint.detach(),
             "loss_distribution": loss_distribution.detach(),
-            "rel_penalty": loss_constraint.detach(),
             "p_head": p_head.detach(),
             "p_chest": p_chest.detach(),
             "p_neck": p_neck.detach(),
@@ -152,11 +151,10 @@ class SurrogateAdapter(nn.Module):
         return total_loss, predictions_phys, info
 
     def generate_pulse(self, context_params: torch.Tensor) -> torch.Tensor:
+        # context_params 只包含 context 子集，列顺序并不等于 FEATURE_ORDER。先补全到完整特征向量，再按完整索引抽取 impact 参数，才能保证送入 PulsePredict 的速度/角度/重叠率与全项目统一数据接口严格对齐。
         full = self.constraint_engine.compose_full_features(context_params=context_params)
-        impact_names = ["impact_velocity", "impact_angle", "overlap"]
-        impact_indices = [FEATURE_ORDER.index(name) for name in impact_names]
-        impact_phys = full[:, impact_indices]
-        impact_norm = self.data_processor.process_by_name(impact_phys, impact_names, inverse=False)
+        impact_phys = full[:, self._impact_indices]
+        impact_norm = self.data_processor.process_by_name(impact_phys, self._impact_names, inverse=False)
         pulse_output_raw = self.pulse_model(impact_norm)
         if hasattr(self.pulse_model, "get_metrics_output"):
             waveform_norm = self.pulse_model.get_metrics_output(pulse_output_raw)

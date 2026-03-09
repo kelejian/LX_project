@@ -165,11 +165,15 @@ def main():
         )
         surrogate.fit_distribution_reference(ref_context)
 
+    tensorboard_enabled = bool(train_cfg.get("tensorboard", True))
+
     save_root = base_dir / "saved_models"
     save_root.mkdir(parents=True, exist_ok=True)
     run_dir = save_root / f"strategy_net_{datetime.now().strftime('%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=False)
-    writer = SummaryWriter(log_dir=str(run_dir))
+    run_norm_snapshot_path = run_dir / "normalization_config.json"
+    shutil.copy2(str(NORMALIZATION_CONFIG_PATH), str(run_norm_snapshot_path))
+    writer = SummaryWriter(log_dir=str(run_dir)) if tensorboard_enabled else None
 
     train_best_path = run_dir / "train_best_model.pth"
     val_best_path = run_dir / "val_best_model.pth"
@@ -181,11 +185,12 @@ def main():
     val_best_iter = -1
     ema_train_loss: Optional[float] = None
 
-    def evaluate_full_val() -> tuple[float, float, float]:
+    def evaluate_full_val() -> tuple[float, float, float, float]:
         strategy_net.eval()
         total_loss = 0.0
         total_risk = 0.0
         total_constraint = 0.0
+        total_distribution = 0.0
         sample_count = 0
         with torch.no_grad():
             for batch_context in val_sampler.iter_dataset_batches(batch_size=int(train_cfg.get("val_batch_size", 1024)), shuffle=False):
@@ -195,11 +200,17 @@ def main():
                 total_loss += float(loss_batch.sum().item())
                 total_risk += float(info["loss_risk"].sum().item())
                 total_constraint += float(info["loss_constraint"].sum().item())
+                total_distribution += float(info["loss_distribution"].sum().item())
                 sample_count += int(loss_batch.numel())
         strategy_net.train()
         if sample_count == 0:
             raise ValueError("验证集为空")
-        return total_loss / sample_count, total_risk / sample_count, total_constraint / sample_count
+        return (
+            total_loss / sample_count,
+            total_risk / sample_count,
+            total_constraint / sample_count,
+            total_distribution / sample_count,
+        )
 
     log_interval = int(train_cfg.get("log_interval", 10))
     val_interval = int(train_cfg.get("val_interval", 500))
@@ -240,22 +251,26 @@ def main():
             train_select_metric = ema_train_loss if ema_enabled else loss_value
             ema_ready = (iter_idx + 1) >= max(1, ema_warmup_iters) if ema_enabled else True
 
-            writer.add_scalar("Train/Loss", loss_value, iter_idx)
-            writer.add_scalar("Train/LossRisk", loss_risk, iter_idx)
-            writer.add_scalar("Train/LossConstraint", loss_constraint, iter_idx)
-            writer.add_scalar("Train/LossDistribution", loss_distribution, iter_idx)
-            writer.add_scalar("Train/LR", current_lr, iter_idx)
-            if ema_log_to_tb:
-                writer.add_scalar("Train/EMA_Loss", float(ema_train_loss), iter_idx)
+            if writer is not None:
+                writer.add_scalar("Train/Loss", loss_value, iter_idx)
+                writer.add_scalar("Train/LossRisk", loss_risk, iter_idx)
+                writer.add_scalar("Train/LossConstraint", loss_constraint, iter_idx)
+                writer.add_scalar("Train/LossDistribution", loss_distribution, iter_idx)
+                writer.add_scalar("Train/LR", current_lr, iter_idx)
+                if ema_log_to_tb:
+                    writer.add_scalar("Train/EMA_Loss", float(ema_train_loss), iter_idx)
 
             val_loss = None
             val_loss_risk = None
             val_loss_constraint = None
+            val_loss_distribution = None
             if val_interval > 0 and (iter_idx + 1) % val_interval == 0:
-                val_loss, val_loss_risk, val_loss_constraint = evaluate_full_val()
-                writer.add_scalar("Val/Loss", val_loss, iter_idx)
-                writer.add_scalar("Val/LossRisk", val_loss_risk, iter_idx)
-                writer.add_scalar("Val/LossConstraint", val_loss_constraint, iter_idx)
+                val_loss, val_loss_risk, val_loss_constraint, val_loss_distribution = evaluate_full_val()
+                if writer is not None:
+                    writer.add_scalar("Val/Loss", val_loss, iter_idx)
+                    writer.add_scalar("Val/LossRisk", val_loss_risk, iter_idx)
+                    writer.add_scalar("Val/LossConstraint", val_loss_constraint, iter_idx)
+                    writer.add_scalar("Val/LossDistribution", val_loss_distribution, iter_idx)
                 if val_loss < val_best_loss:
                     val_best_loss = val_loss
                     val_best_iter = iter_idx + 1
@@ -277,6 +292,7 @@ def main():
                     "val_loss": val_loss,
                     "val_loss_risk": val_loss_risk,
                     "val_loss_constraint": val_loss_constraint,
+                    "val_loss_distribution": val_loss_distribution,
                     "lr": current_lr,
                 }
             )
@@ -304,6 +320,7 @@ def main():
                         "enabled": ema_enabled,
                         "alpha": ema_alpha,
                         "warmup_iters": ema_warmup_iters,
+                        "tensorboard": tensorboard_enabled,
                     },
                     "distribution_penalty": {
                         "enabled": bool(surrogate.distribution_penalty.enabled),
@@ -314,6 +331,16 @@ def main():
                         "eps": surrogate.distribution_penalty.eps,
                         "clip_max": surrogate.distribution_penalty.clip_max,
                         "normalize_by_train_stats": surrogate.distribution_penalty.normalize_by_train_stats,
+                    },
+                    "parameter_roles": {
+                        "context": param_manager.get_context_names(),
+                        "trainable_control": [param["name"] for param in param_manager.control_trainable_params],
+                        "fixed_control": [param["name"] for param in param_manager.control_fixed_params],
+                    },
+                    "external_artifacts": {
+                        "normalization_config": run_norm_snapshot_path.name,
+                        "pulse_checkpoint": config.get("surrogate", {}).get("pulse_checkpoint"),
+                        "injury_checkpoint": config.get("surrogate", {}).get("checkpoint_rel_path"),
                     },
                     "train_best": {
                         "iter": train_best_iter,
@@ -348,7 +375,8 @@ def main():
             logger.info(f"最终权重: {final_path}")
         logger.info(f"训练产物目录: {run_dir}")
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
 
 
 if __name__ == "__main__":

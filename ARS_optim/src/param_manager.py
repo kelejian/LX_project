@@ -1,7 +1,7 @@
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import List, Tuple, Union
 
 import torch
 import yaml
@@ -26,7 +26,6 @@ class ParamManager:
             with open(param_space_path_or_dict, "r", encoding="utf-8") as file:
                 config = yaml.safe_load(file)
 
-        self.param_space_config = config
         self.sampling_rules = config.get("sampling_rules", {})
         self.all_params = self._parse_parameters(config.get("parameters", []))
 
@@ -39,7 +38,6 @@ class ParamManager:
         ]
 
         self.params_by_name = {param["name"]: param for param in self.all_params}
-        self.params_by_index = {param["index"]: param for param in self.all_params}
 
         self._validate_feature_order()
         self._warn_if_bounds_conflict(norm_config_path or NORMALIZATION_CONFIG_PATH)
@@ -114,9 +112,6 @@ class ParamManager:
 
     def get_total_feature_dim(self) -> int:
         return len(self.all_params)
-
-    def get_state_params(self) -> List[dict]:
-        return list(self.state_params)
 
     def get_context_params(self) -> List[dict]:
         params = self.state_params + self.control_fixed_params

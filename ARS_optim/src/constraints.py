@@ -13,8 +13,10 @@ class ConstraintEngine:
 
     设计上只保留一套规则源：
     - `sanitize_*` 用于训练采样、baseline 输入和评估 CSV 的确定性修复；
-    - `project_forward` 用于策略网络和局部精调阶段的可微投影；
+    - `project_forward` 用于策略网络和局部精调阶段的可微投影，只覆盖连续且可微的子集；
     - `compute_soft_penalty` 用于把硬规则转成训练期的平滑惩罚。
+
+    polygon/离散规则仍统一由 sanitize 执行；project_forward 只做不会破坏梯度的近似投影。
     """
 
     def __init__(self, param_manager: ParamManager):
@@ -41,6 +43,8 @@ class ConstraintEngine:
 
         coupling = self.rules.get("coupling", {})
         self.aft_btf_delta_max = float(coupling.get("aft_btf_delta_max", 25.0))
+        self.llattf_btf_delta_min = float(coupling.get("llattf_btf_delta_min", 0.0))
+        self.ll2_ll1_delta_max = float(coupling.get("ll2_ll1_delta_max", 0.0))
         self.epsilon = float(coupling.get("epsilon", 1e-3))
 
         self._build_rule_caches()
@@ -132,8 +136,9 @@ class ConstraintEngine:
 
     def project_forward(self, actions: torch.Tensor, context_params: torch.Tensor) -> torch.Tensor:
         device = actions.device
-        # Clone each column to avoid in-place version conflicts when the same
-        # trainable variable participates in multiple coupled projections.
+        # 这里故意只处理连续且可微的约束子集。
+        # 对策略网络和局部精调而言，AFT/BTF、LLATTF/BTF、LL1/LL2 这类 min/max 耦合可以直接投影且不会破坏梯度；而离散 RA 和 seat polygon 若在这里做硬 snapping，会让反向传播不稳定，因此只做 bbox 级别的近似裁剪，再由 soft_penalty/sanitize 补足。
+        # 为避免在相同的可训练变量参与多个耦合投影时出现就地版本冲突，克隆每一列。
         cols = [actions[:, idx].clone() for idx in range(actions.shape[1])]
 
         aft = self._get_param_col("AFT", cols, context_params, device)
@@ -147,18 +152,36 @@ class ConstraintEngine:
         llattf = self._get_param_col("LLATTF", cols, context_params, device)
         btf = self._get_param_col("BTF", cols, context_params, device)
         if "LLATTF" in self.trainable_names:
-            cols[self.trainable_names["LLATTF"]] = torch.max(llattf, btf)
+            cols[self.trainable_names["LLATTF"]] = torch.max(llattf, btf + self.llattf_btf_delta_min)
         llattf = self._get_param_col("LLATTF", cols, context_params, device)
         if "BTF" in self.trainable_names:
-            cols[self.trainable_names["BTF"]] = torch.min(btf, llattf)
+            cols[self.trainable_names["BTF"]] = torch.min(btf, llattf - self.llattf_btf_delta_min)
 
         ll1 = self._get_param_col("LL1", cols, context_params, device)
         ll2 = self._get_param_col("LL2", cols, context_params, device)
         if "LL2" in self.trainable_names:
-            cols[self.trainable_names["LL2"]] = torch.min(ll2, ll1)
+            cols[self.trainable_names["LL2"]] = torch.min(ll2, ll1 + self.ll2_ll1_delta_max)
         ll2 = self._get_param_col("LL2", cols, context_params, device)
         if "LL1" in self.trainable_names:
-            cols[self.trainable_names["LL1"]] = torch.max(ll1, ll2)
+            cols[self.trainable_names["LL1"]] = torch.max(ll1, ll2 - self.ll2_ll1_delta_max)
+
+        if self.seat_cache and "is_driver_side" in self.context_names and "OT" in self.context_names:
+            has_trainable_sp = "SP" in self.trainable_names
+            has_trainable_sh = "SH" in self.trainable_names
+            if has_trainable_sp or has_trainable_sh:
+                side = torch.round(context_params[:, self.context_names["is_driver_side"]]).to(torch.int64)
+                ot = torch.round(context_params[:, self.context_names["OT"]]).to(torch.int64)
+                for (rule_side, rule_ot), info in self.seat_cache.items():
+                    mask = (side == rule_side) & (ot == rule_ot)
+                    if not mask.any():
+                        continue
+                    sp_min, sp_max, sh_min, sh_max = info["bbox"]
+                    if has_trainable_sp:
+                        sp_idx = self.trainable_names["SP"]
+                        cols[sp_idx][mask] = torch.clamp(cols[sp_idx][mask], sp_min, sp_max)
+                    if has_trainable_sh:
+                        sh_idx = self.trainable_names["SH"]
+                        cols[sh_idx][mask] = torch.clamp(cols[sh_idx][mask], sh_min, sh_max)
 
         projected_actions = torch.stack(cols, dim=1)
         min_bounds, max_bounds = self.param_manager.get_trainable_bounds(device=device)
@@ -166,6 +189,7 @@ class ConstraintEngine:
 
     def compute_soft_penalty(self, actions: torch.Tensor, context_params: torch.Tensor) -> torch.Tensor:
         device = actions.device
+        # soft penalty 的职责不是替代 sanitize，而是在训练阶段为那些不适合直接硬投影的规则提供连续可导的惩罚信号：例如 RA 必须落在离散档位集合附近、SP/SH 应处在对应(side, OT) 组合允许的座椅包围盒内。这样网络即使暂时输出不可行解，也能收到平滑梯度。
         penalty = torch.zeros(actions.shape[0], device=device, dtype=torch.float32)
         cols = [actions[:, idx] for idx in range(actions.shape[1])]
 
@@ -176,8 +200,8 @@ class ConstraintEngine:
         ll2 = self._get_param_col("LL2", cols, context_params, device)
 
         penalty += torch.relu(aft - (btf + self.aft_btf_delta_max))
-        penalty += torch.relu(btf - llattf)
-        penalty += torch.relu(ll2 - ll1)
+        penalty += torch.relu((btf + self.llattf_btf_delta_min) - llattf)
+        penalty += torch.relu(ll2 - (ll1 + self.ll2_ll1_delta_max))
 
         if "is_driver_side" not in self.context_names or "OT" not in self.context_names:
             return penalty
@@ -241,6 +265,7 @@ class ConstraintEngine:
         neg_min, neg_max = map(float, overlap_cfg.get("domain", {}).get("negative", [-1.0, -0.25]))
         pos_min, pos_max = map(float, overlap_cfg.get("domain", {}).get("positive", [0.25, 1.0]))
 
+        # step0 里把接近 0 或接近 ±100% 的重叠率统一折算为 100%，其工程含义是：这两类边界值在采样和后续仿真里都更接近“完全正碰”这一稳定工况，若保留极小正值/负值，反而会把样本推到 overlap 禁区附近，造成不合理碰撞输入。
         special_mask = (overlap.abs() > special_abs_high) | (overlap.abs() < special_abs_low)
         overlap = torch.where(special_mask, torch.full_like(overlap, force_to), overlap)
         gap_mask = overlap.abs() < pos_min
@@ -263,6 +288,7 @@ class ConstraintEngine:
         abs_min = float(rule.get("overlap_abs_min", 0.25))
         abs_max = float(rule.get("overlap_abs_max", 0.3))
         angle_abs_min = float(rule.get("angle_abs_min", 30.0))
+        # 当 |overlap| 落在 0.25~0.3 的窄区间时，step0 会强制碰撞角度与重叠率异号且绝对值足够大。这是为了排除“小重叠但近似正碰”的不合理组合：此时若角度太小，同侧擦碰与重叠率设定会互相矛盾。
         trigger = (overlap.abs() >= abs_min) & (overlap.abs() < abs_max)
         if not trigger.any():
             return
@@ -287,7 +313,8 @@ class ConstraintEngine:
         if fallback.any():
             signs = torch.where(overlap[fallback] > 0.0, -torch.ones_like(overlap[fallback]), torch.ones_like(overlap[fallback]))
             angle[fallback] = signs * angle_abs_min
-        x[:, angle_idx] = torch.clamp(angle, -45.0, 45.0)
+        angle_min, angle_max = self.continuous_bounds.get(angle_idx, (-45.0, 45.0))
+        x[:, angle_idx] = torch.clamp(angle, angle_min, angle_max)
 
     def _enforce_control_couplings(self, x: torch.Tensor) -> None:
         ll1_idx = self.name_to_index.get("LL1")
@@ -296,8 +323,8 @@ class ConstraintEngine:
         llattf_idx = self.name_to_index.get("LLATTF")
         aft_idx = self.name_to_index.get("AFT")
 
-        x[:, ll2_idx] = torch.min(x[:, ll2_idx], x[:, ll1_idx])
-        x[:, llattf_idx] = torch.max(x[:, llattf_idx], x[:, btf_idx])
+        x[:, ll2_idx] = torch.min(x[:, ll2_idx], x[:, ll1_idx] + self.ll2_ll1_delta_max)
+        x[:, llattf_idx] = torch.max(x[:, llattf_idx], x[:, btf_idx] + self.llattf_btf_delta_min)
         x[:, aft_idx] = torch.min(x[:, aft_idx], x[:, btf_idx] + self.aft_btf_delta_max - self.epsilon)
 
     def _enforce_ra_discrete(self, x: torch.Tensor) -> None:
@@ -331,6 +358,7 @@ class ConstraintEngine:
         side = torch.round(x[:, side_idx]).to(torch.int64)
         ot = torch.round(x[:, ot_idx]).to(torch.int64)
         for (rule_side, rule_ot), info in self.seat_cache.items():
+            # 不同主副驾和假人体型对应不同可安装/可调范围；主驾受转向盘和踏板布置影响更强，5th/50th/95th 假人的合理坐姿窗口也不同; 因此这里不是单一矩形约束，而是按 (side, OT) 切换多边形可行域。
             mask = (side == rule_side) & (ot == rule_ot)
             if not mask.any():
                 continue

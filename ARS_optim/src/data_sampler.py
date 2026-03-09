@@ -91,6 +91,9 @@ class StateDataSampler:
     def _apply_bounded_jitter(self, batch_context: torch.Tensor) -> torch.Tensor:
         if not self.context_cont_local_indices or self.jitter_ratio <= 0:
             return batch_context
+        # 只对连续 context 特征施加扰动：
+        # 1. 离散变量没有连续噪声语义，直接加噪会破坏类别含义；
+        # 2. trainable 控制量不属于经验池输入，它们由策略网络或局部精调阶段产生。
         continuous = batch_context[:, self.context_cont_local_indices]
         noise = torch.randn(continuous.shape, generator=self.rng, device=self.device, dtype=torch.float32)
         noise = noise * (self.cont_spans.unsqueeze(0) * self.jitter_ratio)
@@ -104,6 +107,7 @@ class StateDataSampler:
     def _generate_batch(self) -> torch.Tensor:
         indices = torch.randint(0, self.pool_size, (self.batch_size,), generator=self.rng, device=self.device)
         batch_context = self.pool_context[indices].clone()
+        # 先对经验池样本做轻微连续扰动，再统一送入约束引擎净化。这样既能保持训练数据流接近真实边际分布，又能确保扰动后的 RA/座椅参数/碰撞工况重新落回 step0 定义的可行域中。
         batch_context = self._apply_bounded_jitter(batch_context)
         return self.constraint_engine.sanitize_context(batch_context)
 

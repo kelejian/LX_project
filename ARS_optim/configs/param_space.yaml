@@ -129,6 +129,8 @@ parameters:
 sampling_rules:
   coupling:
     aft_btf_delta_max: 25.0
+    llattf_btf_delta_min: 0.0
+    ll2_ll1_delta_max: 0.0
     epsilon: 0.001
 
   overlap:

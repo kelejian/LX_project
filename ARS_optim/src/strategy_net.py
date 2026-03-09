@@ -1,4 +1,3 @@
-import logging
 from typing import List
 
 import torch
@@ -24,7 +23,6 @@ class StrategyNet(nn.Module):
         pulse_embed_dim: int = 32,
     ):
         super().__init__()
-        self.logger = logging.getLogger(self.__class__.__name__)
         self.param_manager = param_manager
         self.constraint_engine = constraint_engine
         self.data_processor = data_processor
@@ -84,6 +82,9 @@ class StrategyNet(nn.Module):
             raise ValueError("策略网络最后一层必须是带 bias 的 Linear")
         with torch.no_grad():
             nn.init.constant_(out_layer.weight, 0.0)
+            # 令 sigmoid(bias) 恰好等于默认值在线性边界盒中的归一化位置：
+            # ratio = (default - min) / (max - min), bias = log(ratio / (1 - ratio))。
+            # 这样在最后一层权重清零时，网络未训练前就会稳定输出 default 动作。
             ratio = (self.default_actions - self.min_bounds) / torch.clamp(self.max_bounds - self.min_bounds, min=1e-12)
             ratio = torch.clamp(ratio, min=1e-6, max=1.0 - 1e-6)
             out_layer.bias.copy_(torch.log(ratio / (1.0 - ratio)))
@@ -96,6 +97,7 @@ class StrategyNet(nn.Module):
         context_norm = self._normalize_context(context_features)
         combined = torch.cat([context_norm, pulse_embed], dim=1)
         raw_output = self.mlp(combined)
+        # 先用 sigmoid 把网络输出压到 [0, 1]，再线性映射回物理参数边界盒。最后再通过约束引擎修正 AFT/BTF、LL1/LL2、LLATTF 等耦合关系，避免网络直接回归物理量时频繁输出越界或违反硬约束的解。
         norm_actions = torch.sigmoid(raw_output)
         span = torch.where(self.max_bounds > self.min_bounds, self.max_bounds - self.min_bounds, torch.ones_like(self.max_bounds))
         actions = norm_actions * span.unsqueeze(0) + self.min_bounds.unsqueeze(0)
