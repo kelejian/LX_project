@@ -1,25 +1,23 @@
-import json
-import logging
 from pathlib import Path
 from typing import List, Tuple, Union
 
 import torch
 import yaml
 
-from common.settings import FEATURE_ORDER, NORMALIZATION_CONFIG_PATH
+from common.settings import FEATURE_ORDER
 
 
 class ParamManager:
     """管理 ARS_optim 的参数定义与默认值。
 
-    这里保持两条原则：
-    1. 只保留运行流程真正依赖的配置校验，避免把配置层写成过重的框架；
-    2. 参数分类全部源于 param_space.yaml，训练与评估只通过这里取索引和默认值。
+    这里只保留两类职责：
+    1. 读取并校验 param_space.yaml 中真正影响运行的参数定义；
+    2. 向训练、评估和约束模块提供统一的索引、默认值与角色划分。
+
+    不在这里额外引入与运行主链路无关的配置比对或兼容逻辑，避免参数层继续膨胀。
     """
 
-    def __init__(self, param_space_path_or_dict: Union[str, Path, dict], norm_config_path: Union[str, Path, None] = None):
-        self.logger = logging.getLogger(self.__class__.__name__)
-
+    def __init__(self, param_space_path_or_dict: Union[str, Path, dict]):
         if isinstance(param_space_path_or_dict, dict):
             config = param_space_path_or_dict
         else:
@@ -30,7 +28,6 @@ class ParamManager:
         self.all_params = self._parse_parameters(config.get("parameters", []))
 
         self.state_params = [param for param in self.all_params if param["role"] == "state"]
-        self.control_params = [param for param in self.all_params if param["role"] == "control"]
         self.control_trainable_params = [
             param for param in self.all_params if param["role"] == "control" and bool(param.get("trainable", False))
         ]
@@ -41,7 +38,6 @@ class ParamManager:
         self.params_by_name = {param["name"]: param for param in self.all_params}
 
         self._validate_feature_order()
-        self._warn_if_bounds_conflict(norm_config_path or NORMALIZATION_CONFIG_PATH)
 
     def _parse_parameters(self, raw_params: List[dict]) -> List[dict]:
         if not raw_params:
@@ -83,65 +79,16 @@ class ParamManager:
                     f"expect={FEATURE_ORDER[expected_index]}, actual={param['name']}"
                 )
 
-    def _warn_if_bounds_conflict(self, norm_config_path: Union[str, Path]) -> None:
-        try:
-            with open(norm_config_path, "r", encoding="utf-8") as file:
-                norm_config = json.load(file)
-        except Exception as exc:
-            self.logger.warning(f"读取 normalization_config 失败，跳过边界比对: {exc}")
-            return
-
-        minmax_stats = norm_config.get("continuous", {}).get("minmax", {}).get("stats", {})
-        maxabs_stats = norm_config.get("continuous", {}).get("maxabs", {}).get("stats", {})
-        for param in self.all_params:
-            if param.get("type") != "continuous":
-                continue
-
-            name = param["name"]
-            cfg_min = float(param["min"])
-            cfg_max = float(param["max"])
-            ref_min = None
-            ref_max = None
-            if name in minmax_stats:
-                ref_min = float(minmax_stats[name]["min"])
-                ref_max = float(minmax_stats[name]["max"])
-            elif name in maxabs_stats:
-                ref_max = float(maxabs_stats[name]["abs_max"])
-                ref_min = -ref_max
-
-            if ref_min is None or ref_max is None:
-                continue
-            if abs(cfg_min - ref_min) > 1e-4 or abs(cfg_max - ref_max) > 1e-4:
-                self.logger.warning(
-                    f"参数 {name} 的 ARS 边界 [{cfg_min}, {cfg_max}] 与归一化配置 [{ref_min}, {ref_max}] 不一致，"
-                    "运行时将以 ARS 边界为准。"
-                )
-
     def get_total_feature_dim(self) -> int:
         return len(self.all_params)
 
     def get_all_params(self) -> List[dict]:
         return list(self.all_params)
 
-    def get_all_names(self) -> List[str]:
-        return [param["name"] for param in self.all_params]
-
-    def get_all_indices(self) -> List[int]:
-        return [param["index"] for param in self.all_params]
-
     def get_param(self, name: str) -> dict:
         if name not in self.params_by_name:
             raise KeyError(f"未知参数: {name}")
         return self.params_by_name[name]
-
-    def get_control_params(self) -> List[dict]:
-        return list(self.control_params)
-
-    def get_control_names(self) -> List[str]:
-        return [param["name"] for param in self.control_params]
-
-    def get_control_indices(self) -> List[int]:
-        return [param["index"] for param in self.control_params]
 
     def get_discrete_index_value_map(self) -> dict[int, List[float]]:
         return {
@@ -175,20 +122,11 @@ class ParamManager:
     def get_control_trainable_indices(self) -> List[int]:
         return [param["index"] for param in self.control_trainable_params]
 
-    def get_fixed_control_params(self) -> List[dict]:
-        return list(self.control_fixed_params)
-
     def get_fixed_control_names(self) -> List[str]:
         return [param["name"] for param in self.control_fixed_params]
 
-    def get_fixed_control_indices(self) -> List[int]:
-        return [param["index"] for param in self.control_fixed_params]
-
     def get_sampling_rules(self) -> dict:
         return self.sampling_rules
-
-    def get_default_value(self, name: str) -> float:
-        return float(self.get_param(name)["default"])
 
     def get_default_values(self, params: List[dict]) -> List[float]:
         return [float(param["default"]) for param in params]

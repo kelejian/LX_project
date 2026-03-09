@@ -54,18 +54,31 @@ class ConstraintEngine:
 
         self._build_rule_caches()
 
+    @staticmethod
+    def _parse_side_ot_rule_key(rule_name: str, key: str) -> Tuple[int, int]:
+        """解析形如 "side_ot" 的规则键。
+
+        seat_constraints 和 ra_values 都以 `(is_driver_side, OT)` 作为索引。
+        这里统一解析并在格式不符时立即报错，避免配置拼写错误被静默跳过，
+        进而让某些组合在运行期悄悄失去约束。
+        """
+        try:
+            side_text, ot_text = key.split("_")
+            return int(side_text), int(ot_text)
+        except ValueError as exc:
+            raise ValueError(f"{rule_name} 存在非法键 {key!r}，应为 'is_driver_side_OT' 形式") from exc
+
     def _build_rule_caches(self) -> None:
+        # 这里在初始化阶段把 YAML 规则转成运行期缓存，而不是在每个 batch 里现解析，
+        # 目的是把配置错误尽早暴露，并减少高频推理时的字符串处理和 numpy 构造开销。
         self.seat_cache: Dict[Tuple[int, int], Dict[str, object]] = {}
         for key, points in (self.rules.get("seat_constraints", {}) or {}).items():
-            try:
-                side_text, ot_text = key.split("_")
-                side = int(side_text)
-                ot = int(ot_text)
-            except Exception:
-                continue
+            side, ot = self._parse_side_ot_rule_key("seat_constraints", key)
             polygon = np.asarray(points, dtype=np.float32)
-            if polygon.ndim != 2 or polygon.shape[1] != 2:
-                continue
+            if polygon.ndim != 2 or polygon.shape[1] != 2 or polygon.shape[0] < 3:
+                raise ValueError(
+                    f"seat_constraints[{key!r}] 必须是至少包含 3 个 [SP, SH] 点的二维多边形，实际形状为 {polygon.shape}"
+                )
             sp_min, sh_min = np.min(polygon, axis=0)
             sp_max, sh_max = np.max(polygon, axis=0)
             self.seat_cache[(side, ot)] = {
@@ -76,15 +89,10 @@ class ConstraintEngine:
 
         self.ra_cache: Dict[Tuple[int, int], torch.Tensor] = {}
         for key, values in (self.rules.get("ra_values", {}) or {}).items():
-            try:
-                side_text, ot_text = key.split("_")
-                side = int(side_text)
-                ot = int(ot_text)
-            except Exception:
-                continue
+            side, ot = self._parse_side_ot_rule_key("ra_values", key)
             arr = np.asarray(values, dtype=np.float32).reshape(-1)
             if arr.size == 0:
-                continue
+                raise ValueError(f"ra_values[{key!r}] 不能为空")
             self.ra_cache[(side, ot)] = torch.tensor(arr, dtype=torch.float32)
 
     @staticmethod
@@ -148,6 +156,15 @@ class ConstraintEngine:
         return self.split_from_full(full)
 
     def sanitize_full_features(self, full_features: torch.Tensor, apply_control_couplings: bool = True) -> torch.Tensor:
+        """对完整特征做最终硬合法化。
+
+        顺序固定为：
+        1. 先把离散值和连续边界拉回基础定义域；
+        2. 再处理 overlap、角度和 control 耦合等跨变量规则；
+        3. 最后应用 RA/座椅等依赖 `(side, OT)` 的条件规则，并再收一次连续边界。
+
+        这样写是为了避免后面的条件修正把前面的边界重新推坏，保证所有入口都得到同一套终态定义。
+        """
         full_features = self._ensure_2d(full_features, self.total_dim, "full_features")
         x = full_features.clone()
         self._clamp_discrete(x)

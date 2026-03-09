@@ -559,6 +559,15 @@ def _build_eval_info(
     }
 
 
+def _prepare_output_paths(base_dir: Path, input_csv: Optional[str], output_csv: str) -> tuple[Path, Path]:
+    """在所有前置校验完成后再创建评估输出目录。
+
+    这样当策略权重缺失、输入文件非法或配置不满足要求时，不会提前留下空的 saved_eval 子目录。
+    """
+    output_dir = _build_output_dir(base_dir, input_csv)
+    return output_dir, output_dir / Path(output_csv).name
+
+
 def main():
     args = parse_args()
     base_dir = Path(__file__).resolve().parent
@@ -575,8 +584,6 @@ def main():
         config["optimization"]["direct_inference"] = True
 
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
-    output_dir = _build_output_dir(base_dir, args.input_csv)
-    output_csv_path = output_dir / Path(args.output_csv).name
 
     param_manager = ParamManager(param_space_path)
     constraint_engine = ConstraintEngine(param_manager)
@@ -666,6 +673,7 @@ def main():
         truth_arrays=truth_arrays,
         trainable_names=trainable_names,
     )
+    output_dir, output_csv_path = _prepare_output_paths(base_dir, args.input_csv, args.output_csv)
     result_df.to_csv(str(output_csv_path), index=False)
     opt1_generated = stage_outputs["Opt1"]["preds"] is not None
     opt2_generated = stage_outputs["Opt2"]["preds"] is not None

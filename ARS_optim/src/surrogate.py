@@ -108,6 +108,12 @@ class SurrogateAdapter(nn.Module):
             self.distribution_penalty.fit(reference_features)
 
     def _prepare_normalized_inputs(self, context_params: torch.Tensor, control_trainable: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """把 context/trainable 重新拼成完整特征，并映射到代理模型需要的归一化空间。
+
+        PulsePredict 和 InjuryPredict 依赖的是全量 FEATURE_ORDER 输入；
+        ARS_optim 内部为了拆清职责，常常把 context 与 trainable 分开传递。
+        因此这里集中做一次“物理空间拼接 -> 统一归一化”，避免每个调用点重复维护同样的列对齐逻辑。
+        """
         combined_phys = self.constraint_engine.compose_full_features(context_params, control_trainable)
         model_input_norm = self.data_processor.process_by_name(
             values=combined_phys,
@@ -117,6 +123,8 @@ class SurrogateAdapter(nn.Module):
         return combined_phys, model_input_norm
 
     def predict_injury_and_loss(self, context_params: torch.Tensor, control_trainable: torch.Tensor, pulse_norm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        # 这里返回逐样本 loss 而不是 batch mean，原因是局部精调和评估表都需要保留样本粒度；
+        # batch 聚合只在更外层训练循环里完成，避免优化器和评估脚本各自再拆一次总损失。
         combined_phys, model_input_norm = self._prepare_normalized_inputs(context_params, control_trainable)
         x_att_continuous = model_input_norm[:, CONTINUOUS_INDICES]
         x_att_discrete = model_input_norm[:, DISCRETE_INDICES].to(torch.long)

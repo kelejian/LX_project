@@ -33,7 +33,12 @@ def build_strategy_net_from_config(
 
 
 class StrategyNet(nn.Module):
-    """策略网络：context + pulse -> trainable controls。"""
+    """策略网络：context + pulse -> trainable controls。
+
+    这个模块只负责学习“给定工况时应该往哪个控制量方向调”。
+    约束处理仍交给 ConstraintEngine，原因是同一套合法化规则还要被训练采样、
+    评估 CSV、局部精调共同复用；若把规则散落到网络内部，训练端和评估端很容易逐渐偏离。
+    """
 
     def __init__(
         self,
@@ -115,6 +120,9 @@ class StrategyNet(nn.Module):
             out_layer.bias.copy_(torch.log(ratio / (1.0 - ratio)))
 
     def _normalize_context(self, context_features: torch.Tensor) -> torch.Tensor:
+        # context_features 的列顺序来自 ParamManager，而不是 data_processor 内部的固定顺序。
+        # 这里按名称归一化，目的是把“特征顺序由谁定义”收敛到 ParamManager 一处，
+        # 避免后续参数角色调整时因为列顺序假设失效而产生隐蔽错误。
         return self.data_processor.process_by_name(context_features, self.context_names, inverse=False)
 
     def _decode_actions_from_logits(self, raw_output: torch.Tensor, context_features: torch.Tensor) -> torch.Tensor:
@@ -133,6 +141,8 @@ class StrategyNet(nn.Module):
         return self.constraint_engine.project_forward(actions, context_features)
 
     def forward(self, context_features: torch.Tensor, pulse_features: torch.Tensor) -> torch.Tensor:
+        # pulse 只作为工况补充信息编码进策略，不在这里重复生成，
+        # 这样训练、验证和评估都可以复用同一份 pulse，避免同批样本重复跑代理前端。
         pulse_embed = self.pulse_encoder(pulse_features)
         context_norm = self._normalize_context(context_features)
         combined = torch.cat([context_norm, pulse_embed], dim=1)

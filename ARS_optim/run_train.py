@@ -229,6 +229,7 @@ def main():
 
     optimizer = optim.Adam(strategy_net.parameters(), lr=train_cfg["lr"], weight_decay=train_cfg["weight_decay"])
     scheduler = _build_scheduler(optimizer, train_cfg, train_cfg["max_iterations"])
+    val_batch_size = int(train_cfg.get("val_batch_size", 1024))
 
     train_sampler = StateDataSampler(
         param_manager=param_manager,
@@ -243,7 +244,7 @@ def main():
     val_sampler = StateDataSampler(
         param_manager=param_manager,
         constraint_engine=constraint_engine,
-        batch_size=int(train_cfg.get("val_batch_size", 1024)),
+        batch_size=val_batch_size,
         device=device,
         seed=seed,
         split_indices_path=str(SPLIT_INDICES_DIR / "injury_val_indices.npy"),
@@ -285,6 +286,12 @@ def main():
     ema_train_loss: Optional[float] = None
 
     def evaluate_full_val() -> tuple[float, float, float, float]:
+        """在 injury_val 全量样本上做一次无扰动评估。
+
+        训练阶段使用无限采样流，不存在自然 epoch；
+        因此验证不能直接复用训练 batch，而要显式遍历固定的 injury_val 切片，
+        才能让不同迭代点的验证指标具有可比性。
+        """
         strategy_net.eval()
         total_loss = 0.0
         total_risk = 0.0
@@ -292,7 +299,7 @@ def main():
         total_distribution = 0.0
         sample_count = 0
         with torch.no_grad():
-            for batch_context in val_sampler.iter_dataset_batches(batch_size=int(train_cfg.get("val_batch_size", 1024)), shuffle=False):
+            for batch_context in val_sampler.iter_dataset_batches(batch_size=val_batch_size, shuffle=False):
                 loss_batch, info = _evaluate_strategy_batch(strategy_net, surrogate, batch_context)
                 total_loss += float(loss_batch.sum().item())
                 total_risk += float(info["loss_risk"].sum().item())
@@ -311,7 +318,6 @@ def main():
 
     log_interval = int(train_cfg.get("log_interval", 10))
     val_interval = int(train_cfg.get("val_interval", 500))
-    val_batch_size = int(train_cfg.get("val_batch_size", 1024))
     grad_clip = float(train_cfg.get("gradient_clip_max_norm", 1.0))
     save_best = bool(train_cfg.get("save_best", True))
     save_last = bool(train_cfg.get("save_last", True))
@@ -341,6 +347,8 @@ def main():
 
             ema_train_loss = loss_value if ema_train_loss is None else ema_alpha * ema_train_loss + (1.0 - ema_alpha) * loss_value
             train_select_metric = ema_train_loss if ema_enabled else loss_value
+            # 训练最优权重默认按 EMA 指标挑选，是为了弱化随机采样流带来的单步抖动；
+            # 但在 warmup 结束前 EMA 还没有稳定含义，因此这段区间不更新 train_best。
             ema_ready = (iter_idx + 1) >= max(1, ema_warmup_iters) if ema_enabled else True
 
             if writer is not None:

@@ -117,12 +117,6 @@ class StateDataSampler:
         while True:
             yield self._generate_batch()
 
-    def get_dataset_tensor(self) -> torch.Tensor:
-        return self.pool_context
-
-    def get_dataset_size(self) -> int:
-        return int(self.pool_size)
-
     def get_source_info(self) -> dict:
         """返回当前采样器的数据流元信息。
 
