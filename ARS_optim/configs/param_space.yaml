@@ -5,13 +5,14 @@
 # 严格按照 common.settings.FEATURE_ORDER 顺序定义 (0-12)
 # role: control(执行机构) / state(不可控工况)
 # trainable: True(参与梯度寻优) / False(当前阶段固定)
+# min/max: 对于状态参数是取值范围（和params_constraint.md中一致，是数据集覆盖的范围）；对于控制参数是优化边界（规定了可调范围，是数据集覆盖范围的子集！）
 # 语义约定：
 # - context = state + trainable=False 的 control
 # - 这类固定 control 仍然保留 role=control，不会被降格为 state；未来只需修改 trainable 即可重新纳入优化变量
 # - 任何未由调用方显式覆盖的特征位置，都统一回退到这里的 default
 # ---------------------------------------------------------
 parameters:
-  # --- 1. 连续型状态参数 (State) ---
+  # --- 连续型状态参数 (State) ---
   - name: "impact_velocity"
     index: 0
     role: "state"
@@ -32,17 +33,17 @@ parameters:
     index: 2
     role: "state"
     type: "continuous"
-    min: -1.0
+    min: -0.99
     max: 1.0
     default: 1.0
 
-  # --- 2. 连续型控制参数 (Control) ---
+  # --- 连续型控制参数 (Control) ---
   - name: "LL1"
     index: 3
     role: "control"
     type: "continuous"
     min: 1.0  
-    max: 7.0  
+    max: 4.5  
     trainable: False
     default: 2.5
 
@@ -51,7 +52,7 @@ parameters:
     role: "control"
     type: "continuous"
     min: 0.5  
-    max: 4.5  
+    max: 2.7  
     trainable: False
     default: 2.5
 
@@ -61,7 +62,7 @@ parameters:
     type: "continuous"
     min: 10.0 
     max: 100.0
-    trainable: True # trainable=True 时参与摊销优化与在线精调
+    trainable: True # trainable=True 时参与摊销优化与局部精调
     default: 20.0
 
   - name: "LLATTF"
@@ -82,7 +83,6 @@ parameters:
     trainable: True
     default: 20.0
 
-  # --- 3. 座椅参数（control） ---
   - name: "SP"
     index: 8
     role: "control"
@@ -96,7 +96,7 @@ parameters:
     index: 9
     role: "control"
     type: "continuous"
-    min: 0.0
+    min: -3.3
     max: 60.0
     trainable: True
     default: 0.0
@@ -110,7 +110,7 @@ parameters:
     trainable: True
     default: 25.0
 
-  # --- 4. 离散型状态参数 (State) ---
+  # --- 离散型状态参数 (State) ---
   - name: "is_driver_side"
     index: 11
     role: "state"
@@ -126,7 +126,7 @@ parameters:
     default: 2 # 1=5th，2=50th，3=95th
 
 # ---------------------------------------------------------
-# 采样/约束规则集中配置（与 step0_params_sample_1220.py 保持一致）
+# 采样/约束规则集中配置
 # ---------------------------------------------------------
 sampling_rules:
   coupling:
@@ -136,9 +136,6 @@ sampling_rules:
     epsilon: 0.001
 
   overlap:
-    special_abs_high: 0.99
-    special_abs_low: 0.02
-    force_to: 1.0
     domain:
       negative: [-1.0, -0.25]
       positive: [0.25, 1.0]
@@ -160,7 +157,7 @@ sampling_rules:
   seat_constraints:
     "1_1": [[40, 0], [110, 5.5], [110, 60], [80, 60], [80, 30], [40, 30]]
     "1_2": [[-40, -2.222222], [60, 3.333333], [60, 60], [-40, 60]]
-    "1_3": [[-60, -3.333333], [30, 1.666667], [30, 60], [-60, 60]]
+    "1_3": [[-60, -3.333333], [30, 1.666666], [30, 60], [-60, 60]]
     "0_1": [[-110, 0], [110, 0], [110, 0], [-110, 0]]
     "0_2": [[-110, 0], [110, 0], [110, 0], [-110, 0]]
     "0_3": [[-110, 0], [49, 0], [49, 0], [-110, 0]]

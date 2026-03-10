@@ -109,7 +109,7 @@ class StateDataSampler:
     def _generate_batch(self) -> torch.Tensor:
         indices = torch.randint(0, self.pool_size, (self.batch_size,), generator=self.rng, device=self.device)
         batch_context = self.pool_context[indices].clone()
-        # 先对经验池样本做轻微连续扰动，再统一送入约束引擎净化。这样既能保持训练数据流接近真实边际分布，又能确保扰动后的 RA/座椅参数/碰撞工况重新落回 step0 定义的可行域中。
+        # 先对经验池样本做轻微连续扰动，再统一送入约束引擎净化。这样既能保持训练数据流接近真实边际分布，又能确保扰动后的 RA/座椅参数/碰撞工况重新落回可行域中。
         batch_context = self._apply_bounded_jitter(batch_context)
         return self.constraint_engine.sanitize_context(batch_context)
 

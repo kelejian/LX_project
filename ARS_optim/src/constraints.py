@@ -59,8 +59,7 @@ class ConstraintEngine:
         """解析形如 "side_ot" 的规则键。
 
         seat_constraints 和 ra_values 都以 `(is_driver_side, OT)` 作为索引。
-        这里统一解析并在格式不符时立即报错，避免配置拼写错误被静默跳过，
-        进而让某些组合在运行期悄悄失去约束。
+        这里统一解析并在格式不符时立即报错，避免配置拼写错误被静默跳过，进而让某些组合在运行期悄悄失去约束。
         """
         try:
             side_text, ot_text = key.split("_")
@@ -69,8 +68,7 @@ class ConstraintEngine:
             raise ValueError(f"{rule_name} 存在非法键 {key!r}，应为 'is_driver_side_OT' 形式") from exc
 
     def _build_rule_caches(self) -> None:
-        # 这里在初始化阶段把 YAML 规则转成运行期缓存，而不是在每个 batch 里现解析，
-        # 目的是把配置错误尽早暴露，并减少高频推理时的字符串处理和 numpy 构造开销。
+        # 这里在初始化阶段把 YAML 规则转成运行期缓存，而不是在每个 batch 里现解析，目的是把配置错误尽早暴露，并减少高频推理时的字符串处理和 numpy 构造开销。
         self.seat_cache: Dict[Tuple[int, int], Dict[str, object]] = {}
         for key, points in (self.rules.get("seat_constraints", {}) or {}).items():
             side, ot = self._parse_side_ot_rule_key("seat_constraints", key)
@@ -100,8 +98,7 @@ class ConstraintEngine:
         """将多边形外部点投影到最近的边界点上。
 
         这里使用边段投影而不是“最近顶点吸附”，原因是座椅可行域本质上是二维连续区域。
-        若只吸附到顶点，很多明明应该落到边上的样本会被额外推向角点，既偏离 step0 的几何语义，
-        也会在人为制造局部聚集。边界投影仍然足够简单，不会引入额外的复杂依赖。
+        若只吸附到顶点，很多明明应该落到边上的样本会被额外推向角点，会在人为制造局部聚集。
         """
         edge_start = polygon
         edge_end = np.roll(polygon, shift=-1, axis=0)
@@ -198,7 +195,7 @@ class ConstraintEngine:
             cols[self.trainable_names["AFT"]] = torch.min(aft, btf + self.aft_btf_delta_max - self.epsilon)
         # 当 BTF 未来改为 trainable 时，AFT 仍可能由其他路径固定给定；
         # 这里补上对称投影，把 BTF 拉回满足 BTF >= AFT - 25 + epsilon 的下界。
-        # 若 AFT 与 BTF 同时可训练，则沿用 step0 的优先语义，只投影被约束方 AFT。
+        # 若 AFT 与 BTF 同时可训练，只投影被约束方 AFT。
         if "BTF" in self.trainable_names and "AFT" not in self.trainable_names:
             cols[self.trainable_names["BTF"]] = torch.max(btf, aft - self.aft_btf_delta_max + self.epsilon)
 
@@ -218,7 +215,7 @@ class ConstraintEngine:
         if "LL2" in self.trainable_names:
             cols[self.trainable_names["LL2"]] = torch.min(ll2, ll1 + self.ll2_ll1_delta_max)
         # LL1 若未来改为 trainable，而 LL2 保持固定/不可训练，则需要把 LL1 投影回
-        # 满足 LL1 >= LL2 的下界。若二者同时可训练，仍遵循 step0 语义，仅调被约束方 LL2。
+        # 满足 LL1 >= LL2 的下界。若二者同时可训练，仅调被约束方 LL2。
         if "LL1" in self.trainable_names and "LL2" not in self.trainable_names:
             cols[self.trainable_names["LL1"]] = torch.max(ll1, ll2 - self.ll2_ll1_delta_max)
 
@@ -317,15 +314,9 @@ class ConstraintEngine:
         overlap_cfg = self.rules.get("overlap", {})
         overlap = x[:, overlap_idx]
 
-        special_abs_high = float(overlap_cfg.get("special_abs_high", 0.99))
-        special_abs_low = float(overlap_cfg.get("special_abs_low", 0.02))
-        force_to = float(overlap_cfg.get("force_to", 1.0))
         neg_min, neg_max = map(float, overlap_cfg.get("domain", {}).get("negative", [-1.0, -0.25]))
         pos_min, pos_max = map(float, overlap_cfg.get("domain", {}).get("positive", [0.25, 1.0]))
 
-        # step0 里把接近 0 或接近 ±100% 的重叠率统一折算为 100%，其工程含义是：这两类边界值在采样和后续仿真里都更接近“完全正碰”这一稳定工况，若保留极小正值/负值，反而会把样本推到 overlap 禁区附近，造成不合理碰撞输入。
-        special_mask = (overlap.abs() > special_abs_high) | (overlap.abs() < special_abs_low)
-        overlap = torch.where(special_mask, torch.full_like(overlap, force_to), overlap)
         gap_mask = overlap.abs() < pos_min
         sign = torch.where(overlap >= 0.0, torch.ones_like(overlap), -torch.ones_like(overlap))
         overlap = torch.where(gap_mask, sign * pos_min, overlap)
@@ -346,7 +337,7 @@ class ConstraintEngine:
         abs_min = float(rule.get("overlap_abs_min", 0.25))
         abs_max = float(rule.get("overlap_abs_max", 0.3))
         angle_abs_min = float(rule.get("angle_abs_min", 30.0))
-        # 当 |overlap| 落在 0.25~0.3 的窄区间时，step0 会强制碰撞角度与重叠率异号且绝对值足够大。这是为了排除“小重叠但近似正碰”的不合理组合：此时若角度太小，同侧擦碰与重叠率设定会互相矛盾。
+        # 当 |overlap| 落在 0.25~0.3 的窄区间时，强制碰撞角度与重叠率异号且绝对值足够大。这是为了排除“小重叠但近似正碰”的不合理组合：此时若角度太小，同侧擦碰与重叠率设定会互相矛盾。
         trigger = (overlap.abs() >= abs_min) & (overlap.abs() < abs_max)
         if not trigger.any():
             return

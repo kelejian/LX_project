@@ -1,11 +1,37 @@
-ARS.md
-check_raw_packed_consistency.py
-# data/raw_packed/
-# data/split_indices/
+# Project-wide ignores
+
 data/processed/
 data/inference_outputs/
+# data/raw_packed/
+# data/split_indices/
 .vscode/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+# ARS_Pipeline.md
+# params_constraint.md
+
+# ========================
+# ARS_optim specific rules
+# ========================
+ARS_optim/saved_models/
+ARS_optim/saved_eval/
+
+# ===========================
+# InjuryPredict specific rules
+# ===========================
+# 数据文件夹
+InjuryPredict/runs/
+InjuryPredict/model_computation_graph
+InjuryPredict/model_computation_graph.png
+InjuryPredict/*.onnx
+# =============================
+# PulsePredict specific rules
+# =============================
+PulsePredict/saved/
+PulsePredict/model_computation_graph
+PulsePredict/model_computation_graph.png
+PulsePredict/*.onnx
+
+
