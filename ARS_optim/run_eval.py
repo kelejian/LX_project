@@ -200,14 +200,6 @@ def _prepare_eval_inputs(
     return context_df, baseline_df, missing_context, missing_trainable
 
 
-def _choose_report_stage(stage_outputs: Dict[str, object]) -> str:
-    if stage_outputs["Opt2"]["preds"] is not None:
-        return "Opt2"
-    if stage_outputs["Opt1"]["preds"] is not None:
-        return "Opt1"
-    raise ValueError("当前配置下未生成任何优化阶段结果，无法组织评估输出")
-
-
 def _fit_distribution_reference_if_needed(surrogate: SurrogateAdapter, sampler: StateDataSampler, param_manager: ParamManager, config: dict) -> None:
     if not surrogate.distribution_penalty.enabled:
         return
@@ -400,7 +392,12 @@ def _build_result_dataframe(
     frame_parts = [metadata_df, context_df.reset_index(drop=True)]
 
     ot_array = context_df["OT"].to_numpy(dtype=np.float32)
-    optimized_stage_name = _choose_report_stage(stage_outputs)
+    if stage_outputs["Opt2"]["preds"] is not None:
+        optimized_stage_name = "Opt2"
+    elif stage_outputs["Opt1"]["preds"] is not None:
+        optimized_stage_name = "Opt1"
+    else:
+        raise ValueError("当前配置下未生成任何优化阶段结果，无法组织评估输出")
     optimized_stage = stage_outputs[optimized_stage_name]
 
     baseline_df = baseline_df.reset_index(drop=True).rename(columns={name: f"Base_{name}" for name in trainable_names})
@@ -492,10 +489,9 @@ def _build_eval_info(
     args,
     output_dir: Path,
     output_csv_path: Path,
+    config_snapshots: Dict[str, str],
     input_source: Dict[str, str],
     strategy_ckpt_path: Optional[Path],
-    cfg_path: Path,
-    param_space_path: Path,
     config: dict,
     param_manager: ParamManager,
     context_names: List[str],
@@ -517,7 +513,7 @@ def _build_eval_info(
         "input_source": input_source,
         "strategy_checkpoint_path": str(strategy_ckpt_path) if strategy_ckpt_path is not None else None,
         "direct_inference": bool(config.get("optimization", {}).get("direct_inference", False)),
-        "config_files": _copy_config_snapshots(cfg_path, param_space_path, output_dir),
+        "config_files": config_snapshots,
         "evaluation_config": config.get("evaluation", {}),
         "optimization_config": config.get("optimization", {}),
         "parameter_roles": {
@@ -557,15 +553,6 @@ def _build_eval_info(
             "trajectory_steps_logged": len(stage_outputs["trajectory_all"]),
         },
     }
-
-
-def _prepare_output_paths(base_dir: Path, input_csv: Optional[str], output_csv: str) -> tuple[Path, Path]:
-    """在所有前置校验完成后再创建评估输出目录。
-
-    这样当策略权重缺失、输入文件非法或配置不满足要求时，不会提前留下空的 saved_eval 子目录。
-    """
-    output_dir = _build_output_dir(base_dir, input_csv)
-    return output_dir, output_dir / Path(output_csv).name
 
 
 def main():
@@ -673,7 +660,10 @@ def main():
         truth_arrays=truth_arrays,
         trainable_names=trainable_names,
     )
-    output_dir, output_csv_path = _prepare_output_paths(base_dir, args.input_csv, args.output_csv)
+    # 在所有前置校验和模型推理都完成后再创建输出目录，避免早退时留下空目录。
+    output_dir = _build_output_dir(base_dir, args.input_csv)
+    output_csv_path = output_dir / Path(args.output_csv).name
+    config_snapshots = _copy_config_snapshots(cfg_path, param_space_path, output_dir)
     result_df.to_csv(str(output_csv_path), index=False)
     opt1_generated = stage_outputs["Opt1"]["preds"] is not None
     opt2_generated = stage_outputs["Opt2"]["preds"] is not None
@@ -682,10 +672,9 @@ def main():
         args=args,
         output_dir=output_dir,
         output_csv_path=output_csv_path,
+        config_snapshots=config_snapshots,
         input_source=input_source,
         strategy_ckpt_path=strategy_ckpt_path,
-        cfg_path=cfg_path,
-        param_space_path=param_space_path,
         config=config,
         param_manager=param_manager,
         context_names=context_names,

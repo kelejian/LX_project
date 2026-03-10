@@ -137,6 +137,9 @@ class StateDataSampler:
         }
 
     def get_distribution_reference(self, max_samples: int = 0, shuffle: bool = False, feature_space: str = "context", trainable_indices: Optional[list] = None) -> torch.Tensor:
+        # feature_space="context" 时，仅返回经验池中的 context 列，用于度量工况分布偏离。
+        # feature_space="context_control" 时，返回 [context | trainable_control] 的拼接矩阵；
+        # 其中 trainable_control 部分直接取自经验池原始样本中的对应控制参数列，而不是 default 值或策略网络输出。
         if feature_space == "context":
             ref = self.pool_context
         elif feature_space == "context_control":

@@ -226,7 +226,7 @@ def test_model(
     test_inference_speed=True,
     num_warmup=10,
     num_iterations=100,
-    print_flops_per_layer=False  # 新增参数：是否打印每层 FLOPs
+    print_flops_per_layer=False  # 是否打印每层 FLOPs
 ):
     """
     通用化模型测试函数：

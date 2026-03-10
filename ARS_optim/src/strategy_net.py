@@ -123,6 +123,9 @@ class StrategyNet(nn.Module):
         # context_features 的列顺序来自 ParamManager，而不是 data_processor 内部的固定顺序。
         # 这里按名称归一化，目的是把“特征顺序由谁定义”收敛到 ParamManager 一处，
         # 避免后续参数角色调整时因为列顺序假设失效而产生隐蔽错误。
+        # 其中 is_driver_side / OT 会被 process_by_name 映射为整数类别编码，并直接作为标量输入 MLP。
+        # 这与 InjuryPredictModel 为离散变量单独做 Embedding 的设计不同：策略网络这里只需要一个轻量决策器，
+        # 而 OT 本身又带有明确的序数语义（5th < 50th < 95th），因此标量编码已经足够让 MLP 学到体型趋势。
         return self.data_processor.process_by_name(context_features, self.context_names, inverse=False)
 
     def _decode_actions_from_logits(self, raw_output: torch.Tensor, context_features: torch.Tensor) -> torch.Tensor:

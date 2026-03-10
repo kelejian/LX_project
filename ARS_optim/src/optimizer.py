@@ -15,7 +15,7 @@ class LocalRefiner:
     评估阶段固定区分三层语义：
     - Base: 输入给定或 default 的 baseline；
     - Opt1: 仅当 direct_inference=True 时，记录策略网络直推结果；
-    - Opt2: 仅当 refine_steps>0 时，记录局部精调结果。
+    - Opt2: 仅当 refine_steps>0 时，记录局部精调结果。局部精调属于逐点优化。
 
     这里把“局部精调从哪里起步”和“哪些结果对外写出”分开处理：
     内部迭代可以从 default 或策略网络输出出发，但结果表只写入上面这三种已定义阶段，
@@ -128,6 +128,10 @@ class LocalRefiner:
                 control_trainable=opt_var,
                 pulse_norm=pulse_norm,
             )
+            # 这里对 batch 内逐样本 loss 取 mean，不会把逐点优化错误地变成分布级优化：
+            # surrogate 不存在跨样本耦合，因此第 i 个样本的梯度仍只依赖第 i 个样本自身，
+            # 即 d(loss_mean)/d(opt_var[i]) = (1/N) * d(loss_i)/d(opt_var[i])。
+            # 这个 1/N 只是常数缩放，会被 Adam 的自适应步长吸收。
             loss_mean = loss_batch.mean()
             loss_mean.backward()
             optimizer.step()

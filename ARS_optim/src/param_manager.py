@@ -9,12 +9,8 @@ from common.settings import FEATURE_ORDER
 
 class ParamManager:
     """管理 ARS_optim 的参数定义与默认值。
-
-    这里只保留两类职责：
     1. 读取并校验 param_space.yaml 中真正影响运行的参数定义；
     2. 向训练、评估和约束模块提供统一的索引、默认值与角色划分。
-
-    不在这里额外引入与运行主链路无关的配置比对或兼容逻辑，避免参数层继续膨胀。
     """
 
     def __init__(self, param_space_path_or_dict: Union[str, Path, dict]):
@@ -36,6 +32,13 @@ class ParamManager:
         ]
 
         self.params_by_name = {param["name"]: param for param in self.all_params}
+        self.context_params = sorted(self.state_params + self.control_fixed_params, key=lambda item: item["index"])
+        self.context_indices = [param["index"] for param in self.context_params]
+        self.context_names = [param["name"] for param in self.context_params]
+        self.trainable_names = [param["name"] for param in self.control_trainable_params]
+        self.trainable_indices = [param["index"] for param in self.control_trainable_params]
+        self.fixed_control_names = [param["name"] for param in self.control_fixed_params]
+        self.default_feature_values = [float(param["default"]) for param in self.all_params]
 
         self._validate_feature_order()
 
@@ -98,17 +101,16 @@ class ParamManager:
         }
 
     def get_context_params(self) -> List[dict]:
-        params = self.state_params + self.control_fixed_params
-        return sorted(params, key=lambda item: item["index"])
+        return list(self.context_params)
 
     def get_context_dim(self) -> int:
-        return len(self.get_context_params())
+        return len(self.context_params)
 
     def get_context_indices(self) -> List[int]:
-        return [param["index"] for param in self.get_context_params()]
+        return list(self.context_indices)
 
     def get_context_names(self) -> List[str]:
-        return [param["name"] for param in self.get_context_params()]
+        return list(self.context_names)
 
     def get_trainable_dim(self) -> int:
         return len(self.control_trainable_params)
@@ -117,13 +119,13 @@ class ParamManager:
         return list(self.control_trainable_params)
 
     def get_trainable_names(self) -> List[str]:
-        return [param["name"] for param in self.control_trainable_params]
+        return list(self.trainable_names)
 
     def get_control_trainable_indices(self) -> List[int]:
-        return [param["index"] for param in self.control_trainable_params]
+        return list(self.trainable_indices)
 
     def get_fixed_control_names(self) -> List[str]:
-        return [param["name"] for param in self.control_fixed_params]
+        return list(self.fixed_control_names)
 
     def get_sampling_rules(self) -> dict:
         return self.sampling_rules
@@ -144,8 +146,7 @@ class ParamManager:
         return torch.tensor(defaults, dtype=torch.float32, device=device)
 
     def get_default_feature_vector(self, device: torch.device = torch.device("cpu")) -> torch.Tensor:
-        defaults = [float(param["default"]) for param in self.all_params]
-        return torch.tensor(defaults, dtype=torch.float32, device=device)
+        return torch.tensor(self.default_feature_values, dtype=torch.float32, device=device)
 
     def get_default_feature_matrix(self, batch_size: int, device: torch.device = torch.device("cpu")) -> torch.Tensor:
         base = self.get_default_feature_vector(device=device)
