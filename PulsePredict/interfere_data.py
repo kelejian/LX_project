@@ -602,7 +602,7 @@ def main():
             )
     logger.info(f"波形绘图完成,共绘制 {plot_count} 张图片。保存在 {run_root_dir}/fig 目录下。")
 
-    # <--- 新增: 组合波形绘图 --->
+    # <--- 组合波形绘图 --->
     if COMBINED_PLOT_CONFIG['enabled'] and COMBINED_PLOT_CONFIG['case_groups']:
         logger.info("正在绘制组合波形对比图...")
         

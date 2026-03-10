@@ -1,8 +1,14 @@
 numpy
-torch
 pandas
 scipy
 scikit-learn
+torch
 matplotlib
 joblib
 pyyaml
+tqdm
+seaborn
+optuna
+tensorboard
+tensorboardX
+ptflops

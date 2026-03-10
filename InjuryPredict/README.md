@@ -6,7 +6,9 @@
 ## 2. 目录概览
 ```
 InjuryPredict/
+├─ runs/                 # 训练输出目录（包含 checkpoints等）
 ├─ utils/                # 模型/损失/优化器实现
+├─ configs.py            # 模型/训练/评估参数配置
 ├─ Injurydata_prepare.py # 生成 data/processed/injury/*.pt（依赖根目录 prepare_data.py 的运行产物）
 ├─ train.py              # 单次训练入口
 ├─ train_KFold.py        # K-Fold 训练入口

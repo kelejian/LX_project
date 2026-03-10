@@ -139,9 +139,13 @@ class SurrogateAdapter(nn.Module):
         p_chest = torch.clamp(injury_risk.Injury_prob_cal_chest(dmax, OT=ot_tensor), 1e-6, 1.0 - 1e-6)
         p_neck = torch.clamp(injury_risk.Injury_prob_cal_neck(nij), 1e-6, 1.0 - 1e-6)
 
-        # 这里对应 ARS.md 步骤三中的联合损伤风险项。
-        # 头/胸/颈仍保持乘法结构，只允许通过指数权重调节三部分的相对重要性，
-        # 这样不会把“联合风险”改写成另一套完全不同的目标函数。
+        # loss_risk 是训练/精调时真正回传梯度的目标函数：
+        #   loss_risk = 1 - Π_k (1 - p_k)^{w_k}
+        # 其中 w_k 用来调节头/胸/颈三部分在优化时的相对重要性。
+        # joint_risk 则是无权重版本：
+        #   joint_risk = 1 - Π_k (1 - p_k)
+        # 它只作为评估报告与结果表中的统一指标，不参与额外加权。
+        # 当所有权重均为 1.0 时，loss_risk 与 joint_risk 在数值上完全相同。
         loss_risk = 1.0 - (
             torch.pow(1.0 - p_head, self.w_head)
             * torch.pow(1.0 - p_chest, self.w_chest)

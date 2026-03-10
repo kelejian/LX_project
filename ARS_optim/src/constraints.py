@@ -196,16 +196,31 @@ class ConstraintEngine:
         btf = self._get_param_col("BTF", cols, context_params, device)
         if "AFT" in self.trainable_names:
             cols[self.trainable_names["AFT"]] = torch.min(aft, btf + self.aft_btf_delta_max - self.epsilon)
+        # 当 BTF 未来改为 trainable 时，AFT 仍可能由其他路径固定给定；
+        # 这里补上对称投影，把 BTF 拉回满足 BTF >= AFT - 25 + epsilon 的下界。
+        # 若 AFT 与 BTF 同时可训练，则沿用 step0 的优先语义，只投影被约束方 AFT。
+        if "BTF" in self.trainable_names and "AFT" not in self.trainable_names:
+            cols[self.trainable_names["BTF"]] = torch.max(btf, aft - self.aft_btf_delta_max + self.epsilon)
 
         llattf = self._get_param_col("LLATTF", cols, context_params, device)
         btf = self._get_param_col("BTF", cols, context_params, device)
         if "LLATTF" in self.trainable_names:
             cols[self.trainable_names["LLATTF"]] = torch.max(llattf, btf + self.llattf_btf_delta_min)
+        # BTF 同时受 AFT 下界和 LLATTF 上界约束；这里按“先下界、后上界”的顺序
+        # 追加对称投影，使未来 BTF 可训练而 LLATTF 固定时仍能保持 LLATTF >= BTF。
+        # 若两者同时可训练，则仍只投影被约束方 LLATTF。
+        if "BTF" in self.trainable_names and "LLATTF" not in self.trainable_names:
+            btf_idx = self.trainable_names["BTF"]
+            cols[btf_idx] = torch.min(cols[btf_idx], llattf - self.llattf_btf_delta_min)
 
         ll1 = self._get_param_col("LL1", cols, context_params, device)
         ll2 = self._get_param_col("LL2", cols, context_params, device)
         if "LL2" in self.trainable_names:
             cols[self.trainable_names["LL2"]] = torch.min(ll2, ll1 + self.ll2_ll1_delta_max)
+        # LL1 若未来改为 trainable，而 LL2 保持固定/不可训练，则需要把 LL1 投影回
+        # 满足 LL1 >= LL2 的下界。若二者同时可训练，仍遵循 step0 语义，仅调被约束方 LL2。
+        if "LL1" in self.trainable_names and "LL2" not in self.trainable_names:
+            cols[self.trainable_names["LL1"]] = torch.max(ll1, ll2 - self.ll2_ll1_delta_max)
 
         if self.seat_cache and "is_driver_side" in self.context_names and "OT" in self.context_names:
             has_trainable_sp = "SP" in self.trainable_names
@@ -336,15 +351,11 @@ class ConstraintEngine:
         if not trigger.any():
             return
 
-        for segment in rule.get("angle_sampling", {}).get("positive_overlap", []):
-            if not isinstance(segment, (list, tuple)) or len(segment) != 4:
-                continue
-            o_min, o_max, a_min, a_max = map(float, segment)
-            mask = trigger & (overlap >= o_min) & (overlap <= o_max)
-            if mask.any():
-                angle[mask] = torch.clamp(angle[mask], a_min, a_max)
-
-        for segment in rule.get("angle_sampling", {}).get("negative_overlap", []):
+        angle_segments = (
+            list(rule.get("angle_sampling", {}).get("positive_overlap", []))
+            + list(rule.get("angle_sampling", {}).get("negative_overlap", []))
+        )
+        for segment in angle_segments:
             if not isinstance(segment, (list, tuple)) or len(segment) != 4:
                 continue
             o_min, o_max, a_min, a_max = map(float, segment)

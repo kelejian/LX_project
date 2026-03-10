@@ -153,6 +153,35 @@ def _evaluate_strategy_batch(
     return loss_batch, info
 
 
+def _run_gradient_sanity_check(
+    strategy_net,
+    surrogate: SurrogateAdapter,
+    context_params: torch.Tensor,
+) -> None:
+    """在正式训练前做一次轻量梯度流检查。"""
+    strategy_net.train()
+    strategy_net.zero_grad(set_to_none=True)
+    loss_batch, _ = _evaluate_strategy_batch(strategy_net, surrogate, context_params)
+    loss_mean = loss_batch.mean()
+    if torch.isnan(loss_mean) or torch.isinf(loss_mean):
+        raise RuntimeError("梯度流自检失败：sanity batch 的 loss 出现 NaN/Inf")
+    loss_mean.backward()
+
+    out_layer = strategy_net.mlp[-1]
+    if not isinstance(out_layer, torch.nn.Linear):
+        raise TypeError("梯度流自检失败：策略网络最后一层不是 Linear")
+
+    for name, param in {"weight": out_layer.weight, "bias": out_layer.bias}.items():
+        if param is None or param.grad is None:
+            raise RuntimeError(f"梯度流自检失败：输出层 {name} 梯度缺失")
+        if not torch.isfinite(param.grad).all():
+            raise RuntimeError(f"梯度流自检失败：输出层 {name} 梯度存在 NaN/Inf")
+        if float(param.grad.abs().max().item()) <= 0.0:
+            raise RuntimeError(f"梯度流自检失败：输出层 {name} 梯度全为 0")
+
+    strategy_net.zero_grad(set_to_none=True)
+
+
 def main():
     args = parse_args()
     base_dir = Path(__file__).resolve().parent
@@ -264,6 +293,10 @@ def main():
         )
         dist_ref_sample_count = int(ref_context.shape[0])
         surrogate.fit_distribution_reference(ref_context)
+
+    sanity_context = next(train_generator)
+    _run_gradient_sanity_check(strategy_net, surrogate, sanity_context)
+    logger.info("梯度流自检通过：策略网络输出层梯度存在且有限")
 
     tensorboard_enabled = bool(train_cfg.get("tensorboard", True))
 
