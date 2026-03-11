@@ -23,6 +23,7 @@ from common.tools.seeding import set_random_seed
 from InjuryPredict.utils import models
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.config import RUNS_DIR
+from InjuryPredict.utils.tools import get_mais_3c_metrics
 
 # --- 1. 配置区：请在此处设置您的路径 ---
 
@@ -341,6 +342,7 @@ def print_metrics_summary(df):
             ais_neck_pred = subset_df['AIS_neck_pred'].astype(int).values
             mais_true = subset_df['MAIS_true_raw'].astype(int).values
             mais_pred = subset_df['MAIS_pred'].astype(int).values
+            mais_metrics_3c = get_mais_3c_metrics(mais_true, mais_pred, context_hint=f"the {name} subset")
             
             # 计算准确率
             acc_head = accuracy_score(ais_head_true, ais_head_pred) * 100
@@ -356,7 +358,8 @@ def print_metrics_summary(df):
             print(f"    AIS Head Acc : {acc_head:.2f}%")
             print(f"    AIS Chest Acc: {acc_chest:.2f}%")
             print(f"    AIS Neck Acc : {acc_neck:.2f}%")
-            print(f"    MAIS Acc     : {acc_mais:.2f}%")
+            print(f"    MAIS Acc 6C  : {acc_mais:.2f}%")
+            print(f"    MAIS Acc 3C  : {mais_metrics_3c['accuracy']:.2f}%")
             print(f"    All AIS Correct: {all_correct_rate:.2f}% ({all_correct}/{len(subset_df)})")
             
         except Exception as e:

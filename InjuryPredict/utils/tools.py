@@ -7,6 +7,10 @@ from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_sco
 from InjuryPredict.config import AVAILABLE_VAL_METRIC_NAMES
 
 
+MAIS_3C_LABELS = [0, 1, 2]
+MAIS_3C_DISPLAY_LABELS = ['0', '1-2', '3+']
+
+
 def get_regression_metrics(y_true, y_pred):
     """计算并返回一组回归指标。"""
     return {
@@ -33,6 +37,22 @@ def get_classification_metrics(y_true, y_pred, labels, context_hint: str = "the 
             zero_division=0
         )
     }
+
+
+def convert_mais_to_3c(y):
+    """将 MAIS 0~5 映射到三分类: 0, 1-2, 3+。"""
+    y = np.asarray(y, dtype=np.int64)
+    return np.where(y <= 0, 0, np.where(y <= 2, 1, 2))
+
+
+def get_mais_3c_metrics(y_true, y_pred, context_hint: str = "the data"):
+    """基于 MAIS 原始分级计算三分类指标。"""
+    y_true_3c = convert_mais_to_3c(y_true)
+    y_pred_3c = convert_mais_to_3c(y_pred)
+    metrics = get_classification_metrics(y_true_3c, y_pred_3c, MAIS_3C_LABELS, context_hint=context_hint)
+    metrics['mapped_y_true'] = y_true_3c
+    metrics['mapped_y_pred'] = y_pred_3c
+    return metrics
 
 
 def plot_scatter(y_true, y_pred, ais_true, title, xlabel, save_path):

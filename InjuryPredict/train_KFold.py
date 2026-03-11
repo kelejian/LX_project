@@ -31,7 +31,7 @@ from InjuryPredict.utils import models
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.utils.weighted_loss import weighted_loss
 from InjuryPredict.utils.tools import get_parameter_groups, build_metric_trackers, round_float_fields, round_to_significant, convert_numpy_types
-from InjuryPredict.utils.tools import get_regression_metrics, get_classification_metrics, plot_scatter, plot_confusion_matrix
+from InjuryPredict.utils.tools import get_regression_metrics, get_classification_metrics, get_mais_3c_metrics, MAIS_3C_DISPLAY_LABELS, plot_scatter, plot_confusion_matrix
 from InjuryPredict.config import RUNS_DIR, training_params, loss_params, model_params, kfold_params
 
 def run_one_epoch(model, loader, criterion, device, optimizer=None):
@@ -87,6 +87,7 @@ def run_one_epoch(model, loader, criterion, device, optimizer=None):
     true_ais_head, true_ais_chest, true_ais_neck = np.concatenate(all_true_ais_head), np.concatenate(all_true_ais_chest), np.concatenate(all_true_ais_neck)
     true_mais = np.concatenate(all_true_mais)
     mais_pred = np.maximum.reduce([ais_head_pred, ais_chest_pred, ais_neck_pred])
+    mais_metrics_3c = get_mais_3c_metrics(true_mais, mais_pred, context_hint="the current epoch data")
     
     metrics = {
         'loss': avg_loss,
@@ -94,6 +95,7 @@ def run_one_epoch(model, loader, criterion, device, optimizer=None):
         'accu_chest': accuracy_score(true_ais_chest, ais_chest_pred) * 100,
         'accu_neck': accuracy_score(true_ais_neck, ais_neck_pred) * 100,
         'accu_mais': accuracy_score(true_mais, mais_pred) * 100,
+        'accu_mais_3c': mais_metrics_3c['accuracy'],
         'mae_hic': mean_absolute_error(true_hic, pred_hic), 'rmse_hic': root_mean_squared_error(true_hic, pred_hic),
         'mae_dmax': mean_absolute_error(true_dmax, pred_dmax), 'rmse_dmax': root_mean_squared_error(true_dmax, pred_dmax),
         'mae_nij': mean_absolute_error(true_nij, pred_nij), 'rmse_nij': root_mean_squared_error(true_nij, pred_nij),
@@ -182,6 +184,7 @@ def evaluate_and_plot_for_metric(model, model_path, val_loader_k, device, fold, 
     cls_metrics_chest = get_classification_metrics(ground_truths['ais_chest'], ais_chest_pred, list(range(6)), context_hint="the fold data")
     cls_metrics_neck = get_classification_metrics(ground_truths['ais_neck'], ais_neck_pred, list(range(6)), context_hint="the fold data")
     cls_metrics_mais = get_classification_metrics(ground_truths['mais'], mais_pred, list(range(6)), context_hint="the fold data")
+    cls_metrics_mais_3c = get_mais_3c_metrics(ground_truths['mais'], mais_pred, context_hint="the fold data")
     
     # 计算回归指标
     reg_metrics_hic = get_regression_metrics(true_hic, pred_hic)
@@ -208,6 +211,9 @@ def evaluate_and_plot_for_metric(model, model_path, val_loader_k, device, fold, 
     plot_confusion_matrix(cls_metrics_mais['conf_matrix'], list(range(6)), 
                           f'Fold {fold+1} (Best {metric_name}) - CM MAIS', 
                           os.path.join(metric_plot_dir, "cm_mais.png"))
+    plot_confusion_matrix(cls_metrics_mais_3c['conf_matrix'], MAIS_3C_DISPLAY_LABELS,
+                          f'Fold {fold+1} (Best {metric_name}) - CM MAIS 3C',
+                          os.path.join(metric_plot_dir, "cm_mais_3c.png"))
     plot_confusion_matrix(cls_metrics_head['conf_matrix'], list(range(6)), 
                           f'Fold {fold+1} (Best {metric_name}) - CM Head', 
                           os.path.join(metric_plot_dir, "cm_head.png"))
@@ -221,10 +227,12 @@ def evaluate_and_plot_for_metric(model, model_path, val_loader_k, device, fold, 
     # 构建评估结果字典
     eval_results = {
         'accu_mais': cls_metrics_mais['accuracy'],
+        'accu_mais_3c': cls_metrics_mais_3c['accuracy'],
         'accu_head': cls_metrics_head['accuracy'],
         'accu_chest': cls_metrics_chest['accuracy'],
         'accu_neck': cls_metrics_neck['accuracy'],
         'g_mean_mais': cls_metrics_mais['g_mean'],
+        'g_mean_mais_3c': cls_metrics_mais_3c['g_mean'],
         'mae_hic': reg_metrics_hic['mae'],
         'rmse_hic': reg_metrics_hic['rmse'],
         'r2_hic': reg_metrics_hic['r2'],
@@ -492,6 +500,7 @@ if __name__ == "__main__":
             # 训练指标
             writer.add_scalar("Loss/Train", train_metrics['loss'], epoch)
             writer.add_scalar("Accuracy_Train/MAIS", train_metrics['accu_mais'], epoch)
+            writer.add_scalar("Accuracy_Train/MAIS_3C", train_metrics['accu_mais_3c'], epoch)
             writer.add_scalar("MAE_Train/Train_HIC", train_metrics['mae_hic'], epoch)
             writer.add_scalar("MAE_Train/Train_Dmax", train_metrics['mae_dmax'], epoch)
             writer.add_scalar("MAE_Train/Train_Nij", train_metrics['mae_nij'], epoch)
@@ -502,6 +511,7 @@ if __name__ == "__main__":
             # 验证指标
             writer.add_scalar("Loss/Val", val_metrics['loss'], epoch)
             writer.add_scalar("Accuracy_Val/MAIS", val_metrics['accu_mais'], epoch)
+            writer.add_scalar("Accuracy_Val/MAIS_3C", val_metrics['accu_mais_3c'], epoch)
             writer.add_scalar("Accuracy_Val/Head", val_metrics['accu_head'], epoch)
             writer.add_scalar("Accuracy_Val/Chest", val_metrics['accu_chest'], epoch)
             writer.add_scalar("Accuracy_Val/Neck", val_metrics['accu_neck'], epoch)
@@ -586,6 +596,7 @@ if __name__ == "__main__":
         print(f"  Tracker Best Value : {summary_for_metric['mean_best_value']:.4g} +/- {summary_for_metric['std_best_value']:.4g}")
         if 'mean_accu_mais' in summary_for_metric:
             print(f"  val/accu_mais : {summary_for_metric['mean_accu_mais']:.4g}% +/- {summary_for_metric['std_accu_mais']:.4g}%")
+            print(f"  val/accu_mais_3c: {summary_for_metric['mean_accu_mais_3c']:.4g}% +/- {summary_for_metric['std_accu_mais_3c']:.4g}%")
             print(f"  val/accu_head : {summary_for_metric['mean_accu_head']:.4g}% +/- {summary_for_metric['std_accu_head']:.4g}%")
             print(f"  val/accu_chest: {summary_for_metric['mean_accu_chest']:.4g}% +/- {summary_for_metric['std_accu_chest']:.4g}%")
             print(f"  val/accu_neck : {summary_for_metric['mean_accu_neck']:.4g}% +/- {summary_for_metric['std_accu_neck']:.4g}%")

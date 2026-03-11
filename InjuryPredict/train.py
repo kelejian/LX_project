@@ -19,7 +19,7 @@ from common.settings import INJURY_PROCESSED_DIR
 from InjuryPredict.utils import models
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.utils.weighted_loss import weighted_loss
-from InjuryPredict.utils.tools import get_parameter_groups, build_metric_trackers, round_to_significant, round_float_fields, convert_numpy_types
+from InjuryPredict.utils.tools import get_parameter_groups, build_metric_trackers, round_to_significant, round_float_fields, convert_numpy_types, get_mais_3c_metrics
 from InjuryPredict.config import RUNS_DIR, training_params, loss_params, model_params, val_metrics_to_track
 
 # --- 合并 train 和 valid 为一个函数 ---
@@ -96,6 +96,7 @@ def run_one_epoch(model, loader, criterion, device, optimizer=None):
     true_ais_head, true_ais_chest, true_ais_neck = np.concatenate(all_true_ais_head), np.concatenate(all_true_ais_chest), np.concatenate(all_true_ais_neck)
     true_mais = np.concatenate(all_true_mais)
     mais_pred = np.maximum.reduce([ais_head_pred, ais_chest_pred, ais_neck_pred])
+    mais_metrics_3c = get_mais_3c_metrics(true_mais, mais_pred)
     
     metrics = {
         'loss': avg_loss,
@@ -103,6 +104,7 @@ def run_one_epoch(model, loader, criterion, device, optimizer=None):
         'accu_chest': accuracy_score(true_ais_chest, ais_chest_pred) * 100,
         'accu_neck': accuracy_score(true_ais_neck, ais_neck_pred) * 100,
         'accu_mais': accuracy_score(true_mais, mais_pred) * 100,
+        'accu_mais_3c': mais_metrics_3c['accuracy'],
         'mae_hic': mean_absolute_error(true_hic, pred_hic), 'rmse_hic': root_mean_squared_error(true_hic, pred_hic),
         'mae_dmax': mean_absolute_error(true_dmax, pred_dmax), 'rmse_dmax': root_mean_squared_error(true_dmax, pred_dmax),
         'mae_nij': mean_absolute_error(true_nij, pred_nij), 'rmse_nij': root_mean_squared_error(true_nij, pred_nij),
@@ -311,7 +313,7 @@ if __name__ == "__main__":
             raise KeyError(f"val_metrics_to_track 中存在无效指标: {missing_metrics}")
 
         print(f"Epoch {epoch+1}/{Epochs} | Train Loss: {train_metrics['loss']:.4g}")
-        print(f"            | Val Loss: {val_metrics['loss']:.4g} | MAIS Acc: {val_metrics['accu_mais']:.4g}%")
+        print(f"            | Val Loss: {val_metrics['loss']:.4g} | MAIS Acc 6C: {val_metrics['accu_mais']:.4g}% | MAIS Acc 3C: {val_metrics['accu_mais_3c']:.4g}%")
         print(f"            | Head Acc: {val_metrics['accu_head']:.4g}%, Chest Acc: {val_metrics['accu_chest']:.4g}%, Neck Acc: {val_metrics['accu_neck']:.4g}%")
         print(f"            | R²: HIC={val_metrics['r2_hic']:.4g}, Dmax={val_metrics['r2_dmax']:.4g}, Nij={val_metrics['r2_nij']:.4g}")
         
@@ -320,6 +322,7 @@ if __name__ == "__main__":
         # TensorBoard 记录 (训练)
         writer.add_scalar("Loss/Train", train_metrics['loss'], epoch)
         writer.add_scalar("Accuracy_Train/MAIS", train_metrics['accu_mais'], epoch)
+        writer.add_scalar("Accuracy_Train/MAIS_3C", train_metrics['accu_mais_3c'], epoch)
         writer.add_scalar("Accuracy_Train/Head", train_metrics['accu_head'], epoch)
         writer.add_scalar("Accuracy_Train/Chest", train_metrics['accu_chest'], epoch)
         writer.add_scalar("Accuracy_Train/Neck", train_metrics['accu_neck'], epoch)
@@ -353,6 +356,7 @@ if __name__ == "__main__":
         # TensorBoard 记录 (验证)
         writer.add_scalar("Loss/Val", val_metrics['loss'], epoch)
         writer.add_scalar("Accuracy_Val/MAIS", val_metrics['accu_mais'], epoch)
+        writer.add_scalar("Accuracy_Val/MAIS_3C", val_metrics['accu_mais_3c'], epoch)
         writer.add_scalar("Accuracy_Val/Head", val_metrics['accu_head'], epoch)
         writer.add_scalar("Accuracy_Val/Chest", val_metrics['accu_chest'], epoch)
         writer.add_scalar("Accuracy_Val/Neck", val_metrics['accu_neck'], epoch)
@@ -442,6 +446,7 @@ if __name__ == "__main__":
     last_epoch_metrics = round_float_fields({
         "loss": float(val_metrics['loss']),
         "accu_mais": float(val_metrics['accu_mais']),
+        "accu_mais_3c": float(val_metrics['accu_mais_3c']),
         "accu_head": float(val_metrics['accu_head']),
         "accu_chest": float(val_metrics['accu_chest']),
         "accu_neck": float(val_metrics['accu_neck']),

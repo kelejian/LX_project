@@ -2,7 +2,7 @@
 对损伤预测模型在测试集上的性能进行全面评估。
 功能包括：
 1. 计算三个损伤部位（头、胸、颈）的回归指标 (MAE, RMSE, R^2)。
-2. 计算对应AIS等级以及MAIS的分类指标 (Accuracy, G-mean, Confusion Matrix, Report)。
+2. 计算对应AIS等级以及MAIS的分类指标 (六分类与三分类的 Accuracy, G-mean, Confusion Matrix, Report)。
 3. 为HIC额外计算AIS-3C的分类指标。
 4. 生成并保存在指定运行目录下的详细评估报告 (Markdown格式)。
 5. 生成并保存所有损伤指标的散点图和所有AIS分类的混淆矩阵图。
@@ -15,11 +15,13 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader, ConcatDataset
 
-from InjuryPredict.Injurydata_prepare import load_processed_subset
+from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.utils import models
 from InjuryPredict.utils.tools import (
     get_regression_metrics,
     get_classification_metrics,
+    get_mais_3c_metrics,
+    MAIS_3C_DISPLAY_LABELS,
     plot_scatter,
     plot_confusion_matrix,
 )
@@ -59,7 +61,7 @@ def test(model, loader):
             all_true_ais_neck.append(batch_ais_neck.cpu().numpy())
             all_true_mais.append(batch_y_MAIS.cpu().numpy())
             all_ot.append(batch_OT.cpu().numpy()) # 保存OT
-    
+
     preds = np.concatenate(all_preds)
     trues = {
         'regression': np.concatenate(all_trues_regression),
@@ -67,9 +69,9 @@ def test(model, loader):
         'ais_chest': np.concatenate(all_true_ais_chest),
         'ais_neck': np.concatenate(all_true_ais_neck),
         'mais': np.concatenate(all_true_mais),
-        'ot': np.concatenate(all_ot)
+        'ot': np.concatenate(all_ot),
     }
-    
+
     return preds, trues
 
 def generate_report_section(title, reg_metrics, cls_metrics_6c):
@@ -78,20 +80,20 @@ def generate_report_section(title, reg_metrics, cls_metrics_6c):
     section += f"- **MAE**: {reg_metrics['mae']:.4f}\n"
     section += f"- **RMSE**: {reg_metrics['rmse']:.4f}\n"
     section += f"- **R² Score**: {reg_metrics['r2']:.4f}\n\n"
-    
+
     section += f"### AIS-6C Classification\n\n"
     section += f"- **Accuracy**: {cls_metrics_6c['accuracy']:.2f}%\n"
     section += f"- **G-Mean**: {cls_metrics_6c['g_mean']:.4f}\n"
     section += f"- **Confusion Matrix**:\n```\n{cls_metrics_6c['conf_matrix']}\n```\n"
     section += f"- **Classification Report**:\n```\n{cls_metrics_6c['report']}\n```\n"
-    
+
     return section
 
 if __name__ == "__main__":
 
     set_random_seed()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') 
- 
+
     # parser = argparse.ArgumentParser(description="Evaluate a trained injury prediction model")
     # parser.add_argument("--run_dir", '-r', type=str, default=r".\InjuryPredict\runs\InjuryPredictModel_03032051", help="Directory of the training run to evaluate.")
     # parser.add_argument("--weight_file", '-w', type=str, default="best_val_loss.pth", help="Name of the model weight file.")
@@ -103,18 +105,13 @@ if __name__ == "__main__":
         run_dir: str = r".\InjuryPredict\runs\InjuryPredictModel_03032051"
         weight_file: str = 'best_val_loss.pth'
 
-    # --- 1. 加载模型和数据 ---
-    # 尝试加载普通训练记录
     record_path = os.path.join(args.run_dir, "TrainingRecord.json")
-    
-    # 如果找不到，尝试查找是否是 K-Fold 训练的子目录结构
+
     if not os.path.exists(record_path):
-        # 尝试在当前目录找 KFold 记录
         kfold_record_path = os.path.join(args.run_dir, "TrainingRecord.json")
         if os.path.exists(kfold_record_path):
-             record_path = kfold_record_path
+            record_path = kfold_record_path
         else:
-            # 尝试在父目录找 KFold 记录 (标准 K-Fold 结构)
             parent_dir = os.path.dirname(args.run_dir)
             parent_kfold_record = os.path.join(parent_dir, "TrainingRecord.json")
             if os.path.exists(parent_kfold_record):
@@ -123,12 +120,12 @@ if __name__ == "__main__":
     print(f"Reading training record from: {record_path}")
     with open(record_path, "r") as f:
         training_record = json.load(f)
-    
+
     model_params = training_record["hyperparameters"]["model"]
-    
+
     train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
     val_pt = INJURY_PROCESSED_DIR / "val_dataset.pt"
-    train_dataset = load_processed_subset(train_pt)  # 仅用于获取 num_classes_of_discrete
+    train_dataset = load_processed_subset(train_pt)
     test_dataset1 = load_processed_subset(val_pt)
     test_dataset2 = load_processed_subset(INJURY_PROCESSED_DIR / "test_dataset.pt")
     test_dataset = ConcatDataset([test_dataset1, test_dataset2])
@@ -136,40 +133,34 @@ if __name__ == "__main__":
 
     print(f"加载 InjuryPredictModel 架构 (来自 {args.run_dir})")
     model = models.InjuryPredictModel(**model_params).to(device)
-    
+
     model.load_state_dict(torch.load(os.path.join(args.run_dir, args.weight_file)))
 
-    # --- 2. 执行预测 ---
     predictions, ground_truths = test(model, test_loader)
-    
-    ot = ground_truths['ot']  # 乘员体征类别
+
+    ot = ground_truths['ot']
     pred_hic, pred_dmax, pred_nij = predictions[:, 0], predictions[:, 1], predictions[:, 2]
     true_hic, true_dmax, true_nij = ground_truths['regression'][:, 0], ground_truths['regression'][:, 1], ground_truths['regression'][:, 2]
 
-    # --- 3. 计算所有指标 ---
-    # 回归指标
     reg_metrics_hic = get_regression_metrics(true_hic, pred_hic)
     reg_metrics_dmax = get_regression_metrics(true_dmax, pred_dmax)
     reg_metrics_nij = get_regression_metrics(true_nij, pred_nij)
 
-    # 分类指标 
     AIS_head = AIS_cal_head(pred_hic)
     AIS_chest = AIS_cal_chest(pred_dmax, ot)
     AIS_neck = AIS_cal_neck(pred_nij)
     print(f"processed {len(pred_hic)} samples for classification metrics.")
-    cls_metrics_head = get_classification_metrics(ground_truths['ais_head'], AIS_head,  list(range(6)))
+    cls_metrics_head = get_classification_metrics(ground_truths['ais_head'], AIS_head, list(range(6)))
     print(f"Head metrics: {cls_metrics_head['accuracy']:.2f}%")
     cls_metrics_chest = get_classification_metrics(ground_truths['ais_chest'], AIS_chest, list(range(6)))
     print(f"Chest metrics: {cls_metrics_chest['accuracy']:.2f}%")
     cls_metrics_neck = get_classification_metrics(ground_truths['ais_neck'], AIS_neck, list(range(6)))
     print(f"Neck metrics: {cls_metrics_neck['accuracy']:.2f}%")
 
-    # MAIS 指标
     mais_pred = np.maximum.reduce([AIS_head, AIS_chest, AIS_neck])
     cls_metrics_mais = get_classification_metrics(ground_truths['mais'], mais_pred, list(range(6)))
-    
+    cls_metrics_mais_3c = get_mais_3c_metrics(ground_truths['mais'], mais_pred)
 
-    # --- 4. 生成并保存所有可视化图表 ---
     plot_scatter(true_hic, pred_hic, ground_truths['ais_head'], 'Head Injury Criterion (HIC)', 'HIC', os.path.join(args.run_dir, "scatter_plot_HIC.png"))
     plot_scatter(true_dmax, pred_dmax, ground_truths['ais_chest'], 'Chest Displacement (Dmax)', 'Dmax (mm)', os.path.join(args.run_dir, "scatter_plot_Dmax.png"))
     plot_scatter(true_nij, pred_nij, ground_truths['ais_neck'], 'Neck Injury Criterion (Nij)', 'Nij', os.path.join(args.run_dir, "scatter_plot_Nij.png"))
@@ -178,24 +169,22 @@ if __name__ == "__main__":
     plot_confusion_matrix(cls_metrics_chest['conf_matrix'], list(range(6)), 'Confusion Matrix - AIS Chest (6C)', os.path.join(args.run_dir, "cm_chest_6c.png"))
     plot_confusion_matrix(cls_metrics_neck['conf_matrix'], list(range(6)), 'Confusion Matrix - AIS Neck (6C)', os.path.join(args.run_dir, "cm_neck_6c.png"))
     plot_confusion_matrix(cls_metrics_mais['conf_matrix'], list(range(6)), 'Confusion Matrix - MAIS (6C)', os.path.join(args.run_dir, "cm_mais_6c.png"))
+    plot_confusion_matrix(cls_metrics_mais_3c['conf_matrix'], MAIS_3C_DISPLAY_LABELS, 'Confusion Matrix - MAIS (3C)', os.path.join(args.run_dir, "cm_mais_3c.png"))
     print(f"All plots have been saved to {args.run_dir}")
 
-    # 模型参数量
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model has {total_params} parameters.")
 
-    # 打印回归指标
     print("\n--- Regression Metrics ---")
     print(f"HIC - MAE: {reg_metrics_hic['mae']:.4f}, RMSE: {reg_metrics_hic['rmse']:.4f}, R²: {reg_metrics_hic['r2']:.4f}")
     print(f"Dmax - MAE: {reg_metrics_dmax['mae']:.4f}, RMSE: {reg_metrics_dmax['rmse']:.4f}, R²: {reg_metrics_dmax['r2']:.4f}")
     print(f"Nij - MAE: {reg_metrics_nij['mae']:.4f}, RMSE: {reg_metrics_nij['rmse']:.4f}, R²: {reg_metrics_nij['r2']:.4f}")
-    # 打印MAIS准确率, 和三个部位多分类准确率
-    print(f"MAIS Accuracy: {cls_metrics_mais['accuracy']:.2f}%")
+    print(f"MAIS Accuracy (6C): {cls_metrics_mais['accuracy']:.2f}%")
+    print(f"MAIS Accuracy (3C): {cls_metrics_mais_3c['accuracy']:.2f}%")
     print(f"Head AIS-6C Accuracy: {cls_metrics_head['accuracy']:.2f}%")
     print(f"Chest AIS-6C Accuracy: {cls_metrics_chest['accuracy']:.2f}%")
     print(f"Neck AIS-6C Accuracy: {cls_metrics_neck['accuracy']:.2f}%")
 
-    # --- 5. 生成并保存 Markdown 报告 ---
     markdown_content = f"""# Model Evaluation Report
 
 ## Model Identification
@@ -208,12 +197,19 @@ if __name__ == "__main__":
 
 ## Overall Injury Assessment (MAIS)
 
-- **Accuracy**: {cls_metrics_mais['accuracy']:.2f}%
-- **G-Mean**: {cls_metrics_mais['g_mean']:.4f}
-- **Confusion Matrix**:
+- **AIS-6C Accuracy**: {cls_metrics_mais['accuracy']:.2f}%
+- **AIS-6C G-Mean**: {cls_metrics_mais['g_mean']:.4f}
+- **AIS-6C Confusion Matrix**:
 {cls_metrics_mais['conf_matrix']}
-- **Classification Report**:
+- **AIS-6C Classification Report**:
 {cls_metrics_mais['report']}
+
+- **AIS-3C Accuracy**: {cls_metrics_mais_3c['accuracy']:.2f}%
+- **AIS-3C G-Mean**: {cls_metrics_mais_3c['g_mean']:.4f}
+- **AIS-3C Confusion Matrix**:
+{cls_metrics_mais_3c['conf_matrix']}
+- **AIS-3C Classification Report**:
+{cls_metrics_mais_3c['report']}
 
 ---
 """

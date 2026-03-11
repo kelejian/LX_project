@@ -49,7 +49,7 @@ model_params = {
 # 2) val_metrics_to_track 中可写 "loss" 或 "val_loss"（其余指标同理），内部会统一按 val 指标处理。
 AVAILABLE_VAL_METRIC_NAMES = (
     'loss',
-    'accu_head', 'accu_chest', 'accu_neck', 'accu_mais',
+    'accu_head', 'accu_chest', 'accu_neck', 'accu_mais', 'accu_mais_3c',
     'mae_hic', 'mae_dmax', 'mae_nij',
     'rmse_hic', 'rmse_dmax', 'rmse_nij',
     'r2_hic', 'r2_dmax', 'r2_nij',

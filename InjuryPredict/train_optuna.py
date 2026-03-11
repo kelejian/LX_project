@@ -19,7 +19,7 @@ from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from InjuryPredict.utils import models
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from InjuryPredict.utils.weighted_loss import weighted_loss
-from InjuryPredict.utils.tools import get_parameter_groups
+from InjuryPredict.utils.tools import get_parameter_groups, get_mais_3c_metrics
 from InjuryPredict.config import RUNS_DIR
 
 
@@ -77,10 +77,12 @@ def run_one_epoch(model, loader, criterion, device, optimizer=None):
     true_ais_neck = np.concatenate(all_true_ais_neck)
     true_mais = np.concatenate(all_true_mais)
     mais_pred = np.maximum.reduce([ais_head_pred, ais_chest_pred, ais_neck_pred])
+    mais_metrics_3c = get_mais_3c_metrics(true_mais, mais_pred)
 
     metrics = {
         'loss': avg_loss,
         'accu_mais': accuracy_score(true_mais, mais_pred) * 100,
+        'accu_mais_3c': mais_metrics_3c['accuracy'],
         'accu_head': accuracy_score(true_ais_head, ais_head_pred) * 100,
         'accu_chest': accuracy_score(true_ais_chest, ais_chest_pred) * 100,
         'accu_neck': accuracy_score(true_ais_neck, ais_neck_pred) * 100,
@@ -187,9 +189,12 @@ def objective(trial):
 
     # --- 计算并返回新的多目标优化值 ---
     avg_mais_acc = np.mean([m['accu_mais'] for m in val_metrics_list])
+    avg_mais_acc_3c = np.mean([m['accu_mais_3c'] for m in val_metrics_list])
     avg_head_acc = np.mean([m['accu_head'] for m in val_metrics_list])
     avg_chest_acc = np.mean([m['accu_chest'] for m in val_metrics_list])
     avg_neck_acc = np.mean([m['accu_neck'] for m in val_metrics_list])
+
+    trial.set_user_attr('avg_accu_mais_3c', float(avg_mais_acc_3c))
 
     return avg_mais_acc, avg_head_acc, avg_chest_acc, avg_neck_acc
 
@@ -239,6 +244,7 @@ if __name__ == "__main__":
     for trial in study.best_trials:
         print(f"Trial Number: {trial.number}")
         print(f"  - MAIS Acc:   {trial.values[0]:.2f}%")
+        print(f"  - MAIS Acc 3C:{trial.user_attrs.get('avg_accu_mais_3c', float('nan')):.2f}%")
         print(f"  - Head Acc:   {trial.values[1]:.2f}%")
         print(f"  - Chest Acc:  {trial.values[2]:.2f}%")
         print(f"  - Neck Acc:   {trial.values[3]:.2f}%")
