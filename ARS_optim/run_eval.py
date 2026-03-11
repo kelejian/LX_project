@@ -9,6 +9,7 @@ import pandas as pd
 import torch
 import yaml
 
+from common.data_utils.split_io import load_int_vector_csv
 from common.data_utils.processor import UnifiedDataProcessor
 from common.metrics.injury_risk import AIS_cal_chest, AIS_cal_head, AIS_cal_neck
 from common.settings import FEATURE_ORDER, NORMALIZATION_CONFIG_PATH, RAW_DATA_DIR, SPLIT_INDICES_DIR
@@ -84,8 +85,7 @@ def _safe_nanmean(series: pd.Series) -> float:
 def _build_param_dataframe(
     df_input: pd.DataFrame,
     params: List[dict],
-    logger,
-    missing_message: str,
+    fill_missing_with_default: bool,
 ) -> tuple[pd.DataFrame, List[str], List[str]]:
     output_df = pd.DataFrame(index=df_input.index)
     missing = []
@@ -93,57 +93,21 @@ def _build_param_dataframe(
     for param in params:
         name = param["name"]
         if name in df_input.columns:
-            output_df[name] = pd.to_numeric(df_input[name], errors="raise")
+            output_df[name] = pd.to_numeric(df_input[name], errors="coerce")
             provided.append(name)
         else:
-            output_df[name] = float(param["default"])
+            fill_value = float(param["default"]) if fill_missing_with_default else np.nan
+            output_df[name] = fill_value
             missing.append(name)
-    if missing:
-        logger.warning(missing_message.format(missing=missing))
     return output_df, missing, provided
 
 
-def _validate_provided_values(
-    param_manager: ParamManager,
-    raw_df: pd.DataFrame,
-    sanitized_df: pd.DataFrame,
-    provided_names: List[str],
-    label: str,
-    strict: bool,
-    logger,
-) -> None:
-    issues = []
-    for name in provided_names:
-        param = param_manager.get_param(name)
-        raw_values = raw_df[name].to_numpy()
-        sanitized_values = sanitized_df[name].to_numpy()
-        if param.get("type") == "discrete":
-            invalid_mask = raw_values.astype(np.int64) != sanitized_values.astype(np.int64)
-        else:
-            invalid_mask = ~np.isclose(raw_values.astype(np.float64), sanitized_values.astype(np.float64), atol=1e-5, rtol=1e-5)
-        if np.any(invalid_mask):
-            first_idx = int(np.flatnonzero(invalid_mask)[0])
-            issues.append(
-                f"{label}.{name}[row={first_idx}]={raw_values[first_idx]!r} 不合法，修正后应为 {sanitized_values[first_idx]!r}"
-            )
-        if len(issues) >= 12:
-            break
-
-    if not issues:
-        return
-
-    issue_message = (
-        "输入中存在不合法参数值或硬约束冲突。缺失列会自动回填 default，但已提供的列必须本身合法。\n"
-        + "\n".join(issues)
-    )
-    if strict:
-        raise ValueError(
-            issue_message
-        )
-    logger.warning(
-        "当前评估输入来自内部测试集，将对非规范值执行 sanitize 后继续。首批修正项如下：\n%s",
-        "\n".join(issues),
-    )
+def _format_row_list(row_indices: np.ndarray, max_items: int = 12) -> str:
+    if row_indices.size == 0:
+        return "[]"
+    preview = row_indices[:max_items].tolist()
+    suffix = " ..." if row_indices.size > max_items else ""
+    return f"{preview}{suffix}"
 
 
 def _prepare_eval_inputs(
@@ -153,51 +117,134 @@ def _prepare_eval_inputs(
     device: torch.device,
     logger,
     strict_provided_validation: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame, List[str], List[str]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], List[str], np.ndarray, List[int], List[int]]:
     context_params = param_manager.get_context_params()
     trainable_params = param_manager.get_trainable_params()
     context_names = param_manager.get_context_names()
     trainable_names = param_manager.get_trainable_names()
+    default_trainable = np.asarray(param_manager.get_default_values(trainable_params), dtype=np.float32)
 
     context_df_raw, missing_context, provided_context = _build_param_dataframe(
         df_input,
         context_params,
-        logger,
-        "输入缺失部分 context 参数，已回退 default: {missing}",
+        fill_missing_with_default=not strict_provided_validation,
     )
     baseline_df_raw, missing_trainable, provided_trainable = _build_param_dataframe(
         df_input,
         trainable_params,
-        logger,
-        "输入未提供部分可调参数，baseline 已回退 default: {missing}",
+        fill_missing_with_default=True,
     )
 
-    context_tensor_raw = torch.tensor(context_df_raw[context_names].values, dtype=torch.float32, device=device)
-    baseline_tensor_raw = torch.tensor(baseline_df_raw[trainable_names].values, dtype=torch.float32, device=device)
-    context_tensor, baseline_tensor = constraint_engine.sanitize_context_and_trainable(context_tensor_raw, baseline_tensor_raw)
+    if missing_context:
+        if strict_provided_validation:
+            logger.warning("input_csv 缺失 context 列，这些列对应的 case 将被逐行跳过: %s", missing_context)
+        else:
+            logger.warning("输入缺失部分 context 参数，已回退 default: %s", missing_context)
+    if missing_trainable:
+        logger.warning("输入未提供部分可调参数，baseline 已回退 default: %s", missing_trainable)
 
-    context_df = pd.DataFrame(context_tensor.detach().cpu().numpy(), columns=context_names, index=df_input.index)
-    baseline_df = pd.DataFrame(baseline_tensor.detach().cpu().numpy(), columns=trainable_names, index=df_input.index)
+    if not strict_provided_validation:
+        context_eval_df = context_df_raw.astype(np.float32)
+        baseline_eval_df = baseline_df_raw.astype(np.float32)
+        context_tensor = torch.tensor(context_eval_df[context_names].values, dtype=torch.float32, device=device)
+        baseline_tensor = torch.tensor(baseline_eval_df[trainable_names].values, dtype=torch.float32, device=device)
+        full_features = constraint_engine.compose_full_features(context_tensor, baseline_tensor)
+        valid_mask = constraint_engine.is_valid_physics(full_features).detach().cpu().numpy().astype(bool)
+        invalid_rows = np.flatnonzero(~valid_mask)
+        if invalid_rows.size > 0:
+            logger.warning(
+                "当前评估输入来自内部测试集，其中 %d 个 case 不满足物理约束，已跳过。行号: %s",
+                invalid_rows.size,
+                _format_row_list(invalid_rows),
+            )
+        return (
+            context_eval_df,
+            context_eval_df,
+            baseline_eval_df,
+            missing_context,
+            missing_trainable,
+            valid_mask,
+            invalid_rows.astype(int).tolist(),
+            [],
+        )
 
-    _validate_provided_values(
-        param_manager,
-        context_df_raw,
-        context_df,
-        provided_context,
-        label="context",
-        strict=strict_provided_validation,
-        logger=logger,
+    context_output_df = context_df_raw.copy()
+    row_has_context_nan = context_df_raw[context_names].isna().any(axis=1).to_numpy()
+    valid_context_candidates = ~row_has_context_nan
+    skipped_rows: List[int] = np.flatnonzero(row_has_context_nan).astype(int).tolist()
+
+    valid_mask = np.zeros(len(df_input), dtype=bool)
+    context_eval_df = pd.DataFrame(np.nan, index=df_input.index, columns=context_names, dtype=np.float32)
+    baseline_eval_df = pd.DataFrame(np.tile(default_trainable, (len(df_input), 1)), index=df_input.index, columns=trainable_names, dtype=np.float32)
+    reverted_baseline_rows: List[int] = []
+
+    if np.any(valid_context_candidates):
+        candidate_indices = np.flatnonzero(valid_context_candidates)
+        candidate_context_raw = context_df_raw.iloc[candidate_indices]
+        candidate_context_tensor = torch.tensor(candidate_context_raw[context_names].values, dtype=torch.float32, device=device)
+        context_full = constraint_engine.compose_full_features(candidate_context_tensor)
+        context_valid_local = constraint_engine.is_valid_physics(context_full).detach().cpu().numpy().astype(bool)
+        if (~context_valid_local).any():
+            logger.warning(
+                "以下 input_csv 行的 context 参数不合法，将跳过该 case。行号: %s",
+                _format_row_list(candidate_indices[~context_valid_local]),
+            )
+        invalid_context_indices = candidate_indices[~context_valid_local]
+        if invalid_context_indices.size > 0:
+            skipped_rows.extend(invalid_context_indices.astype(int).tolist())
+
+        legal_context_indices = candidate_indices[context_valid_local]
+        if legal_context_indices.size > 0:
+            valid_mask[legal_context_indices] = True
+            context_eval_df.loc[legal_context_indices, context_names] = context_df_raw.loc[legal_context_indices, context_names]
+
+            baseline_candidate = baseline_df_raw.loc[legal_context_indices, trainable_names].copy()
+            provided_trainable_nan_rows = baseline_candidate[provided_trainable].isna().any(axis=1).to_numpy() if provided_trainable else np.zeros(len(legal_context_indices), dtype=bool)
+            baseline_candidate.loc[:, trainable_names] = baseline_candidate.loc[:, trainable_names].fillna(pd.Series(default_trainable, index=trainable_names))
+
+            legal_context_tensor = torch.tensor(
+                context_eval_df.loc[legal_context_indices, context_names].values,
+                dtype=torch.float32,
+                device=device,
+            )
+            baseline_candidate_tensor = torch.tensor(
+                baseline_candidate[trainable_names].values,
+                dtype=torch.float32,
+                device=device,
+            )
+            baseline_full = constraint_engine.compose_full_features(legal_context_tensor, baseline_candidate_tensor)
+            baseline_valid_local = constraint_engine.is_valid_physics(baseline_full).detach().cpu().numpy().astype(bool)
+            baseline_invalid_mask_local = (~baseline_valid_local) | provided_trainable_nan_rows
+            if baseline_invalid_mask_local.any():
+                logger.warning(
+                    "以下 input_csv 行的 baseline 可调控制参数不合法，已回退为 param_space.yaml 的 default。行号: %s",
+                    _format_row_list(legal_context_indices[baseline_invalid_mask_local]),
+                )
+            reverted_indices = legal_context_indices[baseline_invalid_mask_local]
+            if reverted_indices.size > 0:
+                reverted_baseline_rows.extend(reverted_indices.astype(int).tolist())
+
+            baseline_eval_df.loc[legal_context_indices, trainable_names] = baseline_candidate.loc[legal_context_indices, trainable_names]
+            if reverted_indices.size > 0:
+                baseline_eval_df.loc[reverted_indices, trainable_names] = default_trainable
+
+    if skipped_rows:
+        skipped_array = np.asarray(sorted(set(skipped_rows)), dtype=np.int64)
+        logger.warning("input_csv 中共有 %d 个 case 因 context 缺失或非法被跳过，行号: %s", skipped_array.size, _format_row_list(skipped_array))
+    if reverted_baseline_rows:
+        reverted_array = np.asarray(sorted(set(reverted_baseline_rows)), dtype=np.int64)
+        logger.warning("input_csv 中共有 %d 个 case 的 baseline 可调控制参数被回退为 default，行号: %s", reverted_array.size, _format_row_list(reverted_array))
+
+    return (
+        context_output_df,
+        context_eval_df,
+        baseline_eval_df,
+        missing_context,
+        missing_trainable,
+        valid_mask,
+        sorted(set(skipped_rows)),
+        sorted(set(reverted_baseline_rows)),
     )
-    _validate_provided_values(
-        param_manager,
-        baseline_df_raw,
-        baseline_df,
-        provided_trainable,
-        label="baseline",
-        strict=strict_provided_validation,
-        logger=logger,
-    )
-    return context_df, baseline_df, missing_context, missing_trainable
 
 
 def _fit_distribution_reference_if_needed(surrogate: SurrogateAdapter, sampler: StateDataSampler, param_manager: ParamManager, config: dict) -> None:
@@ -232,11 +279,11 @@ def _load_eval_input(args, logger) -> tuple[pd.DataFrame, Dict[str, np.ndarray],
         return df_input, truth_arrays, input_source
 
     pool_path = RAW_DATA_DIR / "raw_data_packed.npz"
-    test_idx_path = SPLIT_INDICES_DIR / "injury_test_indices.npy"
+    test_idx_path = SPLIT_INDICES_DIR / "injury_test_indices.csv"
     if not pool_path.exists() or not test_idx_path.exists():
-        raise FileNotFoundError("自动测试集模式需要 raw_data_packed.npz 和 injury_test_indices.npy")
+        raise FileNotFoundError("自动测试集模式需要 raw_data_packed.npz 和 injury_test_indices.csv")
 
-    test_indices = np.load(str(test_idx_path)).astype(np.int64)
+    test_indices = load_int_vector_csv(test_idx_path)
     with np.load(str(pool_path), allow_pickle=True) as data:
         x_att_raw = data["x_att_raw"][test_indices]
         df_input = pd.DataFrame(x_att_raw, columns=FEATURE_ORDER)
@@ -324,6 +371,50 @@ def _compute_predictions_batch(
     return output
 
 
+def _expand_stage_outputs_to_full(
+    stage_outputs: Dict[str, object],
+    valid_indices: np.ndarray,
+    total_count: int,
+    trainable_dim: int,
+) -> Dict[str, object]:
+    valid_indices_tensor = torch.as_tensor(valid_indices, dtype=torch.long)
+    expanded = {
+        "total_time_cost": stage_outputs["total_time_cost"],
+        "trajectory_all": stage_outputs["trajectory_all"],
+    }
+    for stage_name in ["Base", "Opt1", "Opt2"]:
+        stage = stage_outputs[stage_name]
+        preds_src = stage["preds"]
+        actions_src = stage["actions"]
+        preds_full = None
+        actions_full = None
+        if preds_src is not None:
+            preds_src_cpu = preds_src.detach().cpu()
+            preds_full = torch.full((total_count, preds_src_cpu.shape[1]), float("nan"), dtype=preds_src_cpu.dtype)
+            preds_full[valid_indices_tensor] = preds_src_cpu
+        if actions_src is not None:
+            actions_src_cpu = actions_src.detach().cpu()
+            actions_full = torch.full((total_count, trainable_dim), float("nan"), dtype=actions_src_cpu.dtype)
+            actions_full[valid_indices_tensor] = actions_src_cpu
+        loss_full = torch.full((total_count,), float("nan"), dtype=torch.float32)
+        loss_src = stage["loss"]
+        if loss_src.numel() > 0:
+            loss_full[valid_indices_tensor] = loss_src.detach().cpu().to(torch.float32)
+        info_full = {}
+        for key, values in stage["info"].items():
+            buffer = torch.full((total_count,), float("nan"), dtype=torch.float32)
+            if values.numel() > 0:
+                buffer[valid_indices_tensor] = values.detach().cpu().to(torch.float32)
+            info_full[key] = buffer
+        expanded[stage_name] = {
+            "preds": preds_full,
+            "actions": actions_full,
+            "loss": loss_full,
+            "info": info_full,
+        }
+    return expanded
+
+
 def _build_stage_metric_dataframe(
     stage_label: str,
     stage: Dict[str, object],
@@ -353,6 +444,7 @@ def _build_stage_metric_dataframe(
 
     pred_array = preds.detach().cpu().numpy()
     info_arrays = {name: info[name].detach().cpu().numpy() for name in ["p_head", "p_chest", "p_neck", "joint_risk"]}
+    invalid_rows = np.isnan(pred_array).any(axis=1)
 
     stage_df = pd.DataFrame(
         {
@@ -375,6 +467,13 @@ def _build_stage_metric_dataframe(
             stage_df[f"{stage_label}_AIS_neck"].to_numpy(dtype=np.float32),
         ]
     )
+    if np.any(invalid_rows):
+        stage_df.loc[invalid_rows, [
+            f"{stage_label}_AIS_head",
+            f"{stage_label}_AIS_chest",
+            f"{stage_label}_AIS_neck",
+            f"{stage_label}_AIS_max",
+        ]] = np.nan
     return stage_df
 
 
@@ -385,19 +484,14 @@ def _build_result_dataframe(
     stage_outputs: Dict[str, object],
     truth_arrays: Dict[str, np.ndarray],
     trainable_names: List[str],
+    optimized_stage_name: str,
 ) -> tuple[pd.DataFrame, Dict[str, float], str]:
     excluded_input_cols = set(FEATURE_ORDER) | {"y_HIC", "y_Dmax", "y_Nij", "ais_head", "ais_chest", "ais_neck"}
     metadata_cols = [col for col in df_input.columns if col not in excluded_input_cols]
     metadata_df = df_input[metadata_cols].reset_index(drop=True)
     frame_parts = [metadata_df, context_df.reset_index(drop=True)]
 
-    ot_array = context_df["OT"].to_numpy(dtype=np.float32)
-    if stage_outputs["Opt2"]["preds"] is not None:
-        optimized_stage_name = "Opt2"
-    elif stage_outputs["Opt1"]["preds"] is not None:
-        optimized_stage_name = "Opt1"
-    else:
-        raise ValueError("当前配置下未生成任何优化阶段结果，无法组织评估输出")
+    ot_array = pd.to_numeric(context_df["OT"], errors="coerce").to_numpy(dtype=np.float32)
     optimized_stage = stage_outputs[optimized_stage_name]
 
     baseline_df = baseline_df.reset_index(drop=True).rename(columns={name: f"Base_{name}" for name in trainable_names})
@@ -498,6 +592,8 @@ def _build_eval_info(
     trainable_names: List[str],
     missing_context: List[str],
     missing_trainable: List[str],
+    skipped_case_rows: List[int],
+    reverted_baseline_rows: List[int],
     opt1_generated: bool,
     opt2_generated: bool,
     optimized_stage_name: str,
@@ -523,9 +619,12 @@ def _build_eval_info(
         },
         "missing_context_filled_by_default": missing_context,
         "missing_trainable_filled_by_default": missing_trainable,
+        "skipped_case_rows": skipped_case_rows,
+        "skipped_cases_count": len(skipped_case_rows),
+        "reverted_baseline_rows": reverted_baseline_rows,
         "input_validation_policy": {
-            "input_csv": "strict_provided_values" if args.input_csv else None,
-            "test_split": "allow_internal_sanitize" if not args.input_csv else None,
+            "input_csv": "rowwise_skip_invalid_context_rowwise_revert_invalid_baseline" if args.input_csv else None,
+            "test_split": "rowwise_skip_invalid_internal_cases" if not args.input_csv else None,
         },
         "stage_definition": {
             "Base": "输入 CSV 提供的 baseline control；缺失时回填 default",
@@ -591,7 +690,7 @@ def main():
         batch_size=1024,
         device=device,
         seed=int(config.get("seed", 42)),
-        split_indices_path=str(SPLIT_INDICES_DIR / "injury_train_indices.npy"),
+        split_indices_path=str(SPLIT_INDICES_DIR / "injury_train_indices.csv"),
         jitter_ratio=0.0,
         jitter_prob=0.0,
     )
@@ -628,7 +727,7 @@ def main():
     if "case_id" not in df_input.columns:
         df_input.insert(0, "case_id", np.arange(len(df_input), dtype=np.int64))
 
-    context_df, baseline_df, missing_context, missing_trainable = _prepare_eval_inputs(
+    context_output_df, context_eval_df, baseline_df, missing_context, missing_trainable, valid_mask, skipped_case_rows, reverted_baseline_rows = _prepare_eval_inputs(
         df_input=df_input,
         param_manager=param_manager,
         constraint_engine=constraint_engine,
@@ -638,27 +737,42 @@ def main():
     )
     context_names = param_manager.get_context_names()
     trainable_names = param_manager.get_trainable_names()
-    context_tensor = torch.tensor(context_df[context_names].values, dtype=torch.float32, device=device)
-    baseline_tensor = torch.tensor(baseline_df[trainable_names].values, dtype=torch.float32, device=device)
+    valid_indices = np.flatnonzero(valid_mask)
+    context_tensor = torch.tensor(context_eval_df.loc[valid_indices, context_names].values, dtype=torch.float32, device=device)
+    baseline_tensor = torch.tensor(baseline_df.loc[valid_indices, trainable_names].values, dtype=torch.float32, device=device)
 
     eval_batch_size = int(config.get("evaluation", {}).get("eval_batch_size", 512))
     if eval_batch_size <= 0:
         raise ValueError("eval_batch_size 必须为正整数")
-    stage_outputs = _compute_predictions_batch(
+    stage_outputs_valid = _compute_predictions_batch(
         context_tensor=context_tensor,
         baseline_trainable=baseline_tensor,
         surrogate=surrogate,
         optimizer=optimizer,
         eval_batch_size=eval_batch_size,
     )
+    stage_outputs = _expand_stage_outputs_to_full(
+        stage_outputs=stage_outputs_valid,
+        valid_indices=valid_indices,
+        total_count=len(df_input),
+        trainable_dim=len(trainable_names),
+    )
+
+    if optimizer.refine_steps > 0:
+        optimized_stage_name = "Opt2"
+    elif optimizer.direct_inference:
+        optimized_stage_name = "Opt1"
+    else:
+        raise ValueError("当前配置未启用任何优化阶段，无法组织评估输出")
 
     result_df, summary_metrics, optimized_stage_name = _build_result_dataframe(
         df_input=df_input,
-        context_df=context_df,
+        context_df=context_output_df,
         baseline_df=baseline_df,
         stage_outputs=stage_outputs,
         truth_arrays=truth_arrays,
         trainable_names=trainable_names,
+        optimized_stage_name=optimized_stage_name,
     )
     # 在所有前置校验和模型推理都完成后再创建输出目录，避免早退时留下空目录。
     output_dir = _build_output_dir(base_dir, args.input_csv)
@@ -681,6 +795,8 @@ def main():
         trainable_names=trainable_names,
         missing_context=missing_context,
         missing_trainable=missing_trainable,
+        skipped_case_rows=skipped_case_rows,
+        reverted_baseline_rows=reverted_baseline_rows,
         opt1_generated=opt1_generated,
         opt2_generated=opt2_generated,
         optimized_stage_name=optimized_stage_name,

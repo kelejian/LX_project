@@ -39,6 +39,9 @@ class LocalRefiner:
         self.direct_inference = bool(opt_cfg.get("direct_inference", False))
         self.refine_steps = int(opt_cfg.get("refine_steps", 50))
         self.lr = float(opt_cfg.get("lr", 0.05))
+        min_bounds, max_bounds = self.param_manager.get_trainable_bounds()
+        self._trainable_mins_cpu = min_bounds
+        self._trainable_maxs_cpu = max_bounds
 
     def _resolve_initial_actions(self, context_params: torch.Tensor, pulse_norm: torch.Tensor) -> torch.Tensor:
         """生成局部精调的起始动作。
@@ -58,29 +61,22 @@ class LocalRefiner:
                 return self.strategy_net(context_params, pulse_norm)
         return self.param_manager.get_trainable_defaults_tensor(device=device).unsqueeze(0).expand(batch_size, -1)
 
-    def _legalize_actions(self, context_params: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        """将动作收敛到最终可对外暴露的合法状态。
-
-        这里固定采用两步：
-        1. project_forward 处理可微的连续耦合约束；
-        2. sanitize 处理离散规则和最终硬合法化。
-
-        这样可以保证对外落盘的动作与训练/评估其余入口看到的是同一套最终合法定义，
-        而不是把优化迭代过程中的中间变量直接暴露出去。
-        """
-        with torch.no_grad():
-            projected = self.constraint_engine.project_forward(actions, context_params)
-            _, sanitized = self.constraint_engine.sanitize_context_and_trainable(context_params, projected)
-        return sanitized
-
     def _evaluate_stage(self, context_params: torch.Tensor, actions: torch.Tensor, pulse_norm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """评估一个已经合法化的动作阶段。"""
         loss_batch, preds, info, _ = self.surrogate.evaluate_actions(
             context_params=context_params,
             control_trainable=actions,
             pulse_norm=pulse_norm,
+            include_yaml_bounds=False,
         )
         return loss_batch, preds, info
+
+    def _strict_project_actions(self, context_params: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            full_features = self.constraint_engine.compose_full_features(context_params, actions)
+            projected_full = self.constraint_engine.project_forward(full_features, strict=True)
+            _, projected_actions = self.constraint_engine.split_from_full(projected_full)
+        return projected_actions
 
     def optimize(self, context_params: torch.Tensor, pulse_norm: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         self.surrogate.eval()
@@ -89,7 +85,7 @@ class LocalRefiner:
             with torch.no_grad():
                 pulse_norm = self.surrogate.generate_pulse(context_params)
         init_actions = self._resolve_initial_actions(context_params, pulse_norm)
-        init_actions = self._legalize_actions(context_params, init_actions)
+        init_actions = self._strict_project_actions(context_params, init_actions)
         init_loss_batch, init_preds, init_info = self._evaluate_stage(context_params, init_actions, pulse_norm)
         direct_stage = {
             "enabled": bool(self.direct_inference),
@@ -117,31 +113,43 @@ class LocalRefiner:
         optimizer = torch.optim.Adam([opt_var], lr=self.lr)
         trajectory = []
         start = time.time()
+        min_bounds = self._trainable_mins_cpu.to(device=context_params.device, dtype=context_params.dtype)
+        max_bounds = self._trainable_maxs_cpu.to(device=context_params.device, dtype=context_params.dtype)
+        relaxed_span = torch.clamp(max_bounds - min_bounds, min=1e-6) * 0.1
+        relaxed_lower = min_bounds - relaxed_span
+        relaxed_upper = max_bounds + relaxed_span
 
         for _ in range(self.refine_steps):
-            # 每一步先在当前物理参数上做一次 Adam 更新，再立即投影回连续约束子空间。
-            # 不在循环内直接做 sanitize，是因为离散 snapping 会破坏这一路径上的梯度结构；
-            # 最终硬合法化统一放到循环结束后执行一次。
             optimizer.zero_grad()
-            loss_batch, _, _, _ = self.surrogate.evaluate_actions(
+            full_raw = self.constraint_engine.compose_full_features(context_params, opt_var)
+            projected_full = self.constraint_engine.project_forward(full_raw, strict=False)
+            _, projected_actions = self.constraint_engine.split_from_full(projected_full)
+
+            _, _, risk_info = self.surrogate.predict_injury_and_loss(
                 context_params=context_params,
-                control_trainable=opt_var,
+                control_trainable=projected_actions,
                 pulse_norm=pulse_norm,
+                include_yaml_bounds=False,
+                detach_info=False,
             )
-            # 这里对 batch 内逐样本 loss 取 mean，不会把逐点优化错误地变成分布级优化：
-            # surrogate 不存在跨样本耦合，因此第 i 个样本的梯度仍只依赖第 i 个样本自身，
-            # 即 d(loss_mean)/d(opt_var[i]) = (1/N) * d(loss_i)/d(opt_var[i])。
-            # 这个 1/N 只是常数缩放，会被 Adam 的自适应步长吸收。
-            loss_mean = loss_batch.mean()
-            loss_mean.backward()
+            loss_risk = risk_info["loss_risk"]
+            penalty = self.constraint_engine.compute_soft_penalty(full_raw, include_yaml_bounds=True)
+            dist_penalty = self.surrogate.distribution_penalty.compute(context_params, opt_var)
+            total_batch = (
+                loss_risk
+                + self.surrogate.weight_penalty * penalty
+                + self.surrogate.weight_distribution * dist_penalty
+            )
+            total_mean = total_batch.mean()
+            total_mean.backward()
             optimizer.step()
 
             with torch.no_grad():
-                opt_var.copy_(self.constraint_engine.project_forward(opt_var, context_params))
-            trajectory.append(float(loss_mean.item()))
+                opt_var.clamp_(relaxed_lower.unsqueeze(0), relaxed_upper.unsqueeze(0))
+            trajectory.append(float(total_mean.item()))
 
         end = time.time()
-        final_actions = self._legalize_actions(context_params, opt_var)
+        final_actions = self._strict_project_actions(context_params, opt_var)
         final_loss, final_preds, final_info = self._evaluate_stage(context_params, final_actions, pulse_norm)
         final_info["final_loss_batch"] = final_loss.detach()
         if "joint_risk" in final_info:

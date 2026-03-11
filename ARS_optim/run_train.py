@@ -11,6 +11,7 @@ import yaml
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from common.data_utils.split_io import load_int_vector_csv
 from common.data_utils.processor import UnifiedDataProcessor
 from common.settings import NORMALIZATION_CONFIG_PATH, SPLIT_INDICES_DIR
 from common.tools.logger import setup_logger
@@ -149,6 +150,7 @@ def _evaluate_strategy_batch(
         context_params=context_params,
         control_trainable=actions,
         pulse_norm=pulse_norm,
+        include_yaml_bounds=False,
     )
     return loss_batch, info
 
@@ -266,7 +268,7 @@ def main():
         batch_size=train_cfg["batch_size"],
         device=device,
         seed=seed,
-        split_indices_path=str(SPLIT_INDICES_DIR / "injury_train_indices.npy"),
+        split_indices_path=str(SPLIT_INDICES_DIR / "injury_train_indices.csv"),
         jitter_ratio=float(train_cfg.get("jitter_ratio", 0.01)),
         jitter_prob=float(train_cfg.get("jitter_prob", 1.0)),
     )
@@ -276,7 +278,7 @@ def main():
         batch_size=val_batch_size,
         device=device,
         seed=seed,
-        split_indices_path=str(SPLIT_INDICES_DIR / "injury_val_indices.npy"),
+        split_indices_path=str(SPLIT_INDICES_DIR / "injury_val_indices.csv"),
         jitter_ratio=0.0,
         jitter_prob=0.0,
     )

@@ -133,15 +133,22 @@ class StrategyNet(nn.Module):
 
         这里把“网络回归”和“动作约束”拆成两个连续步骤：
         1. 先用 sigmoid 和边界盒把输出限制在 trainable 参数的基础物理范围内；
-        2. 再调用约束引擎处理 AFT/BTF、LLATTF/BTF、LL1/LL2 这类连续耦合关系。
+        2. 再把动作拼回完整特征张量，由约束引擎统一做连续耦合投影。
 
         这样做的目的不是增加层次，而是避免让网络直接学习一整套硬规则；
         策略网络只负责学习从状态到动作的映射，参数合法化仍然由统一的约束层定义。
         """
         norm_actions = torch.sigmoid(raw_output)
-        span = torch.where(self.max_bounds > self.min_bounds, self.max_bounds - self.min_bounds, torch.ones_like(self.max_bounds))
+        span = torch.where(
+            self.max_bounds > self.min_bounds,
+            self.max_bounds - self.min_bounds,
+            torch.ones_like(self.max_bounds),
+        )
         actions = norm_actions * span.unsqueeze(0) + self.min_bounds.unsqueeze(0)
-        return self.constraint_engine.project_forward(actions, context_features)
+        full_features = self.constraint_engine.compose_full_features(context_features, actions)
+        projected_full = self.constraint_engine.project_forward(full_features, strict=False)
+        _, projected_actions = self.constraint_engine.split_from_full(projected_full)
+        return projected_actions
 
     def forward(self, context_features: torch.Tensor, pulse_features: torch.Tensor) -> torch.Tensor:
         # pulse 只作为工况补充信息编码进策略，不在这里重复生成，

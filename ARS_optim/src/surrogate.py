@@ -122,7 +122,14 @@ class SurrogateAdapter(nn.Module):
         )
         return combined_phys, model_input_norm
 
-    def predict_injury_and_loss(self, context_params: torch.Tensor, control_trainable: torch.Tensor, pulse_norm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    def predict_injury_and_loss(
+        self,
+        context_params: torch.Tensor,
+        control_trainable: torch.Tensor,
+        pulse_norm: torch.Tensor,
+        include_yaml_bounds: bool = False,
+        detach_info: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         # 这里返回逐样本 loss 而不是 batch mean，原因是局部精调和评估表都需要保留样本粒度；
         # batch 聚合只在更外层训练循环里完成，避免优化器和评估脚本各自再拆一次总损失。
         combined_phys, model_input_norm = self._prepare_normalized_inputs(context_params, control_trainable)
@@ -153,22 +160,40 @@ class SurrogateAdapter(nn.Module):
         )
         joint_risk = 1.0 - ((1.0 - p_head) * (1.0 - p_chest) * (1.0 - p_neck))
 
-        loss_constraint = self.constraint_engine.compute_soft_penalty(control_trainable, context_params)
+        # 软惩罚始终基于完整物理特征计算，避免在 context/trainable 分离表示下重复拼列。
+        loss_constraint = self.constraint_engine.compute_soft_penalty(
+            combined_phys,
+            include_yaml_bounds=include_yaml_bounds,
+        )
         loss_distribution = self.distribution_penalty.compute(context_params, control_trainable)
         total_loss = loss_risk + self.weight_penalty * loss_constraint + self.weight_distribution * loss_distribution
 
-        info = {
-            "loss_risk": loss_risk.detach(),
-            "loss_constraint": loss_constraint.detach(),
-            "loss_distribution": loss_distribution.detach(),
-            "p_head": p_head.detach(),
-            "p_chest": p_chest.detach(),
-            "p_neck": p_neck.detach(),
-            "joint_risk": joint_risk.detach(),
-            "hic15": hic15.detach(),
-            "dmax": dmax.detach(),
-            "nij": nij.detach(),
-        }
+        if detach_info:
+            info = {
+                "loss_risk": loss_risk.detach(),
+                "loss_constraint": loss_constraint.detach(),
+                "loss_distribution": loss_distribution.detach(),
+                "p_head": p_head.detach(),
+                "p_chest": p_chest.detach(),
+                "p_neck": p_neck.detach(),
+                "joint_risk": joint_risk.detach(),
+                "hic15": hic15.detach(),
+                "dmax": dmax.detach(),
+                "nij": nij.detach(),
+            }
+        else:
+            info = {
+                "loss_risk": loss_risk,
+                "loss_constraint": loss_constraint,
+                "loss_distribution": loss_distribution,
+                "p_head": p_head,
+                "p_chest": p_chest,
+                "p_neck": p_neck,
+                "joint_risk": joint_risk,
+                "hic15": hic15,
+                "dmax": dmax,
+                "nij": nij,
+            }
         return total_loss, predictions_phys, info
 
     def evaluate_actions(
@@ -176,6 +201,8 @@ class SurrogateAdapter(nn.Module):
         context_params: torch.Tensor,
         control_trainable: torch.Tensor,
         pulse_norm: torch.Tensor = None,
+        include_yaml_bounds: bool = False,
+        detach_info: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict, torch.Tensor]:
         """统一的动作评估入口。
 
@@ -187,7 +214,13 @@ class SurrogateAdapter(nn.Module):
         """
         if pulse_norm is None:
             pulse_norm = self.generate_pulse(context_params)
-        loss_batch, predictions, info = self.predict_injury_and_loss(context_params, control_trainable, pulse_norm)
+        loss_batch, predictions, info = self.predict_injury_and_loss(
+            context_params,
+            control_trainable,
+            pulse_norm,
+            include_yaml_bounds=include_yaml_bounds,
+            detach_info=detach_info,
+        )
         return loss_batch, predictions, info, pulse_norm
 
     def generate_pulse(self, context_params: torch.Tensor) -> torch.Tensor:
