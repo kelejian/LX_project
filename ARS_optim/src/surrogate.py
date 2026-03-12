@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -107,7 +107,7 @@ class SurrogateAdapter(nn.Module):
         if self.distribution_penalty.enabled:
             self.distribution_penalty.fit(reference_features)
 
-    def _prepare_normalized_inputs(self, context_params: torch.Tensor, control_trainable: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _prepare_normalized_inputs(self, context_params: torch.Tensor, control_trainable: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """把 context/trainable 重新拼成完整特征，并映射到代理模型需要的归一化空间。
 
         PulsePredict 和 InjuryPredict 依赖的是全量 FEATURE_ORDER 输入；
@@ -129,6 +129,7 @@ class SurrogateAdapter(nn.Module):
         pulse_norm: torch.Tensor,
         include_yaml_bounds: bool = False,
         detach_info: bool = True,
+        penalty_features: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         # 这里返回逐样本 loss 而不是 batch mean，原因是局部精调和评估表都需要保留样本粒度；
         # batch 聚合只在更外层训练循环里完成，避免优化器和评估脚本各自再拆一次总损失。
@@ -160,9 +161,12 @@ class SurrogateAdapter(nn.Module):
         )
         joint_risk = 1.0 - ((1.0 - p_head) * (1.0 - p_chest) * (1.0 - p_neck))
 
-        # 软惩罚始终基于完整物理特征计算，避免在 context/trainable 分离表示下重复拼列。
+        # 默认在当前送入代理模型的物理特征上计算软惩罚。
+        # 训练策略网络时会额外传入 penalty_features=投影前特征，用于在前向投影
+        # 截断违约量之后，仍保留把动作拉回合法域的梯度补偿。
+        penalty_source = combined_phys if penalty_features is None else penalty_features
         loss_constraint = self.constraint_engine.compute_soft_penalty(
-            combined_phys,
+            penalty_source,
             include_yaml_bounds=include_yaml_bounds,
         )
         loss_distribution = self.distribution_penalty.compute(context_params, control_trainable)
@@ -196,33 +200,6 @@ class SurrogateAdapter(nn.Module):
             }
         return total_loss, predictions_phys, info
 
-    def evaluate_actions(
-        self,
-        context_params: torch.Tensor,
-        control_trainable: torch.Tensor,
-        pulse_norm: torch.Tensor = None,
-        include_yaml_bounds: bool = False,
-        detach_info: bool = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict, torch.Tensor]:
-        """统一的动作评估入口。
-
-        若调用方未预先提供 pulse，这里会基于 context 生成同一份归一化波形；
-        然后只做代理评估本身，返回损伤预测、逐样本 loss 和风险拆解。
-
-        该接口不修复动作，目的是避免把“代理评估”和“动作合法化”写在同一处，
-        让调用方难以判断当前拿到的是原始动作还是修复后的动作。
-        """
-        if pulse_norm is None:
-            pulse_norm = self.generate_pulse(context_params)
-        loss_batch, predictions, info = self.predict_injury_and_loss(
-            context_params,
-            control_trainable,
-            pulse_norm,
-            include_yaml_bounds=include_yaml_bounds,
-            detach_info=detach_info,
-        )
-        return loss_batch, predictions, info, pulse_norm
-
     def generate_pulse(self, context_params: torch.Tensor) -> torch.Tensor:
         # context_params 只包含 context 子集，列顺序并不等于 FEATURE_ORDER。
         # 这里先补全为完整特征向量，再按 FEATURE_ORDER 中的固定索引抽取 impact 参数，
@@ -237,6 +214,3 @@ class SurrogateAdapter(nn.Module):
             raise ValueError(f"generate_pulse 输出形状异常: {tuple(pulse_xy.shape)}")
         return pulse_xy
 
-    def forward(self, context_params: torch.Tensor, control_trainable: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
-        loss_batch, predictions, info, _ = self.evaluate_actions(context_params, control_trainable)
-        return loss_batch, predictions, info

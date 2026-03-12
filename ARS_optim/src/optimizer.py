@@ -1,5 +1,5 @@
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import torch
 
@@ -7,7 +7,6 @@ from ARS_optim.src.constraints import ConstraintEngine
 from ARS_optim.src.param_manager import ParamManager
 from ARS_optim.src.strategy_net import StrategyNet
 from ARS_optim.src.surrogate import SurrogateAdapter
-
 
 class LocalRefiner:
     """局部精调优化器。
@@ -58,18 +57,9 @@ class LocalRefiner:
                 raise ValueError("direct_inference=True 但未提供 strategy_net")
             self.strategy_net.eval()
             with torch.no_grad():
-                return self.strategy_net(context_params, pulse_norm)
+                projected_actions, _ = self.strategy_net(context_params, pulse_norm)
+                return projected_actions
         return self.param_manager.get_trainable_defaults_tensor(device=device).unsqueeze(0).expand(batch_size, -1)
-
-    def _evaluate_stage(self, context_params: torch.Tensor, actions: torch.Tensor, pulse_norm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
-        """评估一个已经合法化的动作阶段。"""
-        loss_batch, preds, info, _ = self.surrogate.evaluate_actions(
-            context_params=context_params,
-            control_trainable=actions,
-            pulse_norm=pulse_norm,
-            include_yaml_bounds=False,
-        )
-        return loss_batch, preds, info
 
     def _strict_project_actions(self, context_params: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -78,22 +68,35 @@ class LocalRefiner:
             _, projected_actions = self.constraint_engine.split_from_full(projected_full)
         return projected_actions
 
-    def optimize(self, context_params: torch.Tensor, pulse_norm: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+    def optimize(self, context_params: torch.Tensor, pulse_norm: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        """执行逐点局部精调。
+
+        pulse_norm 必须由调用方显式提供，避免优化器内部再隐式触发一遍 pulse 生成，
+        让训练、评估和局部精调都共享同一条明确的 pulse 来源语义。
+        """
         self.surrogate.eval()
 
-        if pulse_norm is None:
-            with torch.no_grad():
-                pulse_norm = self.surrogate.generate_pulse(context_params)
         init_actions = self._resolve_initial_actions(context_params, pulse_norm)
         init_actions = self._strict_project_actions(context_params, init_actions)
-        init_loss_batch, init_preds, init_info = self._evaluate_stage(context_params, init_actions, pulse_norm)
-        direct_stage = {
-            "enabled": bool(self.direct_inference),
-            "actions": init_actions.detach() if self.direct_inference else None,
-            "loss_batch": init_loss_batch.detach() if self.direct_inference else None,
-            "preds": init_preds.detach() if self.direct_inference else None,
-            "detail": {key: value.detach() for key, value in init_info.items()} if self.direct_inference else {},
-        }
+        init_loss_batch, init_preds, init_info = self.surrogate.predict_injury_and_loss(
+            context_params=context_params,
+            control_trainable=init_actions,
+            pulse_norm=pulse_norm,
+            include_yaml_bounds=False,
+        )
+        direct_stage = None
+        if self.direct_inference:
+            direct_stage = {
+                "actions": init_actions.detach(),
+                "loss_batch": init_loss_batch.detach(),
+                "preds": init_preds.detach(),
+                "detail": {
+                    "p_head": init_info["p_head"].detach(),
+                    "p_chest": init_info["p_chest"].detach(),
+                    "p_neck": init_info["p_neck"].detach(),
+                    "joint_risk": init_info["joint_risk"].detach(),
+                },
+            }
 
         if self.refine_steps <= 0:
             result = {
@@ -115,6 +118,11 @@ class LocalRefiner:
         start = time.time()
         min_bounds = self._trainable_mins_cpu.to(device=context_params.device, dtype=context_params.dtype)
         max_bounds = self._trainable_maxs_cpu.to(device=context_params.device, dtype=context_params.dtype)
+        # 局部精调直接在物理空间更新变量；若每步都硬夹回 yaml 边界，
+        # 边界附近很容易因为 Adam 动量和投影共同作用而出现“贴边抖动”。
+        # 这里允许优化变量在边界外保留 10% 的缓冲带，
+        # 真正送入代理模型前仍会经过 forward projection 与软惩罚，
+        # 最终输出阶段再由 strict projection 收回绝对合法域。
         relaxed_span = torch.clamp(max_bounds - min_bounds, min=1e-6) * 0.1
         relaxed_lower = min_bounds - relaxed_span
         relaxed_upper = max_bounds + relaxed_span
@@ -134,7 +142,9 @@ class LocalRefiner:
             )
             loss_risk = risk_info["loss_risk"]
             penalty = self.constraint_engine.compute_soft_penalty(full_raw, include_yaml_bounds=True)
-            dist_penalty = self.surrogate.distribution_penalty.compute(context_params, opt_var)
+            # 分布偏离惩罚应约束当前真正送入代理模型评估的候选解，
+            # 否则会把置信度约束施加到投影前的松弛变量上，和实际优化轨迹错位。
+            dist_penalty = self.surrogate.distribution_penalty.compute(context_params, projected_actions)
             total_batch = (
                 loss_risk
                 + self.surrogate.weight_penalty * penalty
@@ -150,7 +160,12 @@ class LocalRefiner:
 
         end = time.time()
         final_actions = self._strict_project_actions(context_params, opt_var)
-        final_loss, final_preds, final_info = self._evaluate_stage(context_params, final_actions, pulse_norm)
+        final_loss, final_preds, final_info = self.surrogate.predict_injury_and_loss(
+            context_params=context_params,
+            control_trainable=final_actions,
+            pulse_norm=pulse_norm,
+            include_yaml_bounds=False,
+        )
         final_info["final_loss_batch"] = final_loss.detach()
         if "joint_risk" in final_info:
             final_info["joint_risk_batch"] = final_info["joint_risk"]

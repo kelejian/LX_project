@@ -11,7 +11,6 @@ import yaml
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from common.data_utils.split_io import load_int_vector_csv
 from common.data_utils.processor import UnifiedDataProcessor
 from common.settings import NORMALIZATION_CONFIG_PATH, SPLIT_INDICES_DIR
 from common.tools.logger import setup_logger
@@ -143,14 +142,17 @@ def _evaluate_strategy_batch(
     最后交给代理模型计算逐样本 loss 与风险拆解。
 
     这样做的目的不是增加封装层，而是避免训练循环和验证循环各自维护一套相同的前向逻辑。
+    同时也把 pulse 的来源固定为“当前 batch 显式生成一次并沿链路传递”，
+    不允许策略网、代理层或局部优化器在内部再各跑一次隐式 pulse fallback。
     """
     pulse_norm = surrogate.generate_pulse(context_params)
-    actions = strategy_net(context_params, pulse_norm)
-    loss_batch, _, info, _ = surrogate.evaluate_actions(
+    actions, raw_full_features = strategy_net(context_params, pulse_norm)
+    loss_batch, _, info = surrogate.predict_injury_and_loss(
         context_params=context_params,
         control_trainable=actions,
         pulse_norm=pulse_norm,
         include_yaml_bounds=False,
+        penalty_features=raw_full_features,
     )
     return loss_batch, info
 
@@ -378,12 +380,15 @@ def main():
             loss_risk = float(info["loss_risk"].mean().item())
             loss_constraint = float(info["loss_constraint"].mean().item())
             loss_distribution = float(info["loss_distribution"].mean().item())
+            jitter_rejection_rate = float(train_sampler.last_rejection_rate)
             current_lr = float(optimizer.param_groups[0]["lr"])
 
             ema_train_loss = loss_value if ema_train_loss is None else ema_alpha * ema_train_loss + (1.0 - ema_alpha) * loss_value
             train_select_metric = ema_train_loss if ema_enabled else loss_value
             # 训练最优权重默认按 EMA 指标挑选，是为了弱化随机采样流带来的单步抖动；
             # 但在 warmup 结束前 EMA 还没有稳定含义，因此这段区间不更新 train_best。
+            # val_best 则始终来自固定 injury_val 全量评估，表示“泛化到固定验证切片的最好点”。
+            # 两者故意分开记录，避免把流式训练噪声下的最优点和固定验证集最优点混成一个概念。
             ema_ready = (iter_idx + 1) >= max(1, ema_warmup_iters) if ema_enabled else True
 
             if writer is not None:
@@ -391,6 +396,7 @@ def main():
                 writer.add_scalar("Train/LossRisk", loss_risk, iter_idx)
                 writer.add_scalar("Train/LossConstraint", loss_constraint, iter_idx)
                 writer.add_scalar("Train/LossDistribution", loss_distribution, iter_idx)
+                writer.add_scalar("Train/JitterRejectionRate", jitter_rejection_rate, iter_idx)
                 writer.add_scalar("Train/LR", current_lr, iter_idx)
                 if ema_log_to_tb:
                     writer.add_scalar("Train/EMA_Loss", float(ema_train_loss), iter_idx)
@@ -424,6 +430,7 @@ def main():
                     "train_loss_risk": loss_risk,
                     "train_loss_constraint": loss_constraint,
                     "train_loss_distribution": loss_distribution,
+                    "jitter_rejection_rate": jitter_rejection_rate,
                     "val_loss": val_loss,
                     "val_loss_risk": val_loss_risk,
                     "val_loss_constraint": val_loss_constraint,
@@ -434,7 +441,8 @@ def main():
             if iter_idx % max(1, log_interval) == 0:
                 tqdm.write(
                     f"iter={iter_idx + 1} loss={loss_value:.4f} ema={ema_train_loss:.4f} "
-                    f"risk={loss_risk:.4f} penalty={loss_constraint:.4f} dist={loss_distribution:.4f} lr={current_lr:.2e}"
+                    f"risk={loss_risk:.4f} penalty={loss_constraint:.4f} dist={loss_distribution:.4f} "
+                    f"rej={jitter_rejection_rate:.2%} lr={current_lr:.2e}"
                 )
 
         if save_last:

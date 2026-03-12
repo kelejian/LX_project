@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
@@ -128,8 +128,12 @@ class StrategyNet(nn.Module):
         # 而 OT 本身又带有明确的序数语义（5th < 50th < 95th），因此标量编码已经足够让 MLP 学到体型趋势。
         return self.data_processor.process_by_name(context_features, self.context_names, inverse=False)
 
-    def _decode_actions_from_logits(self, raw_output: torch.Tensor, context_features: torch.Tensor) -> torch.Tensor:
-        """将网络输出的无界 logits 还原为物理参数，并做连续可微投影。
+    def _decode_actions_from_logits(
+        self,
+        raw_output: torch.Tensor,
+        context_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """将网络输出的无界 logits 还原为物理参数，并返回训练所需的两类结果。
 
         这里把“网络回归”和“动作约束”拆成两个连续步骤：
         1. 先用 sigmoid 和边界盒把输出限制在 trainable 参数的基础物理范围内；
@@ -137,6 +141,11 @@ class StrategyNet(nn.Module):
 
         这样做的目的不是增加层次，而是避免让网络直接学习一整套硬规则；
         策略网络只负责学习从状态到动作的映射，参数合法化仍然由统一的约束层定义。
+
+        返回值分成两部分：
+        - projected_actions：投影后的可行动作，送入代理模型计算损伤；
+        - raw_full_features：Sigmoid 后、DAG 投影前的完整物理特征，专门给训练阶段
+          的软惩罚使用，确保当前向投影截断掉违约量时，惩罚项仍能从原始违约方向提供梯度补偿。
         """
         norm_actions = torch.sigmoid(raw_output)
         span = torch.where(
@@ -145,14 +154,20 @@ class StrategyNet(nn.Module):
             torch.ones_like(self.max_bounds),
         )
         actions = norm_actions * span.unsqueeze(0) + self.min_bounds.unsqueeze(0)
-        full_features = self.constraint_engine.compose_full_features(context_features, actions)
-        projected_full = self.constraint_engine.project_forward(full_features, strict=False)
+        raw_full_features = self.constraint_engine.compose_full_features(context_features, actions)
+        projected_full = self.constraint_engine.project_forward(raw_full_features, strict=False)
         _, projected_actions = self.constraint_engine.split_from_full(projected_full)
-        return projected_actions
+        return projected_actions, raw_full_features
 
-    def forward(self, context_features: torch.Tensor, pulse_features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        context_features: torch.Tensor,
+        pulse_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # pulse 只作为工况补充信息编码进策略，不在这里重复生成，
         # 这样训练、验证和评估都可以复用同一份 pulse，避免同批样本重复跑代理前端。
+        # 评估阶段的 LocalRefiner 也遵守同一约定：pulse 必须由外层显式传入，
+        # 不再在策略网或优化器内部各自补跑一次 surrogate.generate_pulse。
         pulse_embed = self.pulse_encoder(pulse_features)
         context_norm = self._normalize_context(context_features)
         combined = torch.cat([context_norm, pulse_embed], dim=1)

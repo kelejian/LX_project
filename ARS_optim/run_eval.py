@@ -23,6 +23,23 @@ from ARS_optim.src.strategy_net import build_strategy_net_from_config
 from ARS_optim.src.surrogate import SurrogateAdapter, load_surrogate_models
 
 
+STAGE_NAMES = ("Base", "Opt1", "Opt2")
+STAGE_INFO_KEYS = ("p_head", "p_chest", "p_neck", "joint_risk")
+REDUCTION_SPECS = (
+    ("HIC", "Base_HIC", "Opt_HIC"),
+    ("Dmax", "Base_Dmax", "Opt_Dmax"),
+    ("Nij", "Base_Nij", "Opt_Nij"),
+    ("Phead", "Base_Phead", "Opt_Phead"),
+    ("Pchest", "Base_Pchest", "Opt_Pchest"),
+    ("Pneck", "Base_Pneck", "Opt_Pneck"),
+    ("JointRisk", "Base_JointRisk", "Opt_JointRisk"),
+    ("AIS_head", "Base_AIS_head", "Opt_AIS_head"),
+    ("AIS_chest", "Base_AIS_chest", "Opt_AIS_chest"),
+    ("AIS_neck", "Base_AIS_neck", "Opt_AIS_neck"),
+    ("AIS_max", "Base_AIS_max", "Opt_AIS_max"),
+)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="ARS Local Refinement Evaluator")
     parser.add_argument("--input_csv", type=str, default=None, help="输入工况参数 CSV；若不提供则自动使用 injury test split")
@@ -82,6 +99,14 @@ def _safe_nanmean(series: pd.Series) -> float:
     return float(np.nan) if np.isnan(values).all() else float(np.nanmean(values))
 
 
+def _get_reported_stage_name(stage_outputs: Dict[str, object]) -> Optional[str]:
+    if stage_outputs["Opt2"]["preds"] is not None:
+        return "Opt2"
+    if stage_outputs["Opt1"]["preds"] is not None:
+        return "Opt1"
+    return None
+
+
 def _build_param_dataframe(
     df_input: pd.DataFrame,
     params: List[dict],
@@ -118,6 +143,16 @@ def _prepare_eval_inputs(
     logger,
     strict_provided_validation: bool,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], List[str], np.ndarray, List[int], List[int]]:
+    """整理评估输入。
+
+    strict_provided_validation=True 只用于外部 input_csv：
+    - 已提供的 context 值必须逐行合法，否则跳过该 case；
+    - baseline trainable 若缺失或非法，只回退该行 baseline 到 default。
+
+    strict_provided_validation=False 只用于内部 test split：
+    - 不做逐列修补；
+    - 发现非法 case 直接逐行跳过。
+    """
     context_params = param_manager.get_context_params()
     trainable_params = param_manager.get_trainable_params()
     context_names = param_manager.get_context_names()
@@ -196,7 +231,10 @@ def _prepare_eval_inputs(
         legal_context_indices = candidate_indices[context_valid_local]
         if legal_context_indices.size > 0:
             valid_mask[legal_context_indices] = True
-            context_eval_df.loc[legal_context_indices, context_names] = context_df_raw.loc[legal_context_indices, context_names]
+            context_eval_df.loc[legal_context_indices, context_names] = context_df_raw.loc[
+                legal_context_indices,
+                context_names,
+            ].to_numpy(dtype=np.float32)
 
             baseline_candidate = baseline_df_raw.loc[legal_context_indices, trainable_names].copy()
             provided_trainable_nan_rows = baseline_candidate[provided_trainable].isna().any(axis=1).to_numpy() if provided_trainable else np.zeros(len(legal_context_indices), dtype=bool)
@@ -224,7 +262,10 @@ def _prepare_eval_inputs(
             if reverted_indices.size > 0:
                 reverted_baseline_rows.extend(reverted_indices.astype(int).tolist())
 
-            baseline_eval_df.loc[legal_context_indices, trainable_names] = baseline_candidate.loc[legal_context_indices, trainable_names]
+            baseline_eval_df.loc[legal_context_indices, trainable_names] = baseline_candidate.loc[
+                legal_context_indices,
+                trainable_names,
+            ].to_numpy(dtype=np.float32)
             if reverted_indices.size > 0:
                 baseline_eval_df.loc[reverted_indices, trainable_names] = default_trainable
 
@@ -315,9 +356,9 @@ def _compute_predictions_batch(
             "preds": [],
             "actions": [],
             "loss": [],
-            "info": {name: [] for name in ["p_head", "p_chest", "p_neck", "joint_risk"]},
+            "info": {name: [] for name in STAGE_INFO_KEYS},
         }
-        for key in ["Base", "Opt1", "Opt2"]
+        for key in STAGE_NAMES
     }
     total_time_cost = 0.0
     trajectory_all: List[float] = []
@@ -336,32 +377,32 @@ def _compute_predictions_batch(
         stage_parts["Base"]["preds"].append(base_preds.detach())
         stage_parts["Base"]["actions"].append(baseline_batch.detach())
         stage_parts["Base"]["loss"].append(base_loss.detach())
-        for key in stage_parts["Base"]["info"]:
+        for key in STAGE_INFO_KEYS:
             stage_parts["Base"]["info"][key].append(base_info[key].detach())
 
         if optimizer.direct_inference or optimizer.refine_steps > 0:
             opt_actions, opt_preds, opt_info = optimizer.optimize(context_batch, pulse_norm=pulse_batch)
-            direct_stage = opt_info.get("direct_stage", {})
-            if direct_stage.get("enabled") and direct_stage.get("actions") is not None:
-                stage_parts["Opt1"]["actions"].append(direct_stage["actions"].detach())
+            direct_stage = opt_info.get("direct_stage")
+            if direct_stage is not None:
                 stage_parts["Opt1"]["preds"].append(direct_stage["preds"].detach())
+                stage_parts["Opt1"]["actions"].append(direct_stage["actions"].detach())
                 stage_parts["Opt1"]["loss"].append(direct_stage["loss_batch"].detach())
-                direct_detail = direct_stage.get("detail", {})
-                for key in stage_parts["Opt1"]["info"]:
-                    stage_parts["Opt1"]["info"][key].append(direct_detail[key].detach())
+                for key in STAGE_INFO_KEYS:
+                    stage_parts["Opt1"]["info"][key].append(direct_stage["detail"][key].detach())
 
             if opt_info.get("refine_stage_enabled", False):
                 stage_parts["Opt2"]["preds"].append(opt_preds.detach())
                 stage_parts["Opt2"]["actions"].append(opt_actions.detach())
                 stage_parts["Opt2"]["loss"].append(opt_info["final_loss_batch"].detach())
-                for key in stage_parts["Opt2"]["info"]:
+                for key in STAGE_INFO_KEYS:
                     stage_parts["Opt2"]["info"][key].append(opt_info[key].detach())
 
             total_time_cost += float(opt_info.get("time_cost", 0.0))
             trajectory_all.extend(opt_info.get("trajectory", []))
 
     output = {"total_time_cost": total_time_cost, "trajectory_all": trajectory_all}
-    for prefix, content in stage_parts.items():
+    for prefix in STAGE_NAMES:
+        content = stage_parts[prefix]
         output[prefix] = {
             "preds": torch.cat(content["preds"], dim=0) if content["preds"] else None,
             "actions": torch.cat(content["actions"], dim=0) if content["actions"] else None,
@@ -382,7 +423,7 @@ def _expand_stage_outputs_to_full(
         "total_time_cost": stage_outputs["total_time_cost"],
         "trajectory_all": stage_outputs["trajectory_all"],
     }
-    for stage_name in ["Base", "Opt1", "Opt2"]:
+    for stage_name in STAGE_NAMES:
         stage = stage_outputs[stage_name]
         preds_src = stage["preds"]
         actions_src = stage["actions"]
@@ -443,7 +484,7 @@ def _build_stage_metric_dataframe(
         )
 
     pred_array = preds.detach().cpu().numpy()
-    info_arrays = {name: info[name].detach().cpu().numpy() for name in ["p_head", "p_chest", "p_neck", "joint_risk"]}
+    info_arrays = {name: info[name].detach().cpu().numpy() for name in STAGE_INFO_KEYS}
     invalid_rows = np.isnan(pred_array).any(axis=1)
 
     stage_df = pd.DataFrame(
@@ -484,15 +525,19 @@ def _build_result_dataframe(
     stage_outputs: Dict[str, object],
     truth_arrays: Dict[str, np.ndarray],
     trainable_names: List[str],
-    optimized_stage_name: str,
-) -> tuple[pd.DataFrame, Dict[str, float], str]:
+    optimized_stage_name: Optional[str],
+) -> tuple[pd.DataFrame, Dict[str, float]]:
     excluded_input_cols = set(FEATURE_ORDER) | {"y_HIC", "y_Dmax", "y_Nij", "ais_head", "ais_chest", "ais_neck"}
     metadata_cols = [col for col in df_input.columns if col not in excluded_input_cols]
     metadata_df = df_input[metadata_cols].reset_index(drop=True)
     frame_parts = [metadata_df, context_df.reset_index(drop=True)]
 
     ot_array = pd.to_numeric(context_df["OT"], errors="coerce").to_numpy(dtype=np.float32)
-    optimized_stage = stage_outputs[optimized_stage_name]
+    optimized_stage = stage_outputs[optimized_stage_name] if optimized_stage_name is not None else {
+        "preds": None,
+        "actions": None,
+        "info": {},
+    }
 
     baseline_df = baseline_df.reset_index(drop=True).rename(columns={name: f"Base_{name}" for name in trainable_names})
     frame_parts.append(baseline_df)
@@ -540,21 +585,8 @@ def _build_result_dataframe(
                 truth_df[f"True_vs_{prefix}_{name}"] = truth_df[f"True_{name}"] - result_df[f"{prefix}_{name}"]
         result_df = pd.concat([result_df, truth_df], axis=1)
 
-    reduction_specs = [
-        ("HIC", "Base_HIC", "Opt_HIC"),
-        ("Dmax", "Base_Dmax", "Opt_Dmax"),
-        ("Nij", "Base_Nij", "Opt_Nij"),
-        ("Phead", "Base_Phead", "Opt_Phead"),
-        ("Pchest", "Base_Pchest", "Opt_Pchest"),
-        ("Pneck", "Base_Pneck", "Opt_Pneck"),
-        ("JointRisk", "Base_JointRisk", "Opt_JointRisk"),
-        ("AIS_head", "Base_AIS_head", "Opt_AIS_head"),
-        ("AIS_chest", "Base_AIS_chest", "Opt_AIS_chest"),
-        ("AIS_neck", "Base_AIS_neck", "Opt_AIS_neck"),
-        ("AIS_max", "Base_AIS_max", "Opt_AIS_max"),
-    ]
     reduction_data = {}
-    for alias, base_col, opt_col in reduction_specs:
+    for alias, base_col, opt_col in REDUCTION_SPECS:
         reduction_abs = result_df[base_col] - result_df[opt_col]
         reduction_data[f"Reduction_{alias}"] = reduction_abs
 
@@ -576,7 +608,7 @@ def _build_result_dataframe(
         "mean_opt_ais_max": _safe_nanmean(result_df["Opt_AIS_max"]),
         "n_samples": int(len(result_df)),
     }
-    return result_df, summary, optimized_stage_name
+    return result_df, summary
 
 
 def _build_eval_info(
@@ -596,7 +628,7 @@ def _build_eval_info(
     reverted_baseline_rows: List[int],
     opt1_generated: bool,
     opt2_generated: bool,
-    optimized_stage_name: str,
+    optimized_stage_name: Optional[str],
     surrogate: SurrogateAdapter,
     summary_metrics: Dict[str, float],
     stage_outputs: Dict[str, object],
@@ -617,8 +649,8 @@ def _build_eval_info(
             "trainable_control": trainable_names,
             "fixed_control": param_manager.get_fixed_control_names(),
         },
-        "missing_context_filled_by_default": missing_context,
-        "missing_trainable_filled_by_default": missing_trainable,
+        "missing_context_columns": missing_context,
+        "missing_trainable_columns_filled_by_default": missing_trainable,
         "skipped_case_rows": skipped_case_rows,
         "skipped_cases_count": len(skipped_case_rows),
         "reverted_baseline_rows": reverted_baseline_rows,
@@ -627,8 +659,8 @@ def _build_eval_info(
             "test_split": "rowwise_skip_invalid_internal_cases" if not args.input_csv else None,
         },
         "stage_definition": {
-            "Base": "输入 CSV 提供的 baseline control；缺失时回填 default",
-            "Opt1": "策略网络直推结果；仅在 direct_inference=True 且权重可用时存在",
+            "Base": "baseline control；input_csv 缺失值按列回填 default，非法 baseline 按行回退 default",
+            "Opt1": "策略网络直推结果；仅在 direct_inference=True 且显式提供兼容权重时存在",
             "Opt2": "局部精调结果；仅在 refine_steps>0 时存在",
         },
         "stage_status": {
@@ -758,14 +790,9 @@ def main():
         trainable_dim=len(trainable_names),
     )
 
-    if optimizer.refine_steps > 0:
-        optimized_stage_name = "Opt2"
-    elif optimizer.direct_inference:
-        optimized_stage_name = "Opt1"
-    else:
-        raise ValueError("当前配置未启用任何优化阶段，无法组织评估输出")
+    optimized_stage_name = _get_reported_stage_name(stage_outputs)
 
-    result_df, summary_metrics, optimized_stage_name = _build_result_dataframe(
+    result_df, summary_metrics = _build_result_dataframe(
         df_input=df_input,
         context_df=context_output_df,
         baseline_df=baseline_df,

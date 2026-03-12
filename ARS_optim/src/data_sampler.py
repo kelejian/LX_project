@@ -39,6 +39,7 @@ class StateDataSampler:
         self.device = device
         self.jitter_ratio = float(jitter_ratio)
         self.jitter_prob = float(jitter_prob)
+        self._last_rejection_rate = 0.0
 
         self.rng = torch.Generator(device=device)
         if seed is not None:
@@ -104,6 +105,7 @@ class StateDataSampler:
 
     def _apply_bounded_jitter(self, batch_context: torch.Tensor) -> torch.Tensor:
         if not self.context_cont_local_indices or self.jitter_ratio <= 0:
+            self._last_rejection_rate = 0.0
             return batch_context
 
         original_context = batch_context.clone()
@@ -145,18 +147,26 @@ class StateDataSampler:
         )
         batch_context[:, self.context_cont_local_indices] = tentative_continuous
 
-        # 扰动后不做任何后置合法化；若新样本不满足硬约束，则整行回退为经验池原样本。
+        # 掩码后的扰动只生成“试探样本”；这里不做任何后置修补。
+        # 只要某行试探样本破坏硬约束，就整行拒绝并回退为原始经验池样本。
         full_features = self.constraint_engine.compose_full_features(batch_context)
         valid_mask = self.constraint_engine.is_valid_physics(full_features)
+        self._last_rejection_rate = float((~valid_mask).to(dtype=torch.float32).mean().item())
         if (~valid_mask).any():
             batch_context[~valid_mask] = original_context[~valid_mask]
         return batch_context
+
+    @property
+    def last_rejection_rate(self) -> float:
+        return self._last_rejection_rate
 
     def _generate_batch(self) -> torch.Tensor:
         indices = torch.randint(0, self.pool_size, (self.batch_size,), generator=self.rng, device=self.device)
         batch_context = self.pool_context[indices].clone()
         # 先尝试对经验池样本做轻微连续扰动；若扰动破坏了硬约束，则直接回退该样本，
         # 保留未经扰动的原始经验池样本，而不是生成一份后置修补过的伪新样本。
+        # 训练链路只接受“经验池真样本”或“仍然物理合法的轻扰动样本”这两类数据，
+        # 不再引入额外 sanitize 语义，避免采样器与约束层各自维护一套修复规则。
         return self._apply_bounded_jitter(batch_context)
 
     def get_infinite_generator(self) -> Iterator[torch.Tensor]:

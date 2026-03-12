@@ -91,7 +91,7 @@ ARS_optim/
 
 1. 从损伤预测任务的训练集索引中取样
 2. 对连续 context 特征加入轻微扰动
-3. 扰动后统一通过约束引擎回收至合法可行域
+3. 若扰动破坏硬约束，则整行 reject rollback 回退为经验池原样本，不额外做 sanitize
 
 验证阶段则使用 injury_val 全量样本，不加扰动，并按 val_interval 定期评估完整验证集。
 
@@ -142,7 +142,7 @@ ARS_optim/
 - AFT/BTF、LL2/LL1、LLATTF/BTF 等耦合规则
 - overlap 与 angle 的规则
 - 座椅 SP/SH 多边形约束
-- RA 离散档位
+- RA 条件区间
 
 如果后续要切换某个 control 参数是否可调，应优先修改此文件，而不是修改训练或评估脚本。
 
@@ -235,15 +235,17 @@ python -m ARS_optim.run_eval --input_csv path/to/input.csv --output_csv my_eval.
 若使用 input_csv：
 
 - 应包含 context 参数列
-- 若缺失某个 context 参数，会自动回填 param_space.yaml 中的 default，并发出提醒
+- 若缺失某个 context 参数，该行会被跳过，不再静默补 default
 - 若额外提供了 trainable control 列，则这些值作为 baseline 输入
 - 若未提供 trainable control 列，则 baseline 使用 default 值
-- 对于用户已显式提供的列，如果不合法或违反硬约束，会直接报错
+- 若 baseline trainable 缺失或非法，仅该行 baseline 回退到 default
+- 若已提供的 context 非法或违反硬约束，仅该行会被跳过
 
 若未提供 input_csv：
 
 - 自动使用损伤预测任务的测试集工况点
 - baseline 直接使用测试集已有参数
+- 若测试集内部存在不满足硬约束的 case，则逐行跳过，并在 eval_info.yaml 中记录 skipped_case_rows
 - 同时读取真值标签并写入输出结果，便于和 baseline、优化结果做对比
 
 ### 7.3 评估阶段定义
@@ -276,6 +278,8 @@ ARS_optim/saved_eval/eval_xxx_MMDD_HHMMSS/
 - normalization_config.json
 
 ### 7.5 输出 CSV 内容
+
+
 
 输出结果包含：
 
@@ -327,7 +331,7 @@ eval_info.yaml 中会记录：
 
 3. 若启用 direct_inference，但未提供兼容当前参数空间的策略权重，会直接报错
 
-4. 若用户输入 CSV 中显式提供了非法参数，评估不会静默修正，而会报错退出
+4. input_csv 中若 context 参数缺失或非法，会跳过该 case；若 baseline trainable 缺失或非法，仅该行 baseline 回退为 default，并给出 warning
 
 5. param_space.yaml 中的 default 值被视为用户已确认的合法值，不会额外做兼容性兜底
 
