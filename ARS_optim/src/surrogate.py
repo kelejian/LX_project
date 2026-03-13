@@ -22,6 +22,14 @@ def _resolve_checkpoint_path(base_dir: Path, cfg_value: str) -> Path:
 
 
 def load_surrogate_models(config: dict, device: torch.device) -> Tuple[HybridPulseCNN, InjuryPredictModel]:
+    """按各自子项目保存格式重建 PulsePredict 与 InjuryPredict。
+
+    这里不在 ARS_optim 内另造一套模型配置协议，而是直接复用：
+    - PulsePredict checkpoint 同目录下的 config.json；
+    - InjuryPredict checkpoint 同目录下的 TrainingRecord.json。
+
+    这样模型结构的真源仍然留在各自子项目中，ARS_optim 只负责装配与调用。
+    """
     surrogate_cfg = config.get("surrogate", {})
 
     pulse_ckpt_path = _resolve_checkpoint_path(Path(PULSE_PREDICT_DIR), surrogate_cfg.get("pulse_checkpoint", ""))
@@ -127,7 +135,7 @@ class SurrogateAdapter(nn.Module):
         context_params: torch.Tensor,
         control_trainable: torch.Tensor,
         pulse_norm: torch.Tensor,
-        include_yaml_bounds: bool = False,
+        include_opt_bounds: bool = False,
         detach_info: bool = True,
         penalty_features: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
@@ -167,7 +175,7 @@ class SurrogateAdapter(nn.Module):
         penalty_source = combined_phys if penalty_features is None else penalty_features
         loss_constraint = self.constraint_engine.compute_soft_penalty(
             penalty_source,
-            include_yaml_bounds=include_yaml_bounds,
+            include_opt_bounds=include_opt_bounds,
         )
         loss_distribution = self.distribution_penalty.compute(context_params, control_trainable)
         total_loss = loss_risk + self.weight_penalty * loss_constraint + self.weight_distribution * loss_distribution
@@ -201,6 +209,12 @@ class SurrogateAdapter(nn.Module):
         return total_loss, predictions_phys, info
 
     def generate_pulse(self, context_params: torch.Tensor) -> torch.Tensor:
+        """基于 context 里的碰撞工况生成归一化后的 XY 波形。
+
+        这里显式只取 impact_velocity / impact_angle / overlap 三个工况参数，
+        再走与 PulsePredict 推理一致的归一化与 `get_metrics_output` 提取流程。
+        输出保持归一化后的 XY 两通道，直接供 InjuryPredict 与策略网络复用。
+        """
         # context_params 只包含 context 子集，列顺序并不等于 FEATURE_ORDER。
         # 这里先补全为完整特征向量，再按 FEATURE_ORDER 中的固定索引抽取 impact 参数，
         # 目的是确保送入 PulsePredict 的速度/角度/重叠率与全项目统一特征接口保持一致。

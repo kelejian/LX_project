@@ -20,7 +20,7 @@ class ParamManager:
             with open(param_space_path_or_dict, "r", encoding="utf-8") as file:
                 config = yaml.safe_load(file)
 
-        self.sampling_rules = config.get("sampling_rules", {})
+        self.constraint_rules = config.get("constraint_rules", {})
         self.all_params = self._parse_parameters(config.get("parameters", []))
 
         self.state_params = [param for param in self.all_params if param["role"] == "state"]
@@ -57,8 +57,11 @@ class ParamManager:
                 raise ValueError(f"参数 {param.get('name')} 的 role 非法: {role}")
             if "default" not in param:
                 raise ValueError(f"参数 {param.get('name')} 缺少 default")
-            if param.get("type") == "continuous" and ("min" not in param or "max" not in param):
-                raise ValueError(f"连续参数 {param.get('name')} 缺少 min/max")
+            if param.get("type") == "continuous":
+                if "base_min" not in param or "base_max" not in param:
+                    raise ValueError(f"连续参数 {param.get('name')} 缺少 base_min/base_max")
+                if role == "control" and ("opt_min" not in param or "opt_max" not in param):
+                    raise ValueError(f"控制参数 {param.get('name')} 缺少 opt_min/opt_max")
             if param.get("type") == "discrete":
                 values = param.get("values")
                 if not isinstance(values, list) or not values:
@@ -127,15 +130,15 @@ class ParamManager:
     def get_fixed_control_names(self) -> List[str]:
         return list(self.fixed_control_names)
 
-    def get_sampling_rules(self) -> dict:
-        return self.sampling_rules
+    def get_constraint_rules(self) -> dict:
+        return self.constraint_rules
 
     def get_default_values(self, params: List[dict]) -> List[float]:
         return [float(param["default"]) for param in params]
 
-    def get_trainable_bounds(self, device: torch.device = torch.device("cpu")) -> Tuple[torch.Tensor, torch.Tensor]:
-        mins = [float(param["min"]) for param in self.control_trainable_params]
-        maxs = [float(param["max"]) for param in self.control_trainable_params]
+    def get_trainable_opt_bounds(self, device: torch.device = torch.device("cpu")) -> Tuple[torch.Tensor, torch.Tensor]:
+        mins = [float(param["opt_min"]) for param in self.control_trainable_params]
+        maxs = [float(param["opt_max"]) for param in self.control_trainable_params]
         return (
             torch.tensor(mins, dtype=torch.float32, device=device),
             torch.tensor(maxs, dtype=torch.float32, device=device),

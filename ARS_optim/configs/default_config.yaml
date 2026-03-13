@@ -54,20 +54,20 @@ strategy_net:
 optimization:
   # 是否直推
   direct_inference: False    # 为True且有效策略权重指定后再开启 Opt1
-  refine_steps: 100         # 局部精调迭代次数 k。若为 0，则不生成 Opt2；若大于 0，则输出局部精调后的 Opt2
-  lr: 0.05                 # 局部精调阶段在物理参数空间中的 Adam 步长
+  refine_steps: 1000         # 局部精调迭代次数 k。若为 0，则不生成 Opt2；若大于 0，则输出局部精调后的 Opt2
+  lr: 0.005                   # 局部精调阶段在物理参数空间中的 Adam 步长
   
   # 综合目标函数(Loss)各部位风险权重
   objectives:
-    weight_hic: 1.0
+    weight_hic: 5.0
     weight_dmax: 1.0
     weight_nij: 1.0
     weight_penalty: 10.0   # 物理约束惩罚项系数
 
   # 训练分布偏离惩罚项（用于抑制策略输出落入经验池稀疏区域）
   distribution_penalty:
-    enabled: true
-    method: "mahalanobis"     # mahalanobis | knn
+    enabled: False
+    method: "mahalanobis"      # mahalanobis | knn
     weight: 0.01               # 默认小权重，避免策略过于保守
     feature_space: "context_control"  # context | context_control
     k: 8                       # knn 模式的近邻数量

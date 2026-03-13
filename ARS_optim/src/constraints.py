@@ -10,17 +10,16 @@ from ARS_optim.src.param_manager import ParamManager
 class ConstraintEngine:
     """统一管理 ARS 参数的只读校验、前向投影与软惩罚。
 
-    该模块只保留三条职责清晰的路径：
-    1. `is_valid_physics`：纯布尔校验，不修改输入；
-    2. `project_forward`：把完整特征张量投影回可行域的连续子空间；
-    3. `compute_soft_penalty`：为训练或局部精调提供连续可导的约束梯度。
-
-    旧版 sanitize 风格的“读入后直接修正”已整体移除，避免同一份规则在多个入口被重复实现成不同语义。
+    该模块保留四条职责清晰的路径：
+    1. `is_valid_input_physics` / `is_valid_context`：输入端纯布尔校验，只按完整物理定义域判定；
+    2. `is_valid_physics`：输出端纯布尔校验，会把 trainable control 一并放进 yaml 子范围校验；
+    3. `project_forward`：把完整特征张量投影回可行域的连续子空间；
+    4. `compute_soft_penalty`：为训练或局部精调提供连续可导的约束梯度。
     """
 
     def __init__(self, param_manager: ParamManager):
         self.param_manager = param_manager
-        self.rules = param_manager.get_sampling_rules()
+        self.rules = param_manager.get_constraint_rules()
 
         self.total_dim = param_manager.get_total_feature_dim()
         self.context_indices = param_manager.get_context_indices()
@@ -32,8 +31,16 @@ class ConstraintEngine:
         self.continuous_indices = [
             param["index"] for param in all_params if param.get("type") == "continuous"
         ]
-        self.continuous_bounds = {
-            param["index"]: (float(param["min"]), float(param["max"]))
+        self.base_continuous_bounds = {
+            param["index"]: (float(param["base_min"]), float(param["base_max"]))
+            for param in all_params
+            if param.get("type") == "continuous"
+        }
+        self.output_continuous_bounds = {
+            param["index"]: (
+                float(param["opt_min"]) if param.get("role") == "control" and bool(param.get("trainable", False)) else float(param["base_min"]),
+                float(param["opt_max"]) if param.get("role") == "control" and bool(param.get("trainable", False)) else float(param["base_max"]),
+            )
             for param in all_params
             if param.get("type") == "continuous"
         }
@@ -42,7 +49,7 @@ class ConstraintEngine:
             for idx, values in param_manager.get_discrete_index_value_map().items()
         }
 
-        trainable_bounds = param_manager.get_trainable_bounds()
+        trainable_bounds = param_manager.get_trainable_opt_bounds()
         self._trainable_mins_cpu = trainable_bounds[0]
         self._trainable_maxs_cpu = trainable_bounds[1]
 
@@ -84,6 +91,10 @@ class ConstraintEngine:
         self._ra_idx = self.name_to_index.get("RA")
         self._side_idx = self.name_to_index.get("is_driver_side")
         self._ot_idx = self.name_to_index.get("OT")
+        context_names = param_manager.get_context_names()
+        self._context_name_to_local_index = {name: idx for idx, name in enumerate(context_names)}
+        self._context_overlap_local_idx = self._context_name_to_local_index.get("overlap")
+        self._context_angle_local_idx = self._context_name_to_local_index.get("impact_angle")
 
         self._build_rule_caches()
 
@@ -200,6 +211,14 @@ class ConstraintEngine:
         full_features = self._ensure_2d(full_features, self.total_dim, "full_features")
         return full_features[:, self.context_indices], full_features[:, self.trainable_indices]
 
+    def should_freeze_overlap_angle_jitter(self, context_params: torch.Tensor) -> torch.Tensor:
+        """返回在训练采样时应冻结 overlap/impact_angle 扰动的样本掩码。"""
+        context_params = self._ensure_2d(context_params, len(self.context_indices), "context_params")
+        if self._context_overlap_local_idx is None or self._context_angle_local_idx is None:
+            return torch.zeros(context_params.shape[0], dtype=torch.bool, device=context_params.device)
+        overlap = context_params[:, self._context_overlap_local_idx]
+        return (overlap.abs() >= self._overlap_abs_min) & (overlap.abs() < self._overlap_abs_max)
+
     def _replace_column(self, x: torch.Tensor, column_idx: int, new_column: torch.Tensor) -> torch.Tensor:
         x_new = x.clone()
         x_new[:, column_idx] = new_column
@@ -255,6 +274,16 @@ class ConstraintEngine:
         return x
 
     def _project_control_couplings(self, x: torch.Tensor) -> torch.Tensor:
+        """按单向依赖顺序投影 control 间的耦合约束。
+
+        这里故意把每条规则写成单向更新：
+        - AFT 依赖 BTF；
+        - LLATTF 依赖 BTF；
+        - LL2 依赖 LL1。
+
+        这样训练与局部精调的前向链路就始终沿同一拓扑顺序收敛，
+        不会因为多条规则互相“来回修正”而把语义变得不可预测。
+        """
         x = self._project_upper_bound_pair(
             x,
             constrained_idx=self._aft_idx,
@@ -277,6 +306,12 @@ class ConstraintEngine:
         return x
 
     def _project_seat_bbox(self, x: torch.Tensor) -> torch.Tensor:
+        """先做座椅包围盒裁剪，作为训练路径里的安全前置保护。
+
+        SP/SH 的精确可行域是由多边形或线段定义的，但 strict=False 路径需要保持
+        纯 torch、连续可微，因此这里只做 bbox 级别裁剪，把极端越界值先拉回一个
+        更接近真实可行域的区域；真正的精确多边形贴边只放在 strict=True 中执行。
+        """
         if not self.seat_cache:
             return x
         if self._sp_idx not in self._trainable_idx_set and self._sh_idx not in self._trainable_idx_set:
@@ -298,6 +333,12 @@ class ConstraintEngine:
         return x
 
     def _project_ra_ranges(self, x: torch.Tensor) -> torch.Tensor:
+        """按 (is_driver_side, OT) 组合裁剪 RA 的合法子区间。
+
+        RA 在 yaml 里只有一个全局范围，但真实合法区间取决于当前乘员侧与体型。
+        因此这里不能只看 RA 自己的 min/max，而要在完整特征张量里读取 side/OT
+        后再做条件裁剪。
+        """
         if not self.ra_range_cache or self._ra_idx not in self._trainable_idx_set:
             return x
         side, ot = self._get_side_ot_codes(x)
@@ -311,6 +352,11 @@ class ConstraintEngine:
         return x
 
     def _project_seat_polygon(self, x: torch.Tensor) -> torch.Tensor:
+        """在最终输出阶段把 SP/SH 精确贴回座椅多边形边界。
+
+        这一步使用 numpy 与 matplotlib.path 做几何判断，不适合放进训练期的反向链路。
+        因此它只出现在 strict=True 中，作为最终结果的绝对合法化步骤。
+        """
         if not self.seat_cache:
             return x
         if self._sp_idx not in self._trainable_idx_set and self._sh_idx not in self._trainable_idx_set:
@@ -362,6 +408,12 @@ class ConstraintEngine:
         points: np.ndarray,
         info: Dict[str, object],
     ) -> np.ndarray:
+        """在 numpy 侧校验 SP/SH 是否落在对应座椅可行域内。
+
+        评估输入校验不需要梯度，因此这里优先选择更直接的几何判定：
+        - 线段退化情形直接按坐标范围判断；
+        - 普通多边形先做 contains_points，再允许边界附近的数值误差通过投影距离容忍。
+        """
         sp_min, sp_max, sh_min, sh_max = info["bbox"]
         tol = self._tol
 
@@ -410,13 +462,17 @@ class ConstraintEngine:
         signed_distance = torch.einsum("bvd,vd->bv", points.unsqueeze(1) - polygon.unsqueeze(0), normals)
         return torch.relu(signed_distance).sum(dim=1)
 
-    def is_valid_physics(self, full_features: torch.Tensor) -> torch.Tensor:
+    def _is_valid_physics_impl(
+        self,
+        full_features: torch.Tensor,
+        continuous_bounds: Dict[int, Tuple[float, float]],
+    ) -> torch.Tensor:
         x = self._ensure_2d(full_features, self.total_dim, "full_features")
         tol = self._tol
         valid = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
 
         for idx in self.continuous_indices:
-            min_value, max_value = self.continuous_bounds[idx]
+            min_value, max_value = continuous_bounds[idx]
             valid &= (x[:, idx] >= min_value - tol) & (x[:, idx] <= max_value + tol)
 
         for idx, allowed_cpu in self.discrete_values.items():
@@ -475,6 +531,40 @@ class ConstraintEngine:
 
         return valid
 
+    def is_valid_physics(self, full_features: torch.Tensor) -> torch.Tensor:
+        """逐条执行硬约束校验，并返回逐样本布尔掩码。
+
+        这是输出端完整特征的“只判定、不修正”入口。
+        其校验口径包含：
+        - trainable control 的 yaml 子范围；
+        - params_constraint 对应的物理耦合约束。
+
+        因此它适用于优化结果、代理输入和最终合法性复核；
+        输入端 context 或外部 baseline 的文件级校验应改走 `is_valid_input_physics`
+        或 `is_valid_context`，避免把输入端样本误判为必须满足优化子范围。
+        """
+        return self._is_valid_physics_impl(full_features, self.output_continuous_bounds)
+
+    def is_valid_input_physics(self, full_features: torch.Tensor) -> torch.Tensor:
+        """按完整物理定义域校验输入样本，不额外施加优化子范围。
+
+        该入口专门服务评估脚本的输入端语义：外部 input_csv 允许控制量超出当前
+        yaml 优化子范围，只要仍满足 params_constraint 对应的完整物理约束即可。
+        """
+        return self._is_valid_physics_impl(full_features, self.base_continuous_bounds)
+
+    def is_valid_context(self, context_params: torch.Tensor) -> torch.Tensor:
+        """校验仅包含 context 的输入样本是否合法。
+
+        训练采样器与任何只读入 context 的入口，都应走这一层语义：
+        - 先用默认 trainable control 补成完整特征；
+        - 再只按完整物理定义域与物理耦合规则判断是否合法。
+
+        这样可以避免把 LL1/LL2 这类当前固定 control 错误地当成优化子范围变量处理。
+        """
+        full_features = self.compose_full_features(context_params=context_params)
+        return self.is_valid_input_physics(full_features)
+
     def project_forward(self, full_features: torch.Tensor, strict: bool = False) -> torch.Tensor:
         """对完整特征张量做前向投影。
 
@@ -500,7 +590,7 @@ class ConstraintEngine:
     def compute_soft_penalty(
         self,
         full_features: torch.Tensor,
-        include_yaml_bounds: bool = False,
+        include_opt_bounds: bool = False,
     ) -> torch.Tensor:
         """计算连续可导的约束软惩罚。
 
@@ -508,7 +598,7 @@ class ConstraintEngine:
         - AFT <= BTF + 25
         - LLATTF >= BTF
         - LL2 <= LL1
-        - 可选的 trainable yaml 边界
+        - 可选的 trainable opt 边界
         - RA 随 is_driver_side / OT 变化的条件区间
         - SP/SH 的座椅可行域：非退化多边形使用精确半平面惩罚，线段/矩形退化情形保留 bbox 惩罚
         """
@@ -519,7 +609,7 @@ class ConstraintEngine:
         penalty += torch.relu((x[:, self._btf_idx] + self.llattf_btf_delta_min) - x[:, self._llattf_idx])
         penalty += torch.relu(x[:, self._ll2_idx] - (x[:, self._ll1_idx] + self.ll2_ll1_delta_max))
 
-        if include_yaml_bounds and self.trainable_indices:
+        if include_opt_bounds and self.trainable_indices:
             mins = self._trainable_mins_cpu.to(device=x.device, dtype=x.dtype)
             maxs = self._trainable_maxs_cpu.to(device=x.device, dtype=x.dtype)
             trainable = x[:, self.trainable_indices]

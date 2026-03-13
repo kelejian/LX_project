@@ -5,7 +5,8 @@
 # 严格按照 common.settings.FEATURE_ORDER 顺序定义 (0-12)
 # role: control(执行机构) / state(不可控工况)
 # trainable: True(参与梯度寻优) / False(当前阶段固定)
-# min/max: 对于状态参数是取值范围（和params_constraint.md中一致，是数据集覆盖的范围）；对于控制参数是优化边界（规定了可调范围，是数据集覆盖范围的子集！）
+# base_min/base_max: 来源于 params_constraint.md 的基础单参数范围，用于输入端合法性校验
+# opt_min/opt_max: 控制参数在 ARS_optim 中允许寻优的子范围，仅用于输出端寻优解约束
 # 语义约定：
 # - context = state + trainable=False 的 control
 # - 这类固定 control 仍然保留 role=control，不会被降格为 state；未来只需修改 trainable 即可重新纳入优化变量
@@ -17,24 +18,24 @@ parameters:
     index: 0
     role: "state"
     type: "continuous"
-    min: 23.5
-    max: 65.0
+    base_min: 23.5
+    base_max: 65.0
     default: 56.0
 
   - name: "impact_angle"
     index: 1
     role: "state"
     type: "continuous"
-    min: -45
-    max: 45
+    base_min: -45
+    base_max: 45
     default: 0.0
 
   - name: "overlap"
     index: 2
     role: "state"
     type: "continuous"
-    min: -0.99
-    max: 1.0
+    base_min: -0.99
+    base_max: 1.0
     default: 1.0
 
   # --- 连续型控制参数 (Control) ---
@@ -42,8 +43,10 @@ parameters:
     index: 3
     role: "control"
     type: "continuous"
-    min: 1.0  
-    max: 4.5  
+    base_min: 1.0
+    base_max: 7.0
+    opt_min: 1.0
+    opt_max: 4.5
     trainable: False
     default: 2.5
 
@@ -51,8 +54,10 @@ parameters:
     index: 4
     role: "control"
     type: "continuous"
-    min: 0.5  
-    max: 2.7  
+    base_min: 0.5
+    base_max: 4.5
+    opt_min: 0.5
+    opt_max: 2.7
     trainable: False
     default: 2.5
 
@@ -60,8 +65,10 @@ parameters:
     index: 5
     role: "control"
     type: "continuous"
-    min: 10.0 
-    max: 100.0
+    base_min: 10.0
+    base_max: 100.0
+    opt_min: 10.0
+    opt_max: 100.0
     trainable: True # trainable=True 时参与摊销优化与局部精调
     default: 20.0
 
@@ -69,8 +76,10 @@ parameters:
     index: 6
     role: "control"
     type: "continuous"
-    min: 10.0 
-    max: 150.0
+    base_min: 10.0
+    base_max: 150.0
+    opt_min: 10.0
+    opt_max: 150.0
     trainable: True
     default: 150.0
 
@@ -78,8 +87,10 @@ parameters:
     index: 7
     role: "control"
     type: "continuous"
-    min: 10.0 
-    max: 100.0
+    base_min: 10.0
+    base_max: 100.0
+    opt_min: 10.0
+    opt_max: 100.0
     trainable: True
     default: 20.0
 
@@ -87,27 +98,33 @@ parameters:
     index: 8
     role: "control"
     type: "continuous"
-    min: -110.0
-    max: 110.0
-    trainable: True
+    base_min: -110.0
+    base_max: 110.0
+    opt_min: -110.0
+    opt_max: 110.0
+    trainable: False
     default: 0.0
 
   - name: "SH"
     index: 9
     role: "control"
     type: "continuous"
-    min: -3.3
-    max: 60.0
-    trainable: True
+    base_min: -3.33
+    base_max: 60.0
+    opt_min: -3.3
+    opt_max: 60.0
+    trainable: False
     default: 0.0
 
   - name: "RA"
     index: 10
     role: "control"
     type: "continuous"
-    min: 15.0
-    max: 40.0
-    trainable: True
+    base_min: 15.0
+    base_max: 40.0
+    opt_min: 15.0
+    opt_max: 40.0
+    trainable: False
     default: 25.0
 
   # --- 离散型状态参数 (State) ---
@@ -126,9 +143,9 @@ parameters:
     default: 2 # 1=5th，2=50th，3=95th
 
 # ---------------------------------------------------------
-# 采样/约束规则集中配置
+# params_constraint.md 中无法被单参数 base 边界表达的结构化约束
 # ---------------------------------------------------------
-sampling_rules:
+constraint_rules:
   coupling:
     aft_btf_delta_max: 25.0
     llattf_btf_delta_min: 0.0

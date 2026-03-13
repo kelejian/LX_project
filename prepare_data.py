@@ -164,19 +164,51 @@ def package_raw_packed(
     distribution_path: Path,
     pulse_dir: Path,
     output_npz: Path,
-    strict: bool = True
+    strict: bool = True,
+    side: str = "both"
 ) -> Path:
+    """打包原始数据到 raw_packed.npz。
+
+    `side` 只控制当前打包时保留哪些乘员侧样本：
+    - `DS`: 仅主驾 (`is_driver_side==1`)
+    - `PS`: 仅副驾 (`is_driver_side==0`)
+    - `both`: 主副驾全部保留
+
+    该筛选发生在波形读取前，后续所有标量特征、标签与索引都只针对筛选后的样本。
+    """
     df = _read_distribution(distribution_path)
 
     for col in REQUIRED_COLUMNS_FOR_PACKING:
         if col not in df.columns:
             raise ValueError(f"distribution 缺少必要列: {col}")
 
+    side_normalized = str(side).strip().upper()
+    if side_normalized not in {"PS", "DS", "BOTH"}:
+        raise ValueError(f"side 参数无效: {side}, 必须是 'PS'（副驾）、'DS'（主驾）或 'both'（主/副驾）")
+
+    if "is_driver_side" not in df.columns:
+        raise ValueError("distribution 缺少 is_driver_side 列，无法按主/副驾筛选")
+
+    df["is_driver_side"] = pd.to_numeric(df["is_driver_side"], errors="raise").astype(np.int64)
+    invalid_side_mask = ~df["is_driver_side"].isin([0, 1])
+    if invalid_side_mask.any():
+        invalid_values = sorted(df.loc[invalid_side_mask, "is_driver_side"].unique().tolist())
+        raise ValueError(f"distribution 中 is_driver_side 存在非法取值: {invalid_values}，仅允许 0(副驾) 或 1(主驾)")
+
+    if side_normalized == "PS":
+        df = df.loc[df["is_driver_side"] == 0].copy()
+    elif side_normalized == "DS":
+        df = df.loc[df["is_driver_side"] == 1].copy()
+
+    if df.shape[0] == 0:
+        raise RuntimeError(f"side={side} 筛选后没有剩余样本")
+    print(f"⭐ side={side_normalized}，侧向筛选后剩余样本数: {df.shape[0]}")
+
     # 只打包 is_pulse_ok==True 的 case（包含主/副驾）
     pulse_ok_mask = df["is_pulse_ok"].fillna(False).astype(bool)
     pulse_df = df.loc[pulse_ok_mask].copy() # 仅包含 is_pulse_ok==True 的样本，后续如果 strict=False 则会在读取波形时进一步过滤掉那些缺失波形的 case
     if pulse_df.shape[0] == 0:
-        raise RuntimeError("没有成功打包任何数据")
+        raise RuntimeError(f"side={side_normalized} 筛选后没有 is_pulse_ok==True 的样本，无法打包")
 
     # ---------------------------
     # 1) 向量化：case_ids / params / 标志位
@@ -519,7 +551,7 @@ def generate_splits(
 def main():
     parser = argparse.ArgumentParser(description="准备数据：raw_packed打包 + injury/pulse两套索引划分")
     parser.add_argument("--distribution", type=str, 
-                        default=r'E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0302.csv',  
+                        default=r'E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0311.csv',  
                         help="distribution .csv/.npz 路径")
     parser.add_argument("--pulse-dir", type=str, 
                         default=r'G:\VCS_acc_data\acc_data_before1111_6134', 
@@ -534,6 +566,7 @@ def main():
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--non-strict", action="store_true", help="非严格模式：遇到缺失波形/异常case则跳过; 若无此标志则严格模式报错退出")
+    parser.add_argument("--side", type=str, default="both", help="选择打包哪一侧样本: DS(主驾) | PS(副驾) | both(主副驾)")
 
     args = parser.parse_args()
 
@@ -546,12 +579,13 @@ def main():
     print(f"⭐ distribution_path: {distribution_path}")
     print(f"⭐ pulse_dir: {pulse_dir}\n")
     # ========================================================== 
-    # package_raw_packed(
-    #     distribution_path=distribution_path,
-    #     pulse_dir=pulse_dir,
-    #     output_npz=out_raw,
-    #     strict=(not args.non_strict)
-    # )
+    package_raw_packed(
+        distribution_path=distribution_path,
+        pulse_dir=pulse_dir,
+        output_npz=out_raw,
+        strict=(not args.non_strict),
+        side=args.side,
+    )
     # ========================================================== 
     generate_splits(
         raw_npz_path=out_raw,

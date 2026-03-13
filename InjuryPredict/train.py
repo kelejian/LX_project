@@ -391,9 +391,9 @@ if __name__ == "__main__":
             if epoch % 10 == 0:
                 epoch_weights = model.tcn.channel_attention.get_epoch_attention_weights()
                 if epoch_weights is not None:
-                    writer.add_histogram("ChannelAttention_Val/X_Direction_Distribution", epoch_weights[:, 0], epoch)
-                    writer.add_histogram("ChannelAttention_Val/Y_Direction_Distribution", epoch_weights[:, 1], epoch)
-                    # writer.add_histogram("ChannelAttention_Val/Z_Direction_Distribution", epoch_weights[:, 2], epoch)
+                    writer.add_histogram("ChannelAttention_Val/X_Direction_Distri", epoch_weights[:, 0], epoch)
+                    writer.add_histogram("ChannelAttention_Val/Y_Direction_Distri", epoch_weights[:, 1], epoch)
+                    # writer.add_histogram("ChannelAttention_Val/Z_Direction_Distri", epoch_weights[:, 2], epoch)
             
             # 打印权重信息到控制台
             if epoch % 50 == 0 or epoch == Epochs - 1:

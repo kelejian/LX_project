@@ -47,7 +47,6 @@ class StateDataSampler:
 
         self.context_params = self.param_manager.get_context_params()
         self.context_indices = self.param_manager.get_context_indices()
-        self.rules = self.param_manager.get_sampling_rules()
 
         pool_path = Path(pool_npz_path) if pool_npz_path else (RAW_DATA_DIR / "raw_data_packed.npz")
         split_path = Path(split_indices_path) if split_indices_path else (SPLIT_INDICES_DIR / "injury_train_indices.csv")
@@ -67,13 +66,24 @@ class StateDataSampler:
         self.pool_full = torch.tensor(full_features, dtype=torch.float32, device=device)
         self.pool_context = torch.tensor(full_features[:, self.context_indices], dtype=torch.float32, device=device)
         self.pool_size = self.pool_context.shape[0]
+        if self.pool_size == 0:
+            raise ValueError("经验池在剔除非法 context 后为空，无法构建数据流")
 
         self.context_cont_local_indices = [
             idx for idx, param in enumerate(self.context_params) if param.get("type") == "continuous"
         ]
         if self.context_cont_local_indices:
-            mins = [self.context_params[idx]["min"] for idx in self.context_cont_local_indices]
-            maxs = [self.context_params[idx]["max"] for idx in self.context_cont_local_indices]
+            # 训练采样阶段属于输入端 context 扰动：
+            # 即便某些 context 列来自当前不可调 control（如 LL1/LL2），
+            # 这里也只能按完整物理定义域裁剪，而不能误用 yaml 里的优化子范围。
+            mins = [
+                float(self.context_params[idx]["base_min"])
+                for idx in self.context_cont_local_indices
+            ]
+            maxs = [
+                float(self.context_params[idx]["base_max"])
+                for idx in self.context_cont_local_indices
+            ]
             self.cont_mins = torch.tensor(mins, dtype=torch.float32, device=device)
             self.cont_maxs = torch.tensor(maxs, dtype=torch.float32, device=device)
             self.cont_spans = torch.clamp(self.cont_maxs - self.cont_mins, min=1e-6)
@@ -88,10 +98,6 @@ class StateDataSampler:
         }
         self._overlap_cont_pos = cont_name_to_pos.get("overlap")
         self._angle_cont_pos = cont_name_to_pos.get("impact_angle")
-        overlap_angle_rule = self.rules.get("overlap_angle", {})
-        self._overlap_abs_min = float(overlap_angle_rule.get("overlap_abs_min", 0.25))
-        self._overlap_abs_max = float(overlap_angle_rule.get("overlap_abs_max", 0.3))
-
     def _load_feature_matrix_from_pool(self, pool_path: Path) -> np.ndarray:
         if not pool_path.exists():
             raise FileNotFoundError(f"经验池文件不存在: {pool_path}")
@@ -110,17 +116,16 @@ class StateDataSampler:
 
         original_context = batch_context.clone()
 
-        # 只在连续 context 子空间上采样噪声；离散参数本身不在这个张量切片里，
-        # 因此掩码矩阵的形状直接对齐连续列即可。
+        # 这里只对连续 context 列加噪声；离散参数 is_driver_side / OT 不在这个切片里，
+        # 因而天然不会被扰动。这样可避免对离散标签做“先映射成浮点再回整”的伪连续处理。
         continuous = batch_context[:, self.context_cont_local_indices]
 
         feature_mask = torch.ones_like(continuous, dtype=torch.float32)
         if self._overlap_cont_pos is not None and self._angle_cont_pos is not None:
-            overlap_values = continuous[:, self._overlap_cont_pos]
-            protected_rows = (
-                (overlap_values.abs() >= self._overlap_abs_min)
-                & (overlap_values.abs() < self._overlap_abs_max)
-            )
+            # 当 overlap 处于特殊耦合带内时，impact_angle 的合法区间会随 overlap 分段变化。
+            # 若在这一带继续对二者加独立高斯扰动，极易把样本推到非法区域，导致高拒绝率。
+            # 因此这里直接冻结这两列，让采样器只在其余连续 context 维度上做轻扰动。
+            protected_rows = self.constraint_engine.should_freeze_overlap_angle_jitter(batch_context)
             if protected_rows.any():
                 feature_mask[protected_rows, self._overlap_cont_pos] = 0.0
                 feature_mask[protected_rows, self._angle_cont_pos] = 0.0
@@ -149,8 +154,7 @@ class StateDataSampler:
 
         # 掩码后的扰动只生成“试探样本”；这里不做任何后置修补。
         # 只要某行试探样本破坏硬约束，就整行拒绝并回退为原始经验池样本。
-        full_features = self.constraint_engine.compose_full_features(batch_context)
-        valid_mask = self.constraint_engine.is_valid_physics(full_features)
+        valid_mask = self.constraint_engine.is_valid_context(batch_context)
         self._last_rejection_rate = float((~valid_mask).to(dtype=torch.float32).mean().item())
         if (~valid_mask).any():
             batch_context[~valid_mask] = original_context[~valid_mask]

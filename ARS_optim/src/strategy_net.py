@@ -93,7 +93,7 @@ class StrategyNet(nn.Module):
         layers.append(nn.Linear(in_features, self.output_dim))
         self.mlp = nn.Sequential(*layers)
 
-        min_bounds, max_bounds = self.param_manager.get_trainable_bounds()
+        min_bounds, max_bounds = self.param_manager.get_trainable_opt_bounds()
         self.register_buffer("min_bounds", min_bounds)
         self.register_buffer("max_bounds", max_bounds)
         defaults = self.param_manager.get_default_values(self.trainable_params)
@@ -136,7 +136,7 @@ class StrategyNet(nn.Module):
         """将网络输出的无界 logits 还原为物理参数，并返回训练所需的两类结果。
 
         这里把“网络回归”和“动作约束”拆成两个连续步骤：
-        1. 先用 sigmoid 和边界盒把输出限制在 trainable 参数的基础物理范围内；
+        1. 先用 sigmoid 和 opt 边界盒把输出限制在 trainable 参数的寻优子范围内；
         2. 再把动作拼回完整特征张量，由约束引擎统一做连续耦合投影。
 
         这样做的目的不是增加层次，而是避免让网络直接学习一整套硬规则；

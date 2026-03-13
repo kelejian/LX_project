@@ -36,7 +36,7 @@ REDUCTION_SPECS = (
     ("AIS_head", "Base_AIS_head", "Opt_AIS_head"),
     ("AIS_chest", "Base_AIS_chest", "Opt_AIS_chest"),
     ("AIS_neck", "Base_AIS_neck", "Opt_AIS_neck"),
-    ("AIS_max", "Base_AIS_max", "Opt_AIS_max"),
+    ("MAIS", "Base_MAIS", "Opt_MAIS"),
 )
 
 
@@ -112,6 +112,11 @@ def _build_param_dataframe(
     params: List[dict],
     fill_missing_with_default: bool,
 ) -> tuple[pd.DataFrame, List[str], List[str]]:
+    """按参数清单抽取输入列，并记录缺失列与已提供列。
+
+    这里不做合法性判断，只负责把原始 DataFrame 映射到当前评估所需的参数子集，
+    避免“列抽取”和“物理约束校验”混在同一段逻辑里。
+    """
     output_df = pd.DataFrame(index=df_input.index)
     missing = []
     provided = []
@@ -147,11 +152,12 @@ def _prepare_eval_inputs(
 
     strict_provided_validation=True 只用于外部 input_csv：
     - 已提供的 context 值必须逐行合法，否则跳过该 case；
-    - baseline trainable 若缺失或非法，只回退该行 baseline 到 default。
+    - baseline trainable 若缺失或非法，只回退该行 baseline 到 default；
+    - 输入端校验只按完整物理定义域执行，不额外要求落在优化子范围内。
 
     strict_provided_validation=False 只用于内部 test split：
-    - 不做逐列修补；
-    - 发现非法 case 直接逐行跳过。
+    - baseline 直接使用测试集已有完整参数；
+    - 只检查缺失值，不再按优化子范围做过滤。
     """
     context_params = param_manager.get_context_params()
     trainable_params = param_manager.get_trainable_params()
@@ -159,39 +165,40 @@ def _prepare_eval_inputs(
     trainable_names = param_manager.get_trainable_names()
     default_trainable = np.asarray(param_manager.get_default_values(trainable_params), dtype=np.float32)
 
-    context_df_raw, missing_context, provided_context = _build_param_dataframe(
+    context_df_raw, missing_context, _ = _build_param_dataframe(
         df_input,
         context_params,
-        fill_missing_with_default=not strict_provided_validation,
+        fill_missing_with_default=False,
     )
     baseline_df_raw, missing_trainable, provided_trainable = _build_param_dataframe(
         df_input,
         trainable_params,
-        fill_missing_with_default=True,
+        fill_missing_with_default=bool(strict_provided_validation),
     )
 
     if missing_context:
         if strict_provided_validation:
             logger.warning("input_csv 缺失 context 列，这些列对应的 case 将被逐行跳过: %s", missing_context)
         else:
-            logger.warning("输入缺失部分 context 参数，已回退 default: %s", missing_context)
+            raise ValueError(f"测试集缺失 context 列: {missing_context}")
     if missing_trainable:
-        logger.warning("输入未提供部分可调参数，baseline 已回退 default: %s", missing_trainable)
+        if strict_provided_validation:
+            logger.warning("输入未提供部分可调参数，baseline 已回退 default: %s", missing_trainable)
+        else:
+            raise ValueError(f"测试集缺失 trainable control 列: {missing_trainable}")
 
     if not strict_provided_validation:
         context_eval_df = context_df_raw.astype(np.float32)
         baseline_eval_df = baseline_df_raw.astype(np.float32)
-        context_tensor = torch.tensor(context_eval_df[context_names].values, dtype=torch.float32, device=device)
-        baseline_tensor = torch.tensor(baseline_eval_df[trainable_names].values, dtype=torch.float32, device=device)
-        full_features = constraint_engine.compose_full_features(context_tensor, baseline_tensor)
-        valid_mask = constraint_engine.is_valid_physics(full_features).detach().cpu().numpy().astype(bool)
-        invalid_rows = np.flatnonzero(~valid_mask)
-        if invalid_rows.size > 0:
-            logger.warning(
-                "当前评估输入来自内部测试集，其中 %d 个 case 不满足物理约束，已跳过。行号: %s",
-                invalid_rows.size,
-                _format_row_list(invalid_rows),
+        missing_context_rows = context_eval_df[context_names].isna().any(axis=1).to_numpy()
+        missing_trainable_rows = baseline_eval_df[trainable_names].isna().any(axis=1).to_numpy()
+        if missing_context_rows.any() or missing_trainable_rows.any():
+            bad_rows = np.flatnonzero(missing_context_rows | missing_trainable_rows)
+            raise ValueError(
+                "测试集样本存在缺失值，不符合评估前提。行号: "
+                f"{_format_row_list(bad_rows)}"
             )
+        valid_mask = np.ones(len(df_input), dtype=bool)
         return (
             context_eval_df,
             context_eval_df,
@@ -199,7 +206,7 @@ def _prepare_eval_inputs(
             missing_context,
             missing_trainable,
             valid_mask,
-            invalid_rows.astype(int).tolist(),
+            [],
             [],
         )
 
@@ -218,7 +225,7 @@ def _prepare_eval_inputs(
         candidate_context_raw = context_df_raw.iloc[candidate_indices]
         candidate_context_tensor = torch.tensor(candidate_context_raw[context_names].values, dtype=torch.float32, device=device)
         context_full = constraint_engine.compose_full_features(candidate_context_tensor)
-        context_valid_local = constraint_engine.is_valid_physics(context_full).detach().cpu().numpy().astype(bool)
+        context_valid_local = constraint_engine.is_valid_input_physics(context_full).detach().cpu().numpy().astype(bool)
         if (~context_valid_local).any():
             logger.warning(
                 "以下 input_csv 行的 context 参数不合法，将跳过该 case。行号: %s",
@@ -251,11 +258,11 @@ def _prepare_eval_inputs(
                 device=device,
             )
             baseline_full = constraint_engine.compose_full_features(legal_context_tensor, baseline_candidate_tensor)
-            baseline_valid_local = constraint_engine.is_valid_physics(baseline_full).detach().cpu().numpy().astype(bool)
+            baseline_valid_local = constraint_engine.is_valid_input_physics(baseline_full).detach().cpu().numpy().astype(bool)
             baseline_invalid_mask_local = (~baseline_valid_local) | provided_trainable_nan_rows
             if baseline_invalid_mask_local.any():
                 logger.warning(
-                    "以下 input_csv 行的 baseline 可调控制参数不合法，已回退为 param_space.yaml 的 default。行号: %s",
+                    "以下 input_csv 行的 baseline 可调控制参数缺失或不满足完整物理约束，已回退为 param_space.yaml 的 default。行号: %s",
                     _format_row_list(legal_context_indices[baseline_invalid_mask_local]),
                 )
             reverted_indices = legal_context_indices[baseline_invalid_mask_local]
@@ -289,6 +296,11 @@ def _prepare_eval_inputs(
 
 
 def _fit_distribution_reference_if_needed(surrogate: SurrogateAdapter, sampler: StateDataSampler, param_manager: ParamManager, config: dict) -> None:
+    """仅在启用分布惩罚时拟合训练参考分布。
+
+    评估阶段与训练阶段必须使用同一批训练参考样本统计量，
+    否则分布惩罚的量纲会随输入来源改变，无法比较不同评估批次的 penalty 强弱。
+    """
     if not surrogate.distribution_penalty.enabled:
         return
     max_ref_samples = int(config.get("optimization", {}).get("distribution_penalty", {}).get("max_ref_samples", 0))
@@ -349,6 +361,11 @@ def _compute_predictions_batch(
     optimizer: LocalRefiner,
     eval_batch_size: int,
 ) -> Dict[str, object]:
+    """按批次计算 Base/Opt1/Opt2 三个阶段的预测结果。
+
+    这里显式把 Base 和优化阶段拆开缓存，目的是让结果 CSV 只输出最终需要汇报的
+    Base/Opt 两组指标，同时内部仍保留 Opt1/Opt2 的阶段信息，便于 eval_info 复盘。
+    """
     sample_count = context_tensor.shape[0]
     device = context_tensor.device
     stage_parts = {
@@ -479,7 +496,7 @@ def _build_stage_metric_dataframe(
                 f"{stage_label}_AIS_head": nan_array.copy(),
                 f"{stage_label}_AIS_chest": nan_array.copy(),
                 f"{stage_label}_AIS_neck": nan_array.copy(),
-                f"{stage_label}_AIS_max": nan_array.copy(),
+                f"{stage_label}_MAIS": nan_array.copy(),
             }
         )
 
@@ -501,7 +518,8 @@ def _build_stage_metric_dataframe(
     stage_df[f"{stage_label}_AIS_head"] = AIS_cal_head(stage_df[f"{stage_label}_HIC"].to_numpy(dtype=np.float32))
     stage_df[f"{stage_label}_AIS_chest"] = AIS_cal_chest(stage_df[f"{stage_label}_Dmax"].to_numpy(dtype=np.float32), ot_array)
     stage_df[f"{stage_label}_AIS_neck"] = AIS_cal_neck(stage_df[f"{stage_label}_Nij"].to_numpy(dtype=np.float32))
-    stage_df[f"{stage_label}_AIS_max"] = np.maximum.reduce(
+    # MAIS: maximum AIS across head/chest/neck
+    stage_df[f"{stage_label}_MAIS"] = np.maximum.reduce(
         [
             stage_df[f"{stage_label}_AIS_head"].to_numpy(dtype=np.float32),
             stage_df[f"{stage_label}_AIS_chest"].to_numpy(dtype=np.float32),
@@ -513,7 +531,7 @@ def _build_stage_metric_dataframe(
             f"{stage_label}_AIS_head",
             f"{stage_label}_AIS_chest",
             f"{stage_label}_AIS_neck",
-            f"{stage_label}_AIS_max",
+            f"{stage_label}_MAIS",
         ]] = np.nan
     return stage_df
 
@@ -573,7 +591,8 @@ def _build_result_dataframe(
         truth_df["True_AIS_neck"] = np.asarray(
             truth_arrays.get("ais_neck", AIS_cal_neck(truth_df["True_Nij"].to_numpy(dtype=np.float32)))
         )
-        truth_df["True_AIS_max"] = np.maximum.reduce(
+        # compute MAIS from individual AIS values
+        truth_df["True_MAIS"] = np.maximum.reduce(
             [
                 truth_df["True_AIS_head"].to_numpy(dtype=np.float32),
                 truth_df["True_AIS_chest"].to_numpy(dtype=np.float32),
@@ -602,10 +621,14 @@ def _build_result_dataframe(
         "mean_reduction_Pchest": _safe_nanmean(result_df["Reduction_Pchest"]),
         "mean_reduction_Pneck": _safe_nanmean(result_df["Reduction_Pneck"]),
         "mean_reduction_joint_risk": _safe_nanmean(result_df["Reduction_JointRisk"]),
+        "mean_reduction_AIS_head": _safe_nanmean(result_df["Reduction_AIS_head"]),
+        "mean_reduction_AIS_chest": _safe_nanmean(result_df["Reduction_AIS_chest"]),
+        "mean_reduction_AIS_neck": _safe_nanmean(result_df["Reduction_AIS_neck"]),
+        "mean_reduction_MAIS": _safe_nanmean(result_df["Reduction_MAIS"]),
         "mean_base_joint_risk": _safe_nanmean(result_df["Base_JointRisk"]),
         "mean_opt_joint_risk": _safe_nanmean(result_df["Opt_JointRisk"]),
-        "mean_base_ais_max": _safe_nanmean(result_df["Base_AIS_max"]),
-        "mean_opt_ais_max": _safe_nanmean(result_df["Opt_AIS_max"]),
+        "mean_base_mais": _safe_nanmean(result_df["Base_MAIS"]),
+        "mean_opt_mais": _safe_nanmean(result_df["Opt_MAIS"]),
         "n_samples": int(len(result_df)),
     }
     return result_df, summary
@@ -655,13 +678,13 @@ def _build_eval_info(
         "skipped_cases_count": len(skipped_case_rows),
         "reverted_baseline_rows": reverted_baseline_rows,
         "input_validation_policy": {
-            "input_csv": "rowwise_skip_invalid_context_rowwise_revert_invalid_baseline" if args.input_csv else None,
-            "test_split": "rowwise_skip_invalid_internal_cases" if not args.input_csv else None,
+            "input_csv": "context:full_physical_domain_rowwise_skip; baseline_trainable:full_physical_domain_rowwise_revert_to_default" if args.input_csv else None,
+            "test_split": "missing_value_check_only; baseline_uses_raw_test_controls_without_optimization_range_filter" if not args.input_csv else None,
         },
         "stage_definition": {
-            "Base": "baseline control；input_csv 缺失值按列回填 default，非法 baseline 按行回退 default",
+            "Base": "baseline control；input_csv 缺失 trainable 按 default 回填、非法 trainable 按行回退 default；test_split 直接使用测试集原始控制参数",
             "Opt1": "策略网络直推结果；仅在 direct_inference=True 且显式提供兼容权重时存在",
-            "Opt2": "局部精调结果；仅在 refine_steps>0 时存在",
+            "Opt2": "局部精调结果；仅在 refine_steps>0 时存在。内部使用按 yaml 量程归一化后的潜空间 Adam，再映射回物理尺度进入投影与代理评估链路",
         },
         "stage_status": {
             "base_generated": True,
@@ -683,6 +706,45 @@ def _build_eval_info(
             "avg_time_cost_sec": float(stage_outputs["total_time_cost"] / max(1, result_row_count)),
             "trajectory_steps_logged": len(stage_outputs["trajectory_all"]),
         },
+    }
+
+
+def _build_summary_report(
+    input_source: Dict[str, str],
+    strategy_ckpt_path: Optional[Path],
+    config_snapshots: Dict[str, str],
+    config: dict,
+    summary_metrics: Dict[str, float],
+    opt1_generated: bool,
+    opt2_generated: bool,
+    optimized_stage_name: Optional[str],
+    skipped_case_rows: List[int],
+    reverted_baseline_rows: List[int],
+) -> Dict[str, object]:
+    """生成面向结果浏览的轻量汇总文件。
+
+    `eval_info.yaml` 保留完整运行细节，`summary.yaml` 只保留用户最常关心的输入来源、
+    阶段状态、样本计数和宏观降损指标，便于后续批量横向比较多个评估目录。
+    """
+    return {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "input_source": input_source,
+        "strategy_checkpoint_path": str(strategy_ckpt_path) if strategy_ckpt_path is not None else None,
+        "config_files": config_snapshots,
+        "evaluation_config": config.get("evaluation", {}),
+        "optimization_config": config.get("optimization", {}),
+        "stage_status": {
+            "opt1_generated": opt1_generated,
+            "opt2_generated": opt2_generated,
+            "reported_optimized_stage": optimized_stage_name,
+        },
+        "case_accounting": {
+            "skipped_case_rows": skipped_case_rows,
+            "skipped_cases_count": len(skipped_case_rows),
+            "reverted_baseline_rows": reverted_baseline_rows,
+            "reverted_baseline_count": len(reverted_baseline_rows),
+        },
+        "summary_metrics": summary_metrics,
     }
 
 
@@ -833,6 +895,19 @@ def main():
         result_row_count=len(result_df),
     )
     _write_yaml(output_dir / "eval_info.yaml", eval_info)
+    summary_report = _build_summary_report(
+        input_source=input_source,
+        strategy_ckpt_path=strategy_ckpt_path,
+        config_snapshots=config_snapshots,
+        config=config,
+        summary_metrics=summary_metrics,
+        opt1_generated=opt1_generated,
+        opt2_generated=opt2_generated,
+        optimized_stage_name=optimized_stage_name,
+        skipped_case_rows=skipped_case_rows,
+        reverted_baseline_rows=reverted_baseline_rows,
+    )
+    _write_yaml(output_dir / "summary.yaml", summary_report)
     logger.info(f"评估完成，结果目录: {output_dir}")
     logger.info(f"结果 CSV: {output_csv_path}")
 

@@ -294,7 +294,7 @@ ARS_optim/saved_eval/eval_xxx_MMDD_HHMMSS/
   - Nij
   - 三部位风险
   - 联合损伤风险
-  - AIS_head、AIS_chest、AIS_neck、AIS_max
+  - AIS_head、AIS_chest、AIS_neck、MAIS (最大AIS)
 - Reduction_ 前缀的绝对降低量
 - 若为测试集模式，还会包含 True_ 前缀的真值列
 

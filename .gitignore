@@ -1,7 +1,9 @@
 # Project-wide ignores
-
-data/processed/
-data/inference_outputs/
+data/
+data_PS/
+data_DS/
+# data/processed/
+# data/inference_outputs/
 # data/raw_packed/
 # data/split_indices/
 .vscode/

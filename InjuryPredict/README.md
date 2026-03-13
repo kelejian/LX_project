@@ -13,7 +13,6 @@ InjuryPredict/
 ├─ train.py              # 单次训练入口
 ├─ train_KFold.py        # K-Fold 训练入口
 ├─ eval_model.py         # 评估与可视化（图表 + 报告）
-└─ test_all_data.py      # 在完整数据集上导出预测 CSV
 ```
 
 ## 3. 环境准备
@@ -59,11 +58,6 @@ python -m InjuryPredict.Injurydata_prepare --out-dir data/processed/injury
   python -m InjuryPredict.eval_model
 ```
   （建议仅用于评估 InjuryPredict.train 训练的模型. 在脚本 `__main__` 中设置需要评估的 `run_dir` 与 `weight_file`）
-
-- 在完整数据集上导出预测 CSV：
-```bash
-  python -m InjuryPredict.test_all_data
-```
 
 ## 7. 可视化（TensorBoard）
 ```bash

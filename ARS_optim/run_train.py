@@ -151,7 +151,7 @@ def _evaluate_strategy_batch(
         context_params=context_params,
         control_trainable=actions,
         pulse_norm=pulse_norm,
-        include_yaml_bounds=False,
+        include_opt_bounds=False,
         penalty_features=raw_full_features,
     )
     return loss_batch, info

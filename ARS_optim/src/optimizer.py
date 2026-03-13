@@ -19,6 +19,11 @@ class LocalRefiner:
     这里把“局部精调从哪里起步”和“哪些结果对外写出”分开处理：
     内部迭代可以从 default 或策略网络输出出发，但结果表只写入上面这三种已定义阶段，
     避免评估脚本再去推断中间状态含义。
+
+    与策略网络的 Sigmoid 重参数化不同，这里的局部精调不会直接在物理量空间上用统一学习率更新。
+    各控制参数量纲差异很大，若直接共用一个 Adam 步长，很难把学习率解释成稳定的一致尺度。
+    因此这里先把 trainable 控制参数按各自 yaml 量程映射到无量纲潜空间，再在潜空间里优化；
+    每轮前向时再还原回物理尺度，送入统一的投影与代理评估链路。
     """
 
     def __init__(
@@ -38,9 +43,17 @@ class LocalRefiner:
         self.direct_inference = bool(opt_cfg.get("direct_inference", False))
         self.refine_steps = int(opt_cfg.get("refine_steps", 50))
         self.lr = float(opt_cfg.get("lr", 0.05))
-        min_bounds, max_bounds = self.param_manager.get_trainable_bounds()
+        min_bounds, max_bounds = self.param_manager.get_trainable_opt_bounds()
         self._trainable_mins_cpu = min_bounds
         self._trainable_maxs_cpu = max_bounds
+
+    def _to_latent(self, actions_phys: torch.Tensor, mins: torch.Tensor, spans: torch.Tensor) -> torch.Tensor:
+        """把物理尺度动作映射到无量纲潜空间。"""
+        return (actions_phys - mins.unsqueeze(0)) / spans.unsqueeze(0)
+
+    def _from_latent(self, latent_actions: torch.Tensor, mins: torch.Tensor, spans: torch.Tensor) -> torch.Tensor:
+        """把无量纲潜变量还原回物理尺度动作。"""
+        return mins.unsqueeze(0) + latent_actions * spans.unsqueeze(0)
 
     def _resolve_initial_actions(self, context_params: torch.Tensor, pulse_norm: torch.Tensor) -> torch.Tensor:
         """生成局部精调的起始动作。
@@ -73,6 +86,11 @@ class LocalRefiner:
 
         pulse_norm 必须由调用方显式提供，避免优化器内部再隐式触发一遍 pulse 生成，
         让训练、评估和局部精调都共享同一条明确的 pulse 来源语义。
+
+        优化变量不是物理量本身，而是按 yaml 量程归一化后的无量纲潜变量 z：
+        - z=0 对应 trainable 下界；
+        - z=1 对应 trainable 上界；
+        - 统一学习率表示“每步占各自量程的比例”。
         """
         self.surrogate.eval()
 
@@ -82,7 +100,7 @@ class LocalRefiner:
             context_params=context_params,
             control_trainable=init_actions,
             pulse_norm=pulse_norm,
-            include_yaml_bounds=False,
+            include_opt_bounds=False,
         )
         direct_stage = None
         if self.direct_inference:
@@ -107,29 +125,27 @@ class LocalRefiner:
                 "trajectory": [],
             }
             result.update(init_info)
-            if "joint_risk" in result:
-                result["joint_risk_batch"] = result["joint_risk"]
             return init_actions.detach(), init_preds.detach(), result
 
-        opt_var = init_actions.clone().detach().requires_grad_(True)
-
-        optimizer = torch.optim.Adam([opt_var], lr=self.lr)
-        trajectory = []
-        start = time.time()
         min_bounds = self._trainable_mins_cpu.to(device=context_params.device, dtype=context_params.dtype)
         max_bounds = self._trainable_maxs_cpu.to(device=context_params.device, dtype=context_params.dtype)
-        # 局部精调直接在物理空间更新变量；若每步都硬夹回 yaml 边界，
-        # 边界附近很容易因为 Adam 动量和投影共同作用而出现“贴边抖动”。
-        # 这里允许优化变量在边界外保留 10% 的缓冲带，
-        # 真正送入代理模型前仍会经过 forward projection 与软惩罚，
-        # 最终输出阶段再由 strict projection 收回绝对合法域。
-        relaxed_span = torch.clamp(max_bounds - min_bounds, min=1e-6) * 0.1
-        relaxed_lower = min_bounds - relaxed_span
-        relaxed_upper = max_bounds + relaxed_span
+        spans = torch.clamp(max_bounds - min_bounds, min=1e-6)
+        latent_var = self._to_latent(init_actions, mins=min_bounds, spans=spans).detach().requires_grad_(True)
+
+        optimizer = torch.optim.Adam([latent_var], lr=self.lr)
+        trajectory = []
+        start = time.time()
+        # 潜空间 [0, 1] 与 yaml 边界一一对应；这里仍保留 10% 的松弛带，
+        # 但缓冲带定义在无量纲 z 空间里，而不是物理尺度里。
+        # 这样统一学习率的语义不会再被不同参数的量纲放大或缩小。
+        relaxed_margin = 0.1
+        relaxed_lower = -relaxed_margin
+        relaxed_upper = 1.0 + relaxed_margin
 
         for _ in range(self.refine_steps):
             optimizer.zero_grad()
-            full_raw = self.constraint_engine.compose_full_features(context_params, opt_var)
+            actions_phys = self._from_latent(latent_var, mins=min_bounds, spans=spans)
+            full_raw = self.constraint_engine.compose_full_features(context_params, actions_phys)
             projected_full = self.constraint_engine.project_forward(full_raw, strict=False)
             _, projected_actions = self.constraint_engine.split_from_full(projected_full)
 
@@ -137,11 +153,11 @@ class LocalRefiner:
                 context_params=context_params,
                 control_trainable=projected_actions,
                 pulse_norm=pulse_norm,
-                include_yaml_bounds=False,
+                include_opt_bounds=False,
                 detach_info=False,
             )
             loss_risk = risk_info["loss_risk"]
-            penalty = self.constraint_engine.compute_soft_penalty(full_raw, include_yaml_bounds=True)
+            penalty = self.constraint_engine.compute_soft_penalty(full_raw, include_opt_bounds=True)
             # 分布偏离惩罚应约束当前真正送入代理模型评估的候选解，
             # 否则会把置信度约束施加到投影前的松弛变量上，和实际优化轨迹错位。
             dist_penalty = self.surrogate.distribution_penalty.compute(context_params, projected_actions)
@@ -155,20 +171,19 @@ class LocalRefiner:
             optimizer.step()
 
             with torch.no_grad():
-                opt_var.clamp_(relaxed_lower.unsqueeze(0), relaxed_upper.unsqueeze(0))
+                latent_var.clamp_(relaxed_lower, relaxed_upper)
             trajectory.append(float(total_mean.item()))
 
         end = time.time()
-        final_actions = self._strict_project_actions(context_params, opt_var)
+        final_actions_phys = self._from_latent(latent_var.detach(), mins=min_bounds, spans=spans)
+        final_actions = self._strict_project_actions(context_params, final_actions_phys)
         final_loss, final_preds, final_info = self.surrogate.predict_injury_and_loss(
             context_params=context_params,
             control_trainable=final_actions,
             pulse_norm=pulse_norm,
-            include_yaml_bounds=False,
+            include_opt_bounds=False,
         )
         final_info["final_loss_batch"] = final_loss.detach()
-        if "joint_risk" in final_info:
-            final_info["joint_risk_batch"] = final_info["joint_risk"]
         final_info["direct_stage"] = direct_stage
         final_info["refine_stage_enabled"] = True
         final_info["time_cost"] = end - start
