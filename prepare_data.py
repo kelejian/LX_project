@@ -168,19 +168,14 @@ def package_raw_packed(
     side: str = "both"
 ) -> Path:
     """打包原始数据到 raw_packed.npz。
-
-    `side` 只控制当前打包时保留哪些乘员侧样本：
-    - `DS`: 仅主驾 (`is_driver_side==1`)
-    - `PS`: 仅副驾 (`is_driver_side==0`)
-    - `both`: 主副驾全部保留
-
-    该筛选发生在波形读取前，后续所有标量特征、标签与索引都只针对筛选后的样本。
     """
     df = _read_distribution(distribution_path)
 
     for col in REQUIRED_COLUMNS_FOR_PACKING:
         if col not in df.columns:
             raise ValueError(f"distribution 缺少必要列: {col}")
+
+    print(f"✅️ distribution 文件已读取: {distribution_path}")
 
     side_normalized = str(side).strip().upper()
     if side_normalized not in {"PS", "DS", "BOTH"}:
@@ -189,27 +184,30 @@ def package_raw_packed(
     if "is_driver_side" not in df.columns:
         raise ValueError("distribution 缺少 is_driver_side 列，无法按主/副驾筛选")
 
-    df["is_driver_side"] = pd.to_numeric(df["is_driver_side"], errors="raise").astype(np.int64)
+    # 转换为数值，保留 float 格式以容纳 NaN，避免 astype 报错
+    df["is_driver_side"] = pd.to_numeric(df["is_driver_side"], errors="coerce")
     invalid_side_mask = ~df["is_driver_side"].isin([0, 1])
     if invalid_side_mask.any():
-        invalid_values = sorted(df.loc[invalid_side_mask, "is_driver_side"].unique().tolist())
-        raise ValueError(f"distribution 中 is_driver_side 存在非法取值: {invalid_values}，仅允许 0(副驾) 或 1(主驾)")
+        print(f"⚠️ is_driver_side 列存在无效值或空值，这些行将在筛选阶段被忽略。")
 
     if side_normalized == "PS":
         df = df.loc[df["is_driver_side"] == 0].copy()
     elif side_normalized == "DS":
         df = df.loc[df["is_driver_side"] == 1].copy()
+    elif side_normalized == "BOTH":
+        # 显式仅保留 0 和 1
+        df = df.loc[df["is_driver_side"].isin([0, 1])].copy()
 
-    if df.shape[0] == 0:
-        raise RuntimeError(f"side={side} 筛选后没有剩余样本")
-    print(f"⭐ side={side_normalized}，侧向筛选后剩余样本数: {df.shape[0]}")
+    if df.empty:
+        raise RuntimeError(f"筛选失败：side='{side}' 对应的样本量为 0，请检查数据源。")
+    print(f"✅️ 已按 side='{side}' 筛选，剩余 {df.shape[0]} 个样本，准备打包")
 
-    # 只打包 is_pulse_ok==True 的 case（包含主/副驾）
+    # 只打包 is_pulse_ok==True 的 case
     pulse_ok_mask = df["is_pulse_ok"].fillna(False).astype(bool)
     pulse_df = df.loc[pulse_ok_mask].copy() # 仅包含 is_pulse_ok==True 的样本，后续如果 strict=False 则会在读取波形时进一步过滤掉那些缺失波形的 case
     if pulse_df.shape[0] == 0:
         raise RuntimeError(f"side={side_normalized} 筛选后没有 is_pulse_ok==True 的样本，无法打包")
-
+    print(f"✅️ 已筛选出 {pulse_df.shape[0]} 个 is_pulse_ok==True 的样本")
     # ---------------------------
     # 1) 向量化：case_ids / params / 标志位
     # ---------------------------

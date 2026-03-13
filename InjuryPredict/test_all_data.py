@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
 
-from common.settings import INJURY_PROCESSED_DIR
+from common.settings import FEATURE_ORDER, INJURY_PROCESSED_DIR, RAW_DATA_DIR
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from common.tools.seeding import set_random_seed
 
@@ -33,8 +33,9 @@ RUN_DIR = os.path.join(RUNS_DIR, "InjuryPredictModel_03032051")  # 示例: "./ru
 # 1.2) 要加载的模型权重文件名
 WEIGHT_FILE = "best_val_loss.pth"
 
-# 1.3) 包含原始13个标量特征的 distribution 文件路径
-DISTRIBUTION_FILE = r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0302.csv" 
+# 1.3) 原始打包数据文件路径
+# 作用: 从项目内 raw_packed.npz 恢复每条样本的原始标量特征值与 pulse_source_case_id。
+RAW_PACKED_FILE = (RAW_DATA_DIR / "raw_data_packed.npz").as_posix()
 
 # 1.4) 存放 .pt 数据集的目录
 DATA_DIR = INJURY_PROCESSED_DIR.as_posix()
@@ -42,32 +43,30 @@ DATA_DIR = INJURY_PROCESSED_DIR.as_posix()
 # --- 结束配置 ---
 
 
-def load_original_features(dist_file_path):
-    """从 distribution 文件加载原始的标量特征"""
-    print(f"正在从 {dist_file_path} 加载原始标量特征...")
-    if dist_file_path.endswith('.csv'):
-        dist_df = pd.read_csv(dist_file_path)
-    else:
-        # 支持 .npz 格式 (以防万一)
-        dist_npz = np.load(dist_file_path, allow_pickle=True)
-        dist_df = pd.DataFrame({key: dist_npz[key] for key in dist_npz.files})
+def load_original_features(raw_packed_path: str) -> pd.DataFrame:
+    """从 raw_packed.npz 恢复原始标量特征与 case 映射。"""
+    print(f"正在从 {raw_packed_path} 加载原始标量特征...")
+    packed = np.load(raw_packed_path)
 
-    # 定义13个标量特征的列名
-    # 连续特征 (0-10): impact_velocity, impact_angle, overlap, LL1, LL2, BTF, LLATTF, AFT, SP, SH, RA
-    # 离散特征 (11-12): is_driver_side, OT
-    feature_columns = [
-        'case_id', 'pulse_source_case_id',
-        'impact_velocity', 'impact_angle', 'overlap', 'LL1', 'LL2', 
-        'BTF', 'LLATTF', 'AFT', 'SP', 'SH', 'RA', 
-        'is_driver_side', 'OT',
-    ]
-    
-    # 确保所有列都存在
-    missing_cols = [col for col in feature_columns if col not in dist_df.columns]
-    if missing_cols:
-        raise ValueError(f"Distribution 文件中缺少以下必需列: {missing_cols}")
-        
-    original_features_df = dist_df[feature_columns]
+    required_keys = {"case_ids", "pulse_source_case_ids", "x_att_raw"}
+    missing_keys = sorted(required_keys - set(packed.files))
+    if missing_keys:
+        raise KeyError(f"raw_packed 文件缺少以下必需键: {missing_keys}")
+
+    x_att_raw = np.asarray(packed["x_att_raw"], dtype=np.float32)
+    if x_att_raw.ndim != 2 or x_att_raw.shape[1] != len(FEATURE_ORDER):
+        raise ValueError(
+            f"x_att_raw 形状异常: {x_att_raw.shape}, 期望 (N, {len(FEATURE_ORDER)})"
+        )
+
+    original_features_df = pd.DataFrame(x_att_raw, columns=FEATURE_ORDER)
+    original_features_df.insert(0, "pulse_source_case_id", packed["pulse_source_case_ids"].astype(np.int64))
+    original_features_df.insert(0, "case_id", packed["case_ids"].astype(np.int64))
+
+    # 两个离散特征在 raw_packed 中以数值数组存储，这里恢复为整数列，便于导出结果直接复用。
+    original_features_df["is_driver_side"] = original_features_df["is_driver_side"].round().astype(np.int64)
+    original_features_df["OT"] = original_features_df["OT"].round().astype(np.int64)
+
     return original_features_df
 
 def load_model_and_data(run_dir, weight_file, data_dir=DATA_DIR):
@@ -370,8 +369,8 @@ def print_metrics_summary(df):
 if __name__ == "__main__":
     set_random_seed()
     
-    # 1. 加载原始13个标量特征
-    original_features_df = load_original_features(DISTRIBUTION_FILE)
+    # 1. 从项目内 raw_packed 恢复原始13个标量特征
+    original_features_df = load_original_features(RAW_PACKED_FILE)
     
     # 2. 加载模型、完整数据集和 case_id 映射
     model, full_dataset, device, case_id_map = load_model_and_data(RUN_DIR, WEIGHT_FILE, DATA_DIR)

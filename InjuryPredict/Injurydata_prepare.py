@@ -99,7 +99,7 @@ class InjuryPackedDataset(Dataset):
             torch.tensor(self.ais_neck[idx], dtype=torch.int),
             torch.tensor(self.mais[idx], dtype=torch.int),
             torch.tensor(self.OT_raw[idx], dtype=torch.int),
-        ) # 与旧有dataset_prepare.py 中的数据集类的返回项保持一致
+        )
 
 
 def load_processed_subset(pt_path: Path):
