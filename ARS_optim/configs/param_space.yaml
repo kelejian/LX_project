@@ -144,6 +144,8 @@ parameters:
 
 # ---------------------------------------------------------
 # params_constraint.md 中无法被单参数 base 边界表达的结构化约束
+# - coupling: 输入端与输出端都共享的耦合规则
+# - extra_output_constraints: 仅在寻优解约束阶段生效的额外约束
 # ---------------------------------------------------------
 constraint_rules:
   coupling:
@@ -152,9 +154,12 @@ constraint_rules:
     ll2_ll1_delta_max: 0.0
     epsilon: 0.001
 
+  extra_output_constraints:
+    aft_btf_delta_min: 0.0
+
   overlap:
     domain:
-      negative: [-1.0, -0.25]
+      negative: [-0.99, -0.25]
       positive: [0.25, 1.0]
 
   overlap_angle:

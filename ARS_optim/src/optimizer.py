@@ -135,9 +135,8 @@ class LocalRefiner:
         optimizer = torch.optim.Adam([latent_var], lr=self.lr)
         trajectory = []
         start = time.time()
-        # 潜空间 [0, 1] 与 yaml 边界一一对应；这里仍保留 10% 的松弛带，
-        # 但缓冲带定义在无量纲 z 空间里，而不是物理尺度里。
-        # 这样统一学习率的语义不会再被不同参数的量纲放大或缩小。
+        # 潜空间 [0, 1] 与 yaml 边界一一对应；这里仍保留 10% 的松弛带，允许优化器在“合法边界附近”做少量越界探索，再通过前向投影和软惩罚把解拉回可行域，减少边界处的更新僵硬和振荡。
+        # 缓冲带定义在无量纲 z 空间里，而不是物理尺度里。这样统一学习率的语义不会再被不同参数的量纲放大或缩小。
         relaxed_margin = 0.1
         relaxed_lower = -relaxed_margin
         relaxed_upper = 1.0 + relaxed_margin

@@ -14,6 +14,7 @@ from common.data_utils.processor import UnifiedDataProcessor
 from common.metrics.injury_risk import AIS_cal_chest, AIS_cal_head, AIS_cal_neck
 from common.settings import FEATURE_ORDER, NORMALIZATION_CONFIG_PATH, RAW_DATA_DIR, SPLIT_INDICES_DIR
 from common.tools.logger import setup_logger
+from common.tools.seeding import set_random_seed
 
 from ARS_optim.src.constraints import ConstraintEngine
 from ARS_optim.src.data_sampler import StateDataSampler
@@ -656,6 +657,7 @@ def _build_eval_info(
     summary_metrics: Dict[str, float],
     stage_outputs: Dict[str, object],
     result_row_count: int,
+    evaluated_case_count: int,
 ) -> Dict[str, object]:
     return {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -703,7 +705,7 @@ def _build_eval_info(
         },
         "runtime": {
             "total_time_cost_sec": float(stage_outputs["total_time_cost"]),
-            "avg_time_cost_sec": float(stage_outputs["total_time_cost"] / max(1, result_row_count)),
+            "avg_time_cost_sec": float(stage_outputs["total_time_cost"] / max(1, evaluated_case_count)),
             "trajectory_steps_logged": len(stage_outputs["trajectory_all"]),
         },
     }
@@ -720,6 +722,7 @@ def _build_summary_report(
     optimized_stage_name: Optional[str],
     skipped_case_rows: List[int],
     reverted_baseline_rows: List[int],
+    evaluated_case_count: int,
 ) -> Dict[str, object]:
     """生成面向结果浏览的轻量汇总文件。
 
@@ -739,6 +742,7 @@ def _build_summary_report(
             "reported_optimized_stage": optimized_stage_name,
         },
         "case_accounting": {
+            "evaluated_case_count": int(evaluated_case_count),
             "skipped_case_rows": skipped_case_rows,
             "skipped_cases_count": len(skipped_case_rows),
             "reverted_baseline_rows": reverted_baseline_rows,
@@ -764,6 +768,7 @@ def main():
         config["optimization"]["direct_inference"] = True
 
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    set_random_seed(int(config.get("seed", 42)))
 
     param_manager = ParamManager(param_space_path)
     constraint_engine = ConstraintEngine(param_manager)
@@ -863,6 +868,8 @@ def main():
         trainable_names=trainable_names,
         optimized_stage_name=optimized_stage_name,
     )
+    summary_metrics["n_evaluated_cases"] = int(valid_mask.sum())
+    summary_metrics["n_skipped_cases"] = int(len(skipped_case_rows))
     # 在所有前置校验和模型推理都完成后再创建输出目录，避免早退时留下空目录。
     output_dir = _build_output_dir(base_dir, args.input_csv)
     output_csv_path = output_dir / Path(args.output_csv).name
@@ -893,6 +900,7 @@ def main():
         summary_metrics=summary_metrics,
         stage_outputs=stage_outputs,
         result_row_count=len(result_df),
+        evaluated_case_count=int(valid_mask.sum()),
     )
     _write_yaml(output_dir / "eval_info.yaml", eval_info)
     summary_report = _build_summary_report(
@@ -906,6 +914,7 @@ def main():
         optimized_stage_name=optimized_stage_name,
         skipped_case_rows=skipped_case_rows,
         reverted_baseline_rows=reverted_baseline_rows,
+        evaluated_case_count=int(valid_mask.sum()),
     )
     _write_yaml(output_dir / "summary.yaml", summary_report)
     logger.info(f"评估完成，结果目录: {output_dir}")

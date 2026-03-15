@@ -91,7 +91,9 @@ ARS_optim/
 
 1. 从损伤预测任务的训练集索引中取样
 2. 对连续 context 特征加入轻微扰动
-3. 若扰动破坏硬约束，则整行 reject rollback 回退为经验池原样本，不额外做 sanitize
+3. 若扰动破坏 base 范围或共享耦合规则，则整行 reject rollback 回退为经验池原样本，不额外做 sanitize
+
+这里刻意不把“仅针对寻优解”的额外约束混入输入端采样规则。例如 AFT >= BTF 只约束策略网络或局部精调产出的优化解，不参与 context 数据流的合法性筛查。
 
 验证阶段则使用 injury_val 全量样本，不加扰动，并按 val_interval 定期评估完整验证集。
 
@@ -139,7 +141,8 @@ ARS_optim/
 - 默认值
 - 连续参数范围
 - 离散参数允许值
-- AFT/BTF、LL2/LL1、LLATTF/BTF 等耦合规则
+- 输入端与输出端共享的耦合规则
+- 仅在寻优解阶段生效的额外约束
 - overlap 与 angle 的规则
 - 座椅 SP/SH 多边形约束
 - RA 条件区间
@@ -245,7 +248,7 @@ python -m ARS_optim.run_eval --input_csv path/to/input.csv --output_csv my_eval.
 
 - 自动使用损伤预测任务的测试集工况点
 - baseline 直接使用测试集已有参数
-- 若测试集内部存在不满足硬约束的 case，则逐行跳过，并在 eval_info.yaml 中记录 skipped_case_rows
+- 不再对测试集做逐行物理合法性过滤；仅检查缺失值，若发现缺失则直接报错终止
 - 同时读取真值标签并写入输出结果，便于和 baseline、优化结果做对比
 
 ### 7.3 评估阶段定义

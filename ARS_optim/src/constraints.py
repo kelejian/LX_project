@@ -11,8 +11,8 @@ class ConstraintEngine:
     """统一管理 ARS 参数的只读校验、前向投影与软惩罚。
 
     该模块保留四条职责清晰的路径：
-    1. `is_valid_input_physics` / `is_valid_context`：输入端纯布尔校验，只按完整物理定义域判定；
-    2. `is_valid_physics`：输出端纯布尔校验，会把 trainable control 一并放进 yaml 子范围校验；
+    1. `is_valid_input_physics` / `is_valid_context`：输入端纯布尔校验，只按 base 范围与共享耦合规则判定，不包含仅作用于寻优解的额外约束；
+    2. `is_valid_physics`：输出端纯布尔校验，会把 trainable control 一并放进 yaml 子范围校验，并额外检查只作用于寻优解的输出端约束；
     3. `project_forward`：把完整特征张量投影回可行域的连续子空间；
     4. `compute_soft_penalty`：为训练或局部精调提供连续可导的约束梯度。
     """
@@ -54,9 +54,11 @@ class ConstraintEngine:
         self._trainable_maxs_cpu = trainable_bounds[1]
 
         coupling = self.rules.get("coupling", {})
+        extra_output_constraints = self.rules.get("extra_output_constraints", {})
         self.aft_btf_delta_max = float(coupling.get("aft_btf_delta_max", 25.0))
         self.llattf_btf_delta_min = float(coupling.get("llattf_btf_delta_min", 0.0))
         self.ll2_ll1_delta_max = float(coupling.get("ll2_ll1_delta_max", 0.0))
+        self.aft_btf_extra_delta_min = float(extra_output_constraints.get("aft_btf_delta_min", 0.0))
         self.epsilon = float(coupling.get("epsilon", 1e-3))
         self._tol = 1e-5
 
@@ -277,7 +279,7 @@ class ConstraintEngine:
         """按单向依赖顺序投影 control 间的耦合约束。
 
         这里故意把每条规则写成单向更新：
-        - AFT 依赖 BTF；
+        - AFT 上界依赖 BTF；
         - LLATTF 依赖 BTF；
         - LL2 依赖 LL1。
 
@@ -304,6 +306,20 @@ class ConstraintEngine:
             delta=self.ll2_ll1_delta_max,
         )
         return x
+
+    def _project_output_extra_constraints(self, x: torch.Tensor) -> torch.Tensor:
+        """投影仅作用于寻优解的额外约束。
+
+        这类规则不属于输入端数据流的物理采样定义域，因此不能混入 `coupling`。
+        当前唯一规则是 AFT 不得早于 BTF，它只在策略直推与局部精调产出的
+        trainable control 上生效。
+        """
+        return self._project_lower_bound_pair(
+            x,
+            target_idx=self._aft_idx,
+            reference_idx=self._btf_idx,
+            delta=self.aft_btf_extra_delta_min,
+        )
 
     def _project_seat_bbox(self, x: torch.Tensor) -> torch.Tensor:
         """先做座椅包围盒裁剪，作为训练路径里的安全前置保护。
@@ -487,7 +503,7 @@ class ConstraintEngine:
         )
         valid &= overlap_valid
 
-        trigger = (overlap.abs() >= self._overlap_abs_min - tol) & (overlap.abs() < self._overlap_abs_max - tol)
+        trigger = (overlap.abs() >= self._overlap_abs_min - tol) & (overlap.abs() < self._overlap_abs_max + tol)
         if trigger.any() and self._angle_segments:
             angle = x[:, self._impact_angle_idx]
             angle_valid = torch.zeros_like(trigger)
@@ -537,19 +553,24 @@ class ConstraintEngine:
         这是输出端完整特征的“只判定、不修正”入口。
         其校验口径包含：
         - trainable control 的 yaml 子范围；
-        - params_constraint 对应的物理耦合约束。
+        - params_constraint 对应的物理耦合约束；
+        - 仅作用于寻优解的额外约束。
 
         因此它适用于优化结果、代理输入和最终合法性复核；
         输入端 context 或外部 baseline 的文件级校验应改走 `is_valid_input_physics`
         或 `is_valid_context`，避免把输入端样本误判为必须满足优化子范围。
         """
-        return self._is_valid_physics_impl(full_features, self.output_continuous_bounds)
+        x = self._ensure_2d(full_features, self.total_dim, "full_features")
+        valid = self._is_valid_physics_impl(x, self.output_continuous_bounds)
+        valid &= x[:, self._aft_idx] >= x[:, self._btf_idx] + self.aft_btf_extra_delta_min - self._tol
+        return valid
 
     def is_valid_input_physics(self, full_features: torch.Tensor) -> torch.Tensor:
         """按完整物理定义域校验输入样本，不额外施加优化子范围。
 
         该入口专门服务评估脚本的输入端语义：外部 input_csv 允许控制量超出当前
-        yaml 优化子范围，只要仍满足 params_constraint 对应的完整物理约束即可。
+        yaml 优化子范围，只要仍满足 params_constraint 对应的 base 范围与共享耦合规则即可。
+        像 AFT >= BTF 这类只面向寻优解的额外约束，不在这里生效。
         """
         return self._is_valid_physics_impl(full_features, self.base_continuous_bounds)
 
@@ -568,13 +589,14 @@ class ConstraintEngine:
     def project_forward(self, full_features: torch.Tensor, strict: bool = False) -> torch.Tensor:
         """对完整特征张量做前向投影。
 
-        `strict=False` 用于训练和局部精调的中间迭代，做连续可微的耦合投影、
-        bbox 裁剪及 RA 条件区间投影（均为纯 torch 可微操作，不阻断反向传播）。
+        `strict=False` 用于策略直推训练和局部精调的中间迭代，做连续可微的共享耦合投影、
+        输出端额外约束投影、bbox 裁剪及 RA 条件区间投影（均为纯 torch 可微操作，不阻断反向传播）。
         `strict=True` 只用于最终输出，在此基础上追加 numpy 多边形边界精确投影。
         """
         x = self._ensure_2d(full_features, self.total_dim, "full_features").clone()
         x = self._apply_trainable_bounds(x)
         x = self._project_control_couplings(x)
+        x = self._project_output_extra_constraints(x)
         x = self._project_seat_bbox(x)
         # RA 条件区间需在 strict=False 路径中执行：yaml 全局范围 [15, 40] 远宽于
         # 特定 (side, OT) 组合的合法子区间（如主驾 OT=1 上限 25°），若不在此处投影，
@@ -595,6 +617,7 @@ class ConstraintEngine:
         """计算连续可导的约束软惩罚。
 
         当前覆盖的约束项包括：
+        - AFT >= BTF（仅输出端额外约束）
         - AFT <= BTF + 25
         - LLATTF >= BTF
         - LL2 <= LL1
@@ -605,6 +628,7 @@ class ConstraintEngine:
         x = self._ensure_2d(full_features, self.total_dim, "full_features")
         penalty = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
 
+        penalty += torch.relu((x[:, self._btf_idx] + self.aft_btf_extra_delta_min) - x[:, self._aft_idx])
         penalty += torch.relu(x[:, self._aft_idx] - (x[:, self._btf_idx] + self.aft_btf_delta_max))
         penalty += torch.relu((x[:, self._btf_idx] + self.llattf_btf_delta_min) - x[:, self._llattf_idx])
         penalty += torch.relu(x[:, self._ll2_idx] - (x[:, self._ll1_idx] + self.ll2_ll1_delta_max))

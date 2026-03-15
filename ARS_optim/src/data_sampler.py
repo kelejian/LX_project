@@ -67,7 +67,7 @@ class StateDataSampler:
         self.pool_context = torch.tensor(full_features[:, self.context_indices], dtype=torch.float32, device=device)
         self.pool_size = self.pool_context.shape[0]
         if self.pool_size == 0:
-            raise ValueError("经验池在剔除非法 context 后为空，无法构建数据流")
+            raise ValueError("经验池为空，无法构建数据流")
 
         self.context_cont_local_indices = [
             idx for idx, param in enumerate(self.context_params) if param.get("type") == "continuous"
@@ -75,7 +75,8 @@ class StateDataSampler:
         if self.context_cont_local_indices:
             # 训练采样阶段属于输入端 context 扰动：
             # 即便某些 context 列来自当前不可调 control（如 LL1/LL2），
-            # 这里也只能按完整物理定义域裁剪，而不能误用 yaml 里的优化子范围。
+            # 这里的 base 范围只用于定义各列扰动尺度，不用于对试探样本做后置截断；
+            # 真正的合法性判断统一交给约束引擎，若扰动后越界则整行回退原样本。
             mins = [
                 float(self.context_params[idx]["base_min"])
                 for idx in self.context_cont_local_indices
@@ -98,6 +99,7 @@ class StateDataSampler:
         }
         self._overlap_cont_pos = cont_name_to_pos.get("overlap")
         self._angle_cont_pos = cont_name_to_pos.get("impact_angle")
+
     def _load_feature_matrix_from_pool(self, pool_path: Path) -> np.ndarray:
         if not pool_path.exists():
             raise FileNotFoundError(f"经验池文件不存在: {pool_path}")
@@ -145,14 +147,10 @@ class StateDataSampler:
             ) < self.jitter_prob
             feature_mask = feature_mask * prob_mask.to(dtype=torch.float32)
 
-        tentative_continuous = torch.clamp(
-            continuous + noise * feature_mask,
-            self.cont_mins.unsqueeze(0),
-            self.cont_maxs.unsqueeze(0),
-        )
+        tentative_continuous = continuous + noise * feature_mask
         batch_context[:, self.context_cont_local_indices] = tentative_continuous
 
-        # 掩码后的扰动只生成“试探样本”；这里不做任何后置修补。
+        # 掩码后的扰动只生成“试探样本”；这里不做任何后置修补或边界截断。
         # 只要某行试探样本破坏硬约束，就整行拒绝并回退为原始经验池样本。
         valid_mask = self.constraint_engine.is_valid_context(batch_context)
         self._last_rejection_rate = float((~valid_mask).to(dtype=torch.float32).mean().item())

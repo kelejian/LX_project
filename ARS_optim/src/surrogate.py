@@ -170,8 +170,7 @@ class SurrogateAdapter(nn.Module):
         joint_risk = 1.0 - ((1.0 - p_head) * (1.0 - p_chest) * (1.0 - p_neck))
 
         # 默认在当前送入代理模型的物理特征上计算软惩罚。
-        # 训练策略网络时会额外传入 penalty_features=投影前特征，用于在前向投影
-        # 截断违约量之后，仍保留把动作拉回合法域的梯度补偿。
+        # 训练策略网络时会额外传入 penalty_features=投影前特征，用于在前向投影截断违约量之后，仍保留把动作拉回合法域的梯度补偿。
         penalty_source = combined_phys if penalty_features is None else penalty_features
         loss_constraint = self.constraint_engine.compute_soft_penalty(
             penalty_source,

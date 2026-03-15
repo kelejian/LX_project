@@ -14,6 +14,7 @@ import json
 import torch
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from torch.utils.data import DataLoader
 
 from common.settings import FEATURE_ORDER, INJURY_PROCESSED_DIR, RAW_DATA_DIR
@@ -28,10 +29,11 @@ from InjuryPredict.utils.tools import get_mais_3c_metrics
 # --- 1. 配置区：请在此处设置您的路径 ---
 
 # 1.1) 要评估的模型所在的运行目录
-RUN_DIR = os.path.join(RUNS_DIR, "InjuryPredictModel_03032051")  # 示例: "./runs/InjuryPredictModel_XXXXXXXX" 或 "./runs/StudentModel_XXXXXX"
+RUN_DIR = Path(RUNS_DIR) / "InjuryPredictModel_KFold_03131040"
 
-# 1.2) 要加载的模型权重文件名
-WEIGHT_FILE = "best_val_loss.pth"
+# 1.2) 要加载的模型权重文件名（相对于 RUN_DIR）
+FOLD = Path("Fold_1") # 可以指定K折中的某一折，例如 Path("Fold_1")，如果没有K折划分则保持 Path("")
+WEIGHT_FILE = FOLD / Path("best_val_loss.pth")
 
 # 1.3) 原始打包数据文件路径
 # 作用: 从项目内 raw_packed.npz 恢复每条样本的原始标量特征值与 pulse_source_case_id。
@@ -69,7 +71,7 @@ def load_original_features(raw_packed_path: str) -> pd.DataFrame:
 
     return original_features_df
 
-def load_model_and_data(run_dir, weight_file, data_dir=DATA_DIR):
+def load_model_and_data(run_dir, weight_file):
     """加载模型、完整的数据集对象以及数据集划分的 case_id 映射"""
     print(f"正在加载模型: {os.path.join(run_dir, weight_file)}")
     
@@ -88,7 +90,7 @@ def load_model_and_data(run_dir, weight_file, data_dir=DATA_DIR):
     test_pt_path = (INJURY_PROCESSED_DIR / "test_dataset.pt").as_posix()
     
     if not all(os.path.exists(p) for p in [train_pt_path, val_pt_path, test_pt_path]):
-        raise FileNotFoundError(f"未在 {INJURY_PROCESSED_DIR.as_posix()} 中找到 train/val/test_dataset.pt。请先运行：python -m InjuryPredict.Injurydata_prepare 来生成数据集文件。")
+        raise FileNotFoundError(f"未在 {INJURY_PROCESSED_DIR.as_posix()} 中找到 train/val/test_dataset.pt。请先运行: python -m InjuryPredict.Injurydata_prepare 来生成数据集文件。")
         
     train_subset = load_processed_subset(train_pt_path)
     val_subset = load_processed_subset(val_pt_path)
@@ -373,7 +375,7 @@ if __name__ == "__main__":
     original_features_df = load_original_features(RAW_PACKED_FILE)
     
     # 2. 加载模型、完整数据集和 case_id 映射
-    model, full_dataset, device, case_id_map = load_model_and_data(RUN_DIR, WEIGHT_FILE, DATA_DIR)
+    model, full_dataset, device, case_id_map = load_model_and_data(RUN_DIR, WEIGHT_FILE)
     
     # 3. 运行推理
     predictions_np = run_inference(model, full_dataset, device)
@@ -381,9 +383,13 @@ if __name__ == "__main__":
     # 4. 创建并合并结果
     final_results_df = create_results_dataframe(full_dataset, predictions_np, original_features_df, case_id_map)
     
-    # 5. 保存到 CSV
-    output_filename = f"full_dataset_predictions_{WEIGHT_FILE.replace('.pth', '.csv')}"
-    output_path = os.path.join(RUN_DIR, output_filename)
+    # 5. 保存到 CSV 文件
+    if FOLD == Path(""):
+        fold_suffix = ""
+    else:
+        fold_suffix = f"_{FOLD.name}"
+    output_filename = f"full_dataset_predictions{fold_suffix}_{WEIGHT_FILE.name.replace('.pth', '.csv')}"
+    output_path = RUN_DIR / output_filename
     
     final_results_df.to_csv(output_path, index=False, float_format='%.4f')
     
