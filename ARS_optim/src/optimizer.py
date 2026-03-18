@@ -75,6 +75,12 @@ class LocalRefiner:
         return self.param_manager.get_trainable_defaults_tensor(device=device).unsqueeze(0).expand(batch_size, -1)
 
     def _strict_project_actions(self, context_params: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        """把候选动作做最终严格合法化。
+
+        局部精调内部每一步只走 strict=False，可保留纯 torch 的连续梯度链；
+        但真正作为阶段输出写入结果表时，必须补做 strict=True，
+        让座椅多边形边界这类 numpy 几何投影也生效，保证落盘结果是绝对合法的物理解。
+        """
         with torch.no_grad():
             full_features = self.constraint_engine.compose_full_features(context_params, actions)
             projected_full = self.constraint_engine.project_forward(full_features, strict=True)
@@ -104,6 +110,9 @@ class LocalRefiner:
         )
         direct_stage = None
         if self.direct_inference:
+            # Opt1 的记录口径是“策略网络直推后、已经过 strict 投影的动作”。
+            # 这样评估表里的 Opt1 与最终落地可执行的控制量保持同一物理语义，
+            # 不会把投影前的 raw action 混进报告里造成歧义。
             direct_stage = {
                 "actions": init_actions.detach(),
                 "loss_batch": init_loss_batch.detach(),
@@ -148,6 +157,8 @@ class LocalRefiner:
             projected_full = self.constraint_engine.project_forward(full_raw, strict=False)
             _, projected_actions = self.constraint_engine.split_from_full(projected_full)
 
+            # 代理模型只看已经前向投影后的合法动作，避免把中间越界解送去做域外外推；
+            # 但软惩罚仍作用在 full_raw 上，为“越界方向”保留梯度，把潜变量拉回可行域。
             _, _, risk_info = self.surrogate.predict_injury_and_loss(
                 context_params=context_params,
                 control_trainable=projected_actions,

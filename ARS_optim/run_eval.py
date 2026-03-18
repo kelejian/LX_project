@@ -11,7 +11,14 @@ import yaml
 
 from common.data_utils.split_io import load_int_vector_csv
 from common.data_utils.processor import UnifiedDataProcessor
-from common.metrics.injury_risk import AIS_cal_chest, AIS_cal_head, AIS_cal_neck
+from common.metrics.injury_risk import (
+    AIS_cal_chest,
+    AIS_cal_head,
+    AIS_cal_neck,
+    Injury_prob_cal_chest,
+    Injury_prob_cal_head,
+    Injury_prob_cal_neck,
+)
 from common.settings import FEATURE_ORDER, NORMALIZATION_CONFIG_PATH, RAW_DATA_DIR, SPLIT_INDICES_DIR
 from common.tools.logger import setup_logger
 from common.tools.seeding import set_random_seed
@@ -65,6 +72,11 @@ def _build_output_dir(base_dir: Path, input_csv: Optional[str]) -> Path:
 
 
 def _resolve_strategy_ckpt(args, base_dir: Path, config: Dict) -> Optional[Path]:
+    """解析评估阶段允许使用的策略权重路径。
+
+    优先级固定为：CLI 显式指定 > config.evaluation.strategy_checkpoint > 关闭策略直推。
+    这里不做自动搜目录或按时间戳兜底，避免评估在用户不知情时悄悄换了一份权重。
+    """
     if args.strategy_ckpt:
         return Path(args.strategy_ckpt).resolve()
 
@@ -436,6 +448,12 @@ def _expand_stage_outputs_to_full(
     total_count: int,
     trainable_dim: int,
 ) -> Dict[str, object]:
+    """把“仅对有效 case 计算出来的阶段结果”扩回完整行数。
+
+    前面 input_csv 模式可能按行跳过非法 context，因此模型真正推理的张量只覆盖 valid_indices。
+    结果导出时仍需保留原 CSV 的完整行顺序，所以这里把有效结果写回对应位置，
+    其余 skipped 行统一填 NaN，保证结果表、summary 和 warning 行号能一一对应。
+    """
     valid_indices_tensor = torch.as_tensor(valid_indices, dtype=torch.long)
     expanded = {
         "total_time_cost": stage_outputs["total_time_cost"],
@@ -480,6 +498,7 @@ def _build_stage_metric_dataframe(
     row_count: int,
     ot_array: np.ndarray,
 ) -> pd.DataFrame:
+    """把单阶段输出整理成结果表所需的损伤、风险和 AIS 列。"""
     preds = stage["preds"]
     info = stage["info"]
 
@@ -519,7 +538,6 @@ def _build_stage_metric_dataframe(
     stage_df[f"{stage_label}_AIS_head"] = AIS_cal_head(stage_df[f"{stage_label}_HIC"].to_numpy(dtype=np.float32))
     stage_df[f"{stage_label}_AIS_chest"] = AIS_cal_chest(stage_df[f"{stage_label}_Dmax"].to_numpy(dtype=np.float32), ot_array)
     stage_df[f"{stage_label}_AIS_neck"] = AIS_cal_neck(stage_df[f"{stage_label}_Nij"].to_numpy(dtype=np.float32))
-    # MAIS: maximum AIS across head/chest/neck
     stage_df[f"{stage_label}_MAIS"] = np.maximum.reduce(
         [
             stage_df[f"{stage_label}_AIS_head"].to_numpy(dtype=np.float32),
@@ -537,6 +555,63 @@ def _build_stage_metric_dataframe(
     return stage_df
 
 
+def _build_truth_metric_dataframe(
+    truth_arrays: Dict[str, np.ndarray],
+    ot_array: np.ndarray,
+) -> pd.DataFrame:
+    """把测试集真值整理成与 Base/Opt 同口径的损伤、风险和 AIS 列。
+
+    run_eval 的结果表需要同时支持两类用途：
+    1. 比较 Base 与 Opt 的降损效果；
+    2. 在测试集模式下，把代理预测与仿真真值并排查看。
+
+    因此这里把 True_ 列也整理成与 Base_/Opt_ 平行的结构。
+    这样下游绘图脚本和结果分析代码只需按统一列命名规则取值，
+    不必为测试集真值再额外维护一套特例分支。
+    """
+    truth_df = pd.DataFrame(
+        {
+            "True_HIC": np.asarray(truth_arrays["y_HIC"], dtype=np.float32),
+            "True_Dmax": np.asarray(truth_arrays["y_Dmax"], dtype=np.float32),
+            "True_Nij": np.asarray(truth_arrays["y_Nij"], dtype=np.float32),
+        }
+    )
+    truth_df["True_Phead"] = np.asarray(
+        Injury_prob_cal_head(truth_df["True_HIC"].to_numpy(dtype=np.float32)),
+        dtype=np.float32,
+    )
+    truth_df["True_Pchest"] = np.asarray(
+        Injury_prob_cal_chest(truth_df["True_Dmax"].to_numpy(dtype=np.float32), OT=ot_array),
+        dtype=np.float32,
+    )
+    truth_df["True_Pneck"] = np.asarray(
+        Injury_prob_cal_neck(truth_df["True_Nij"].to_numpy(dtype=np.float32)),
+        dtype=np.float32,
+    )
+    truth_df["True_JointRisk"] = 1.0 - (
+        (1.0 - truth_df["True_Phead"])
+        * (1.0 - truth_df["True_Pchest"])
+        * (1.0 - truth_df["True_Pneck"])
+    )
+    truth_df["True_AIS_head"] = np.asarray(
+        truth_arrays.get("ais_head", AIS_cal_head(truth_df["True_HIC"].to_numpy(dtype=np.float32)))
+    )
+    truth_df["True_AIS_chest"] = np.asarray(
+        truth_arrays.get("ais_chest", AIS_cal_chest(truth_df["True_Dmax"].to_numpy(dtype=np.float32), ot_array))
+    )
+    truth_df["True_AIS_neck"] = np.asarray(
+        truth_arrays.get("ais_neck", AIS_cal_neck(truth_df["True_Nij"].to_numpy(dtype=np.float32)))
+    )
+    truth_df["True_MAIS"] = np.maximum.reduce(
+        [
+            truth_df["True_AIS_head"].to_numpy(dtype=np.float32),
+            truth_df["True_AIS_chest"].to_numpy(dtype=np.float32),
+            truth_df["True_AIS_neck"].to_numpy(dtype=np.float32),
+        ]
+    )
+    return truth_df
+
+
 def _build_result_dataframe(
     df_input: pd.DataFrame,
     context_df: pd.DataFrame,
@@ -546,17 +621,23 @@ def _build_result_dataframe(
     trainable_names: List[str],
     optimized_stage_name: Optional[str],
 ) -> tuple[pd.DataFrame, Dict[str, float]]:
+    """组装最终导出 CSV 和宏观汇总指标。
+
+    对外结果表只保留：
+    - 一份原始 metadata/context；
+    - 一份 baseline trainable control；
+    - 一份最终对外汇报的优化后 control；
+    - Base/Opt 两组损伤、风险、AIS 与降幅。
+
+    Opt1/Opt2 的内部区分只保留在 eval_info 中，避免结果 CSV 因中间阶段展开而臃肿。
+    """
     excluded_input_cols = set(FEATURE_ORDER) | {"y_HIC", "y_Dmax", "y_Nij", "ais_head", "ais_chest", "ais_neck"}
     metadata_cols = [col for col in df_input.columns if col not in excluded_input_cols]
     metadata_df = df_input[metadata_cols].reset_index(drop=True)
     frame_parts = [metadata_df, context_df.reset_index(drop=True)]
 
     ot_array = pd.to_numeric(context_df["OT"], errors="coerce").to_numpy(dtype=np.float32)
-    optimized_stage = stage_outputs[optimized_stage_name] if optimized_stage_name is not None else {
-        "preds": None,
-        "actions": None,
-        "info": {},
-    }
+    optimized_stage = stage_outputs[optimized_stage_name] if optimized_stage_name is not None else {"preds": None, "actions": None, "info": {}}
 
     baseline_df = baseline_df.reset_index(drop=True).rename(columns={name: f"Base_{name}" for name in trainable_names})
     frame_parts.append(baseline_df)
@@ -573,36 +654,17 @@ def _build_result_dataframe(
     frame_parts.append(_build_stage_metric_dataframe("Opt", optimized_stage, len(df_input), ot_array).reset_index(drop=True))
 
     result_df = pd.concat(frame_parts, axis=1)
+    truth_vs_df = None
 
     if all(key in truth_arrays for key in ["y_HIC", "y_Dmax", "y_Nij"]):
-        truth_df = pd.DataFrame(
-            [
-                np.asarray(truth_arrays["y_HIC"], dtype=np.float32),
-                np.asarray(truth_arrays["y_Dmax"], dtype=np.float32),
-                np.asarray(truth_arrays["y_Nij"], dtype=np.float32),
-            ],
-            index=["True_HIC", "True_Dmax", "True_Nij"],
-        ).T.reset_index(drop=True)
-        truth_df["True_AIS_head"] = np.asarray(
-            truth_arrays.get("ais_head", AIS_cal_head(truth_df["True_HIC"].to_numpy(dtype=np.float32)))
-        )
-        truth_df["True_AIS_chest"] = np.asarray(
-            truth_arrays.get("ais_chest", AIS_cal_chest(truth_df["True_Dmax"].to_numpy(dtype=np.float32), ot_array))
-        )
-        truth_df["True_AIS_neck"] = np.asarray(
-            truth_arrays.get("ais_neck", AIS_cal_neck(truth_df["True_Nij"].to_numpy(dtype=np.float32)))
-        )
-        # compute MAIS from individual AIS values
-        truth_df["True_MAIS"] = np.maximum.reduce(
-            [
-                truth_df["True_AIS_head"].to_numpy(dtype=np.float32),
-                truth_df["True_AIS_chest"].to_numpy(dtype=np.float32),
-                truth_df["True_AIS_neck"].to_numpy(dtype=np.float32),
-            ]
-        )
+        # 测试集模式下把真值也整理成与 Base/Opt 同口径的列，便于直接并排比较。
+        truth_df = _build_truth_metric_dataframe(truth_arrays=truth_arrays, ot_array=ot_array).reset_index(drop=True)
         for prefix in ["Base", "Opt"]:
             for name in ["HIC", "Dmax", "Nij"]:
-                truth_df[f"True_vs_{prefix}_{name}"] = truth_df[f"True_{name}"] - result_df[f"{prefix}_{name}"]
+                truth_df_key = f"True_{name}"
+                if truth_vs_df is None:
+                    truth_vs_df = pd.DataFrame(index=df_input.index)
+                truth_vs_df[f"True_vs_{prefix}_{name}"] = truth_df[truth_df_key] - result_df[f"{prefix}_{name}"]
         result_df = pd.concat([result_df, truth_df], axis=1)
 
     reduction_data = {}
@@ -612,6 +674,10 @@ def _build_result_dataframe(
 
     if reduction_data:
         result_df = pd.concat([result_df, pd.DataFrame(reduction_data, index=df_input.index).reset_index(drop=True)], axis=1)
+
+    if truth_vs_df is not None:
+        # True_vs_ 放在所有 Reduction_ 列之后，便于先看“Base/Opt/True 本体”，再看“Base-Opt 降幅”，最后看“True 与预测误差”。
+        result_df = pd.concat([result_df, truth_vs_df.reset_index(drop=True)], axis=1)
 
     summary = {
         "optimized_stage_source": optimized_stage_name,
@@ -656,7 +722,6 @@ def _build_eval_info(
     surrogate: SurrogateAdapter,
     summary_metrics: Dict[str, float],
     stage_outputs: Dict[str, object],
-    result_row_count: int,
     evaluated_case_count: int,
 ) -> Dict[str, object]:
     return {
@@ -899,7 +964,6 @@ def main():
         surrogate=surrogate,
         summary_metrics=summary_metrics,
         stage_outputs=stage_outputs,
-        result_row_count=len(result_df),
         evaluated_case_count=int(valid_mask.sum()),
     )
     _write_yaml(output_dir / "eval_info.yaml", eval_info)

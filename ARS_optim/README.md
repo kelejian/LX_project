@@ -30,6 +30,7 @@ ARS_optim/
 ├─ configs/
 │  ├─ default_config.yaml   # 训练与评估主配置
 │  └─ param_space.yaml      # 参数角色、默认值、范围、耦合规则
+├─ plot_eval_cases.py       # 按 case_id 从评估 CSV 批量出图
 ├─ src/
 │  ├─ constraints.py        # 统一硬约束与可微投影
 │  ├─ data_sampler.py       # 基于 injury_train 经验池的训练数据流
@@ -58,11 +59,20 @@ ARS_optim/
 3. 已训练好 InjuryPredict 模型
    - 当前默认权重路径由 ARS_optim/configs/default_config.yaml 中 surrogate.checkpoint_rel_path 指定
 
-4. 根目录下存在统一归一化文件
-   - data/normalization_config.json
+4. 当前数据目录下存在统一归一化文件
+  - 由 common/settings.py 中的 NORMALIZATION_CONFIG_PATH 决定
+  - 默认随 DATA_DIR 指向 data_PS/normalization_config.json
+  - 若要切换到 data_DS，请在运行前显式设置环境变量 LX_DATA_DIR
 
 5. 运行命令必须在 LX_project 根目录下执行
    - 本子项目当前只考虑这种运行方式
+
+例如在 Windows PowerShell 中可先执行：
+
+```powershell
+$env:LX_DATA_DIR = "E:/.../LX_project/data_DS"
+python -m ARS_optim.run_eval
+```
 
 
 ## 4. 参数与数据流约定
@@ -276,6 +286,7 @@ ARS_optim/saved_eval/eval_xxx_MMDD_HHMMSS/
 
 - evaluation_results.csv 或用户指定名称的输出 CSV
 - eval_info.yaml
+- summary.yaml
 - config_used.yaml
 - param_space.yaml
 - normalization_config.json
@@ -300,6 +311,11 @@ ARS_optim/saved_eval/eval_xxx_MMDD_HHMMSS/
   - AIS_head、AIS_chest、AIS_neck、MAIS (最大AIS)
 - Reduction_ 前缀的绝对降低量
 - 若为测试集模式，还会包含 True_ 前缀的真值列
+  - True_HIC、True_Dmax、True_Nij
+  - True_Phead、True_Pchest、True_Pneck、True_JointRisk
+  - True_AIS_head、True_AIS_chest、True_AIS_neck、True_MAIS
+- 若为测试集模式，还会包含 True_vs_ 前缀的真值对比列
+  - 这些列统一放在所有 Reduction_ 列之后，便于先浏览优化收益，再查看与真值的偏差
 
 ### 7.6 eval_info.yaml 内容
 
@@ -313,6 +329,34 @@ eval_info.yaml 中会记录：
 - 各阶段状态
 - 宏观降损指标汇总
 - 总耗时与平均耗时
+
+### 7.7 按 case_id 生成对比图
+
+可直接基于某次评估产出的结果 CSV 生成逐 case 柱状图：
+
+```bash
+python -m ARS_optim.plot_eval_cases --eval_csv ARS_optim/saved_eval/eval_xxx_MMDD_HHMMSS/evaluation_results.csv --case_ids 50007 50013
+```
+
+可选参数：
+
+- --dpi
+  - 控制输出图片分辨率，默认 180
+
+脚本行为约定：
+
+- 若 case_id 不存在，会给出 warning 并跳过该 case
+- 若指定的 case_id 全部不存在，会直接报错
+- 图片输出到评估 CSV 同目录下的 case_<case_id>/ 子目录
+
+每个 case 默认输出 4 张图：
+
+- 01_control_compare.png
+- 02_injury_scalar_compare.png
+- 03_ais_compare.png
+- 04_risk_compare.png
+
+若读取的是历史测试集评估 CSV，且其中缺少 True_Phead / True_Pchest / True_Pneck / True_JointRisk，绘图脚本会按与 run_eval.py 一致的口径即时补算，仅用于绘图，不会回写原 CSV。
 
 
 ## 8. 推荐使用顺序

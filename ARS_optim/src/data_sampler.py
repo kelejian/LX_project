@@ -54,7 +54,6 @@ class StateDataSampler:
             raise FileNotFoundError(f"经验池切分索引不存在: {split_path}")
         self.pool_path = pool_path
         self.split_path = split_path
-        self.using_split_indices = True
 
         full_features = self._load_feature_matrix_from_pool(pool_path)
         split_indices = load_int_vector_csv(split_path)
@@ -183,8 +182,8 @@ class StateDataSampler:
         """
         return {
             "pool_npz_path": str(self.pool_path.resolve()),
-            "split_indices_path": str(self.split_path.resolve()) if self.using_split_indices else None,
-            "using_split_indices": bool(self.using_split_indices),
+            "split_indices_path": str(self.split_path.resolve()),
+            "using_split_indices": True,
             "dataset_size": int(self.pool_size),
             "batch_size": int(self.batch_size),
             "jitter_ratio": float(self.jitter_ratio),

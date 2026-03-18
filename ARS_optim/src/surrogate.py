@@ -16,6 +16,7 @@ from ARS_optim.src.param_manager import ParamManager
 
 
 def _resolve_checkpoint_path(base_dir: Path, cfg_value: str) -> Path:
+    """把配置中的相对/绝对权重路径统一解析成绝对路径。"""
     raw = str(cfg_value or "").strip()
     candidate = Path(raw).expanduser()
     return candidate if candidate.is_absolute() else (base_dir / candidate).resolve()
@@ -112,6 +113,7 @@ class SurrogateAdapter(nn.Module):
         self._ot_index = self.param_manager.get_param("OT")["index"]
 
     def fit_distribution_reference(self, reference_features: torch.Tensor) -> None:
+        """拟合分布偏离惩罚所需的训练参考统计量。"""
         if self.distribution_penalty.enabled:
             self.distribution_penalty.fit(reference_features)
 
@@ -151,6 +153,8 @@ class SurrogateAdapter(nn.Module):
         nij = predictions_phys[:, 2]
         ot_tensor = combined_phys[:, self._ot_index]
 
+        # 代理模型输出已经是物理尺度的损伤值；这里再依据 common.metrics.injury_risk
+        # 中的风险曲线把各部位损伤值映射为 AIS3+ 概率，供优化目标与评估汇总共同使用。
         p_head = torch.clamp(injury_risk.Injury_prob_cal_head(hic15), 1e-6, 1.0 - 1e-6)
         p_chest = torch.clamp(injury_risk.Injury_prob_cal_chest(dmax, OT=ot_tensor), 1e-6, 1.0 - 1e-6)
         p_neck = torch.clamp(injury_risk.Injury_prob_cal_neck(nij), 1e-6, 1.0 - 1e-6)
@@ -176,6 +180,9 @@ class SurrogateAdapter(nn.Module):
             penalty_source,
             include_opt_bounds=include_opt_bounds,
         )
+        # 分布偏离惩罚独立于显式物理约束：
+        # 即使当前动作已经合法，也可能落在训练经验池稀疏甚至未覆盖的区域。
+        # 因此它单独作为一个软项存在，而不是合并进 ConstraintEngine。
         loss_distribution = self.distribution_penalty.compute(context_params, control_trainable)
         total_loss = loss_risk + self.weight_penalty * loss_constraint + self.weight_distribution * loss_distribution
 
