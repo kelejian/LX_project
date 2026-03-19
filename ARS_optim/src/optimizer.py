@@ -78,12 +78,16 @@ class LocalRefiner:
         """把候选动作做最终严格合法化。
 
         局部精调内部每一步只走 strict=False，可保留纯 torch 的连续梯度链；
-        但真正作为阶段输出写入结果表时，必须补做 strict=True，
-        让座椅多边形边界这类 numpy 几何投影也生效，保证落盘结果是绝对合法的物理解。
+        真正写入结果表之前，会再走一次终态合法化并立即复核输出端约束。
+        这样可以把“优化过程中的候选解”与“最终对外汇报/执行的解”彻底分开：
+        前者允许存在中间松弛量，后者必须是完整合法的物理解。
         """
         with torch.no_grad():
             full_features = self.constraint_engine.compose_full_features(context_params, actions)
             projected_full = self.constraint_engine.project_forward(full_features, strict=True)
+            valid_mask = self.constraint_engine.validate_output_solution(projected_full)
+            if not bool(valid_mask.all().item()):
+                raise RuntimeError("strict 投影后的最终动作仍存在输出端非法样本，请检查约束投影实现。")
             _, projected_actions = self.constraint_engine.split_from_full(projected_full)
         return projected_actions
 
@@ -97,6 +101,10 @@ class LocalRefiner:
         - z=0 对应 trainable 下界；
         - z=1 对应 trainable 上界；
         - 统一学习率表示“每步占各自量程的比例”。
+
+        实现上会把一个 batch 的多个 case 组装成同一个张量并行更新，
+        但每个 case 的损失、梯度和 Adam 状态都是按张量行独立维护的，
+        因此语义上仍然是“逐 case 优化”，而不是分布级优化。
         """
         self.surrogate.eval()
 
@@ -141,6 +149,9 @@ class LocalRefiner:
         spans = torch.clamp(max_bounds - min_bounds, min=1e-6)
         latent_var = self._to_latent(init_actions, mins=min_bounds, spans=spans).detach().requires_grad_(True)
 
+        # 这里只有一个 batched Adam，但它维护的状态张量与 latent_var 同形状。
+        # 因此每个 case、每个控制维度都会拥有各自独立的一阶矩/二阶矩，
+        # 本质上等价于“多个 case 各自做 Adam，只是把它们向量化并行执行”。
         optimizer = torch.optim.Adam([latent_var], lr=self.lr)
         trajectory = []
         start = time.time()
@@ -176,13 +187,15 @@ class LocalRefiner:
                 + self.surrogate.weight_penalty * penalty
                 + self.surrogate.weight_distribution * dist_penalty
             )
-            total_mean = total_batch.mean()
-            total_mean.backward()
+
+            total_sum = total_batch.sum() # 用 sum 而不是 mean，完全消除batch_size对Adam的影响
+            total_sum.backward()
             optimizer.step()
 
             with torch.no_grad():
                 latent_var.clamp_(relaxed_lower, relaxed_upper)
-            trajectory.append(float(total_mean.item()))
+            # 轨迹仅用于结果记录和调试观察，记录 batch 平均损失更便于人工比较；不会影响逐点优化的实际梯度计算和 Adam 更新。
+            trajectory.append(float(total_batch.mean().item()))
 
         end = time.time()
         final_actions_phys = self._from_latent(latent_var.detach(), mins=min_bounds, spans=spans)

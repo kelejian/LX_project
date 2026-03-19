@@ -62,16 +62,16 @@ class StrategyNet(nn.Module):
         self.pulse_embed_dim = int(pulse_embed_dim)
 
         if hidden_dims is None:
-            hidden_dims = [128, 256, 128]
+            hidden_dims = [128, 256, 256]
         if self.output_dim == 0:
             raise ValueError("当前 param_space.yaml 中没有 trainable=True 的控制参数")
 
         act_layer = getattr(nn, activation) if hasattr(nn, activation) else nn.ReLU
         self.pulse_encoder = nn.Sequential(
-            nn.Conv1d(pulse_channels, 16, kernel_size=5, stride=2, padding=2, bias=False),
-            nn.BatchNorm1d(16),
+            nn.Conv1d(pulse_channels, self.pulse_embed_dim // 2, kernel_size=5, stride=1, padding=0, bias=False),
+            nn.BatchNorm1d(self.pulse_embed_dim // 2),
             act_layer(inplace=True),
-            nn.Conv1d(16, self.pulse_embed_dim, kernel_size=5, stride=2, padding=2, bias=False),
+            nn.Conv1d(self.pulse_embed_dim // 2, self.pulse_embed_dim, kernel_size=3, stride=1, padding=0, bias=False),
             nn.BatchNorm1d(self.pulse_embed_dim),
             act_layer(inplace=True),
             nn.AdaptiveAvgPool1d(1),
@@ -90,7 +90,7 @@ class StrategyNet(nn.Module):
             if dropout > 0:
                 layers.append(nn.Dropout(float(dropout)))
             in_features = hidden_dim
-        layers.append(nn.Linear(in_features, self.output_dim))
+        layers.append(nn.Linear(in_features, self.output_dim)) # 输出层不带激活函数，由后续的 sigmoid 和边界映射处理约束
         self.mlp = nn.Sequential(*layers)
 
         min_bounds, max_bounds = self.param_manager.get_trainable_opt_bounds()
@@ -116,7 +116,7 @@ class StrategyNet(nn.Module):
             # ratio = (default - min) / (max - min), bias = log(ratio / (1 - ratio))。
             # 这样在最后一层权重清零时，网络未训练前就会稳定输出 default 动作。
             ratio = (self.default_actions - self.min_bounds) / torch.clamp(self.max_bounds - self.min_bounds, min=1e-12)
-            ratio = torch.clamp(ratio, min=1e-6, max=1.0 - 1e-6)
+            ratio = torch.clamp(ratio, min=1e-6, max=1.0 - 1e-6) # 避免 ratio 极端值导致 bias 无穷大
             out_layer.bias.copy_(torch.log(ratio / (1.0 - ratio)))
 
     def _normalize_context(self, context_features: torch.Tensor) -> torch.Tensor:

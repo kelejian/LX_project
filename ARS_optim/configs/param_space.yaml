@@ -47,7 +47,7 @@ parameters:
     base_max: 7.0
     opt_min: 1.0
     opt_max: 4.5
-    trainable: False
+    trainable: True
     default: 2.5
 
   - name: "LL2"
@@ -58,7 +58,7 @@ parameters:
     base_max: 4.5
     opt_min: 0.5
     opt_max: 2.7
-    trainable: False
+    trainable: True
     default: 2.5
 
   - name: "BTF"
@@ -133,7 +133,7 @@ parameters:
     role: "state"
     type: "discrete"
     values: [0, 1]
-    default: 1 # 1=主驾，0=副驾
+    default: 0 # 1=主驾，0=副驾
 
   - name: "OT"
     index: 12
@@ -152,7 +152,7 @@ constraint_rules:
     aft_btf_delta_max: 25.0
     llattf_btf_delta_min: 0.0
     ll2_ll1_delta_max: 0.0
-    epsilon: 0.001
+    epsilon: 0.0001
 
   extra_output_constraints:
     aft_btf_delta_min: 0.0

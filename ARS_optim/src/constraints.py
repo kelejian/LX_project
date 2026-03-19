@@ -10,11 +10,15 @@ from ARS_optim.src.param_manager import ParamManager
 class ConstraintEngine:
     """统一管理 ARS 参数的只读校验、前向投影与软惩罚。
 
-    该模块保留四条职责清晰的路径：
-    1. `is_valid_input_physics` / `is_valid_context`：输入端纯布尔校验，只按 base 范围与共享耦合规则判定，不包含仅作用于寻优解的额外约束；
-    2. `is_valid_physics`：输出端纯布尔校验，会把 trainable control 一并放进 yaml 子范围校验，并额外检查只作用于寻优解的输出端约束；
-    3. `project_forward`：把完整特征张量投影回可行域的连续子空间；
-    4. `compute_soft_penalty`：为训练或局部精调提供连续可导的约束梯度。
+    这里故意把“输入端校验”和“输出端合法化”拆开：
+    1. `validate_context_input`：只校验当前 context 列，供训练采样器与外部 CSV 的 context 检查使用；
+    2. `validate_full_input`：校验完整物理输入，但只看 base 范围和共享耦合规则；
+    3. `validate_output_solution`：校验寻优解，额外纳入 opt_min/opt_max 与仅输出端生效的额外约束；
+    4. `project_forward` / `compute_soft_penalty`：分别负责前向安全投影与反向梯度补偿。
+
+    这样做的原因是：同一条物理规则在不同阶段的适用范围并不相同。
+    如果把“输入端合法性”和“输出端寻优约束”混成一个入口，后续一旦切换某个
+    control 的 trainable 属性，就很容易出现静默误判。
     """
 
     def __init__(self, param_manager: ParamManager):
@@ -25,6 +29,8 @@ class ConstraintEngine:
         self.context_indices = param_manager.get_context_indices()
         self.trainable_indices = param_manager.get_control_trainable_indices()
         self._trainable_idx_set = set(self.trainable_indices)
+        self.context_params = param_manager.get_context_params()
+        self.context_names = [param["name"] for param in self.context_params]
 
         all_params = param_manager.get_all_params()
         self.name_to_index = {param["name"]: param["index"] for param in all_params}
@@ -93,10 +99,30 @@ class ConstraintEngine:
         self._ra_idx = self.name_to_index.get("RA")
         self._side_idx = self.name_to_index.get("is_driver_side")
         self._ot_idx = self.name_to_index.get("OT")
-        context_names = param_manager.get_context_names()
-        self._context_name_to_local_index = {name: idx for idx, name in enumerate(context_names)}
+        self._context_name_to_local_index = {name: idx for idx, name in enumerate(self.context_names)}
         self._context_overlap_local_idx = self._context_name_to_local_index.get("overlap")
         self._context_angle_local_idx = self._context_name_to_local_index.get("impact_angle")
+        self._context_ll1_local_idx = self._context_name_to_local_index.get("LL1")
+        self._context_ll2_local_idx = self._context_name_to_local_index.get("LL2")
+        self._context_btf_local_idx = self._context_name_to_local_index.get("BTF")
+        self._context_llattf_local_idx = self._context_name_to_local_index.get("LLATTF")
+        self._context_aft_local_idx = self._context_name_to_local_index.get("AFT")
+        self._context_sp_local_idx = self._context_name_to_local_index.get("SP")
+        self._context_sh_local_idx = self._context_name_to_local_index.get("SH")
+        self._context_ra_local_idx = self._context_name_to_local_index.get("RA")
+        self._context_side_local_idx = self._context_name_to_local_index.get("is_driver_side")
+        self._context_ot_local_idx = self._context_name_to_local_index.get("OT")
+
+        self.context_continuous_bounds = {
+            local_idx: (float(param["base_min"]), float(param["base_max"]))
+            for local_idx, param in enumerate(self.context_params)
+            if param.get("type") == "continuous"
+        }
+        self.context_discrete_values = {
+            local_idx: torch.tensor([float(value) for value in param["values"]], dtype=torch.float32)
+            for local_idx, param in enumerate(self.context_params)
+            if param.get("type") == "discrete"
+        }
 
         self._build_rule_caches()
 
@@ -163,6 +189,10 @@ class ConstraintEngine:
             self.ra_range_cache[(side, ot)] = (float(np.min(arr)), float(np.max(arr)))
 
     @staticmethod
+    def _all_present(*indices: int) -> bool:
+        return all(idx is not None for idx in indices)
+
+    @staticmethod
     def _project_points_to_polygon_boundary(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
         edge_start = polygon
         edge_end = np.roll(polygon, shift=-1, axis=0)
@@ -213,13 +243,26 @@ class ConstraintEngine:
         full_features = self._ensure_2d(full_features, self.total_dim, "full_features")
         return full_features[:, self.context_indices], full_features[:, self.trainable_indices]
 
+    def _get_overlap_angle_special_mask(self, overlap: torch.Tensor, lower_tol: float = 0.0) -> torch.Tensor:
+        """判断样本是否落入 overlap-angle 的特殊约束带。
+
+        params_constraint.md 对这一带的定义是 `0.25 <= |overlap| < 0.3`。
+        这里专门把它提炼成单一 helper，目的是让：
+        - 训练采样阶段的“冻结扰动”；
+        - 输入端/输出端的“合法性校验”
+        共用完全一致的上边界语义，避免一处按 `<0.3`、另一处按 `<=0.3`
+        导致边界样本在不同阶段出现不一致。
+        """
+        lower = self._overlap_abs_min - lower_tol
+        return (overlap.abs() >= lower) & (overlap.abs() < self._overlap_abs_max)
+
     def should_freeze_overlap_angle_jitter(self, context_params: torch.Tensor) -> torch.Tensor:
-        """返回在训练采样时应冻结 overlap/impact_angle 扰动的样本掩码。"""
+        """返回训练采样阶段应冻结 overlap/impact_angle 扰动的样本掩码。"""
         context_params = self._ensure_2d(context_params, len(self.context_indices), "context_params")
         if self._context_overlap_local_idx is None or self._context_angle_local_idx is None:
             return torch.zeros(context_params.shape[0], dtype=torch.bool, device=context_params.device)
         overlap = context_params[:, self._context_overlap_local_idx]
-        return (overlap.abs() >= self._overlap_abs_min) & (overlap.abs() < self._overlap_abs_max)
+        return self._get_overlap_angle_special_mask(overlap, lower_tol=0.0)
 
     def _replace_column(self, x: torch.Tensor, column_idx: int, new_column: torch.Tensor) -> torch.Tensor:
         x_new = x.clone()
@@ -229,6 +272,11 @@ class ConstraintEngine:
     def _get_side_ot_codes(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         side = torch.round(x[:, self._side_idx]).to(torch.int64)
         ot = torch.round(x[:, self._ot_idx]).to(torch.int64)
+        return side, ot
+
+    def _get_context_side_ot_codes(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        side = torch.round(x[:, self._context_side_local_idx]).to(torch.int64)
+        ot = torch.round(x[:, self._context_ot_local_idx]).to(torch.int64)
         return side, ot
 
     def _apply_trainable_bounds(self, x: torch.Tensor) -> torch.Tensor:
@@ -321,32 +369,166 @@ class ConstraintEngine:
             delta=self.aft_btf_extra_delta_min,
         )
 
-    def _project_seat_bbox(self, x: torch.Tensor) -> torch.Tensor:
-        """先做座椅包围盒裁剪，作为训练路径里的安全前置保护。
+    def _project_points_to_polygon_boundary_torch(
+        self,
+        points: torch.Tensor,
+        polygon_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """把一批二维点投影到凸多边形边界上的最近位置。
 
-        SP/SH 的精确可行域是由多边形或线段定义的，但 strict=False 路径需要保持
-        纯 torch、连续可微，因此这里只做 bbox 级别裁剪，把极端越界值先拉回一个
-        更接近真实可行域的区域；真正的精确多边形贴边只放在 strict=True 中执行。
+        strict=False 路径也必须保证送入 surrogate 的候选解合法，因此这里不再退化为
+        仅做 bbox 裁剪，而是直接在 torch 里计算“点到所有边线段的最近点”并取最小值。
+        这样既能维持计算图，又能避免 bbox 内但多边形外的点漏过前向安全防护。
+        """
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError(f"points 形状应为 [N, 2]，实际为 {tuple(points.shape)}")
+
+        polygon = polygon_tensor.to(device=points.device, dtype=points.dtype)
+        edge_start = polygon
+        edge_end = torch.roll(polygon, shifts=-1, dims=0)
+        edges = edge_end - edge_start
+        diff = points.unsqueeze(1) - edge_start.unsqueeze(0)
+        denom = torch.clamp(torch.sum(edges * edges, dim=1), min=1e-12)
+        t = torch.sum(diff * edges.unsqueeze(0), dim=2) / denom.unsqueeze(0)
+        t = torch.clamp(t, min=0.0, max=1.0)
+        candidates = edge_start.unsqueeze(0) + t.unsqueeze(2) * edges.unsqueeze(0)
+        dist_sq = torch.sum((points.unsqueeze(1) - candidates) ** 2, dim=2)
+        best_idx = torch.argmin(dist_sq, dim=1)
+        row_idx = torch.arange(points.shape[0], device=points.device)
+        return candidates[row_idx, best_idx]
+
+    def _get_axis_interval_from_polygon(
+        self,
+        info: Dict[str, object],
+        fixed_value: float,
+        axis: str,
+    ) -> Tuple[float, float] | None:
+        """计算凸多边形与水平/竖直截线的可行区间。
+
+        当只训练 SP 或只训练 SH 时，另一维来自 context，不能被投影修改。
+        因此这里求的是“在固定另一维后，当前可训练维度还能落到哪里”，
+        再对该单维做截断。这样才符合“未来 trainable 属性切换后仍自适应”的要求。
+        """
+        polygon = np.asarray(info["poly"], dtype=np.float32)
+        intersections = []
+        tol = self._tol
+
+        for start, end in zip(polygon, np.roll(polygon, shift=-1, axis=0)):
+            x1, y1 = float(start[0]), float(start[1])
+            x2, y2 = float(end[0]), float(end[1])
+            if axis == "x":
+                if abs(y1 - y2) <= tol:
+                    if abs(fixed_value - y1) <= tol:
+                        intersections.extend([x1, x2])
+                    continue
+                if min(y1, y2) - tol <= fixed_value <= max(y1, y2) + tol:
+                    t = (fixed_value - y1) / (y2 - y1)
+                    if -tol <= t <= 1.0 + tol:
+                        intersections.append(x1 + t * (x2 - x1))
+                continue
+
+            if axis == "y":
+                if abs(x1 - x2) <= tol:
+                    if abs(fixed_value - x1) <= tol:
+                        intersections.extend([y1, y2])
+                    continue
+                if min(x1, x2) - tol <= fixed_value <= max(x1, x2) + tol:
+                    t = (fixed_value - x1) / (x2 - x1)
+                    if -tol <= t <= 1.0 + tol:
+                        intersections.append(y1 + t * (y2 - y1))
+                continue
+
+            raise ValueError(f"axis 仅支持 'x' 或 'y'，实际为 {axis!r}")
+
+        if not intersections:
+            return None
+        return float(min(intersections)), float(max(intersections))
+
+    def _project_seat_feasible_region(self, x: torch.Tensor) -> torch.Tensor:
+        """把 SP/SH 投影回当前 side/OT 对应的精确座椅可行域。
+
+        这一层的职责是“确保每次送入 surrogate 的候选解都合法”，因此：
+        - 双变量都可调时，直接把二维点投到多边形/线段边界；
+        - 只有单变量可调时，只沿该变量方向截断，保持另一维 context 不变。
         """
         if not self.seat_cache:
             return x
-        if self._sp_idx not in self._trainable_idx_set and self._sh_idx not in self._trainable_idx_set:
+        sp_trainable = self._sp_idx in self._trainable_idx_set
+        sh_trainable = self._sh_idx in self._trainable_idx_set
+        if not sp_trainable and not sh_trainable:
             return x
-        side, ot = self._get_side_ot_codes(x)
+
+        x_new = x.clone()
+        side, ot = self._get_side_ot_codes(x_new)
         for (rule_side, rule_ot), info in self.seat_cache.items():
             mask = (side == rule_side) & (ot == rule_ot)
             if not mask.any():
                 continue
+            indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
             sp_min, sp_max, sh_min, sh_max = info["bbox"]
-            if self._sp_idx in self._trainable_idx_set:
-                sp_column = x[:, self._sp_idx]
-                bounded_sp = torch.where(mask, torch.clamp(sp_column, sp_min, sp_max), sp_column)
-                x = self._replace_column(x, self._sp_idx, bounded_sp)
-            if self._sh_idx in self._trainable_idx_set:
-                sh_column = x[:, self._sh_idx]
-                bounded_sh = torch.where(mask, torch.clamp(sh_column, sh_min, sh_max), sh_column)
-                x = self._replace_column(x, self._sh_idx, bounded_sh)
-        return x
+
+            # 当前项目中的退化情形实际就是线段，直接沿线段坐标做截断即可。
+            # 这类规则没有二维多边形内部，没必要再走最近边投影。
+            if sh_min == sh_max:
+                if sp_trainable:
+                    x_new[indices, self._sp_idx] = torch.clamp(x_new[indices, self._sp_idx], sp_min, sp_max)
+                if sh_trainable:
+                    x_new[indices, self._sh_idx] = sh_min
+                continue
+            if sp_min == sp_max:
+                if sp_trainable:
+                    x_new[indices, self._sp_idx] = sp_min
+                if sh_trainable:
+                    x_new[indices, self._sh_idx] = torch.clamp(x_new[indices, self._sh_idx], sh_min, sh_max)
+                continue
+
+            if sp_trainable and sh_trainable:
+                points = torch.stack([x_new[indices, self._sp_idx], x_new[indices, self._sh_idx]], dim=1)
+                penalty = self._polygon_halfplane_penalty(
+                    sp=points[:, 0],
+                    sh=points[:, 1],
+                    polygon_tensor=info["polygon_tensor"],
+                    normals_tensor=info["normals_tensor"],
+                )
+                outside_mask = penalty > self._tol
+                if outside_mask.any():
+                    projected = self._project_points_to_polygon_boundary_torch(
+                        points[outside_mask],
+                        info["polygon_tensor"],
+                    )
+                    outside_indices = indices[outside_mask]
+                    x_new[outside_indices, self._sp_idx] = projected[:, 0]
+                    x_new[outside_indices, self._sh_idx] = projected[:, 1]
+                continue
+
+            if sp_trainable:
+                projected_sp = x_new[indices, self._sp_idx].clone()
+                fixed_sh_list = x_new[indices, self._sh_idx].detach().cpu().tolist()
+                for row_offset, fixed_sh in enumerate(fixed_sh_list):
+                    interval = self._get_axis_interval_from_polygon(info, float(fixed_sh), axis="x")
+                    if interval is None:
+                        raise RuntimeError(
+                            f"固定 SH={fixed_sh:.6g} 与 seat_constraints[{rule_side}_{rule_ot}] 不兼容，"
+                            "当前样本不可能仅通过调节 SP 进入合法域。"
+                        )
+                    projected_sp[row_offset] = torch.clamp(projected_sp[row_offset], interval[0], interval[1])
+                x_new[indices, self._sp_idx] = projected_sp
+                continue
+
+            if sh_trainable:
+                projected_sh = x_new[indices, self._sh_idx].clone()
+                fixed_sp_list = x_new[indices, self._sp_idx].detach().cpu().tolist()
+                for row_offset, fixed_sp in enumerate(fixed_sp_list):
+                    interval = self._get_axis_interval_from_polygon(info, float(fixed_sp), axis="y")
+                    if interval is None:
+                        raise RuntimeError(
+                            f"固定 SP={fixed_sp:.6g} 与 seat_constraints[{rule_side}_{rule_ot}] 不兼容，"
+                            "当前样本不可能仅通过调节 SH 进入合法域。"
+                        )
+                    projected_sh[row_offset] = torch.clamp(projected_sh[row_offset], interval[0], interval[1])
+                x_new[indices, self._sh_idx] = projected_sh
+
+        return x_new
 
     def _project_ra_ranges(self, x: torch.Tensor) -> torch.Tensor:
         """按 (is_driver_side, OT) 组合裁剪 RA 的合法子区间。
@@ -366,58 +548,6 @@ class ConstraintEngine:
             bounded_ra = torch.where(mask, torch.clamp(ra_column, ra_min, ra_max), ra_column)
             x = self._replace_column(x, self._ra_idx, bounded_ra)
         return x
-
-    def _project_seat_polygon(self, x: torch.Tensor) -> torch.Tensor:
-        """在最终输出阶段把 SP/SH 精确贴回座椅多边形边界。
-
-        这一步使用 numpy 与 matplotlib.path 做几何判断，不适合放进训练期的反向链路。
-        因此它只出现在 strict=True 中，作为最终结果的绝对合法化步骤。
-        """
-        if not self.seat_cache:
-            return x
-        if self._sp_idx not in self._trainable_idx_set and self._sh_idx not in self._trainable_idx_set:
-            return x
-
-        x_new = x.clone()
-        side, ot = self._get_side_ot_codes(x_new)
-        for (rule_side, rule_ot), info in self.seat_cache.items():
-            mask = (side == rule_side) & (ot == rule_ot)
-            if not mask.any():
-                continue
-            indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
-            sp_min, sp_max, sh_min, sh_max = info["bbox"]
-
-            if sh_min == sh_max:
-                if self._sp_idx in self._trainable_idx_set:
-                    x_new[indices, self._sp_idx] = torch.clamp(x_new[indices, self._sp_idx], sp_min, sp_max)
-                if self._sh_idx in self._trainable_idx_set:
-                    x_new[indices, self._sh_idx] = sh_min
-                continue
-
-            if sp_min == sp_max:
-                if self._sp_idx in self._trainable_idx_set:
-                    x_new[indices, self._sp_idx] = sp_min
-                if self._sh_idx in self._trainable_idx_set:
-                    x_new[indices, self._sh_idx] = torch.clamp(x_new[indices, self._sh_idx], sh_min, sh_max)
-                continue
-
-            if self._sp_idx not in self._trainable_idx_set or self._sh_idx not in self._trainable_idx_set:
-                continue
-
-            points = torch.stack([x_new[indices, self._sp_idx], x_new[indices, self._sh_idx]], dim=1)
-            points_np = points.detach().cpu().numpy()
-            inside = info["path"].contains_points(points_np, radius=1e-9)
-            outside_local = np.where(~inside)[0]
-            if outside_local.size == 0:
-                continue
-
-            snapped = self._project_points_to_polygon_boundary(points_np[outside_local], info["poly"])
-            snapped_tensor = torch.tensor(snapped, dtype=x.dtype, device=x.device)
-            outside_indices = torch.tensor(outside_local, dtype=torch.long, device=x.device)
-            x_new[indices[outside_indices], self._sp_idx] = snapped_tensor[:, 0]
-            x_new[indices[outside_indices], self._sh_idx] = snapped_tensor[:, 1]
-
-        return x_new
 
     def _validate_seat_points_numpy(
         self,
@@ -478,7 +608,7 @@ class ConstraintEngine:
         signed_distance = torch.einsum("bvd,vd->bv", points.unsqueeze(1) - polygon.unsqueeze(0), normals)
         return torch.relu(signed_distance).sum(dim=1)
 
-    def _is_valid_physics_impl(
+    def _validate_full_features(
         self,
         full_features: torch.Tensor,
         continuous_bounds: Dict[int, Tuple[float, float]],
@@ -503,7 +633,7 @@ class ConstraintEngine:
         )
         valid &= overlap_valid
 
-        trigger = (overlap.abs() >= self._overlap_abs_min - tol) & (overlap.abs() < self._overlap_abs_max + tol)
+        trigger = self._get_overlap_angle_special_mask(overlap, lower_tol=tol)
         if trigger.any() and self._angle_segments:
             angle = x[:, self._impact_angle_idx]
             angle_valid = torch.zeros_like(trigger)
@@ -547,64 +677,128 @@ class ConstraintEngine:
 
         return valid
 
-    def is_valid_physics(self, full_features: torch.Tensor) -> torch.Tensor:
-        """逐条执行硬约束校验，并返回逐样本布尔掩码。
-
-        这是输出端完整特征的“只判定、不修正”入口。
-        其校验口径包含：
-        - trainable control 的 yaml 子范围；
-        - params_constraint 对应的物理耦合约束；
-        - 仅作用于寻优解的额外约束。
-
-        因此它适用于优化结果、代理输入和最终合法性复核；
-        输入端 context 或外部 baseline 的文件级校验应改走 `is_valid_input_physics`
-        或 `is_valid_context`，避免把输入端样本误判为必须满足优化子范围。
-        """
+    def validate_output_solution(self, full_features: torch.Tensor) -> torch.Tensor:
+        """校验寻优解是否满足输出端全部约束。"""
         x = self._ensure_2d(full_features, self.total_dim, "full_features")
-        valid = self._is_valid_physics_impl(x, self.output_continuous_bounds)
+        valid = self._validate_full_features(x, self.output_continuous_bounds)
         valid &= x[:, self._aft_idx] >= x[:, self._btf_idx] + self.aft_btf_extra_delta_min - self._tol
         return valid
 
-    def is_valid_input_physics(self, full_features: torch.Tensor) -> torch.Tensor:
-        """按完整物理定义域校验输入样本，不额外施加优化子范围。
+    def validate_full_input(self, full_features: torch.Tensor) -> torch.Tensor:
+        """按完整物理输入口径校验样本。
 
-        该入口专门服务评估脚本的输入端语义：外部 input_csv 允许控制量超出当前
-        yaml 优化子范围，只要仍满足 params_constraint 对应的 base 范围与共享耦合规则即可。
-        像 AFT >= BTF 这类只面向寻优解的额外约束，不在这里生效。
+        这里故意不看 opt_min/opt_max，也不看仅输出端生效的额外约束。
+        它只回答一个问题：这条完整输入是否落在代理模型训练数据所对应的
+        base 定义域与共享耦合规则之内。
         """
-        return self._is_valid_physics_impl(full_features, self.base_continuous_bounds)
+        return self._validate_full_features(full_features, self.base_continuous_bounds)
 
-    def is_valid_context(self, context_params: torch.Tensor) -> torch.Tensor:
-        """校验仅包含 context 的输入样本是否合法。
+    def validate_context_input(self, context_params: torch.Tensor) -> torch.Tensor:
+        """只校验当前 context 张量本身，不再补任何默认 trainable control。
 
-        训练采样器与任何只读入 context 的入口，都应走这一层语义：
-        - 先用默认 trainable control 补成完整特征；
-        - 再只按完整物理定义域与物理耦合规则判断是否合法。
-
-        这样可以避免把 LL1/LL2 这类当前固定 control 错误地当成优化子范围变量处理。
+        这一点对 ARS_optim 很关键：context = state + 当前固定 control。
+        未来只要某个 control 的 trainable 属性变化，它就会离开 context。
+        因此 context 校验只能依赖“当前真正出现在 context 里的列”，不能再偷偷补一组
+        default trainable control 去凑完整特征，否则会把输入端语义污染成输出端语义。
         """
-        full_features = self.compose_full_features(context_params=context_params)
-        return self.is_valid_input_physics(full_features)
+        x = self._ensure_2d(context_params, len(self.context_indices), "context_params")
+        tol = self._tol
+        valid = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
+
+        for local_idx, (min_value, max_value) in self.context_continuous_bounds.items():
+            valid &= (x[:, local_idx] >= min_value - tol) & (x[:, local_idx] <= max_value + tol)
+
+        for local_idx, allowed_cpu in self.context_discrete_values.items():
+            allowed = allowed_cpu.to(device=x.device, dtype=x.dtype)
+            matches = (x[:, local_idx].unsqueeze(1) - allowed.unsqueeze(0)).abs() <= tol
+            valid &= matches.any(dim=1)
+
+        if self._context_overlap_local_idx is not None:
+            overlap = x[:, self._context_overlap_local_idx]
+            overlap_valid = (
+                ((overlap >= self._overlap_neg_min - tol) & (overlap <= self._overlap_neg_max + tol))
+                | ((overlap >= self._overlap_pos_min - tol) & (overlap <= self._overlap_pos_max + tol))
+            )
+            valid &= overlap_valid
+
+            if self._context_angle_local_idx is not None and self._angle_segments:
+                trigger = self._get_overlap_angle_special_mask(overlap, lower_tol=tol)
+                if trigger.any():
+                    angle = x[:, self._context_angle_local_idx]
+                    angle_valid = torch.zeros_like(trigger)
+                    for o_min, o_max, a_min, a_max in self._angle_segments:
+                        segment_mask = (
+                            (overlap >= o_min - tol)
+                            & (overlap <= o_max + tol)
+                            & (angle >= a_min - tol)
+                            & (angle <= a_max + tol)
+                        )
+                        angle_valid |= segment_mask
+                    valid &= (~trigger) | angle_valid
+
+        if self._all_present(self._context_ll1_local_idx, self._context_ll2_local_idx):
+            valid &= (
+                x[:, self._context_ll2_local_idx]
+                <= x[:, self._context_ll1_local_idx] + self.ll2_ll1_delta_max + tol
+            )
+        if self._all_present(self._context_btf_local_idx, self._context_llattf_local_idx):
+            valid &= (
+                x[:, self._context_llattf_local_idx]
+                >= x[:, self._context_btf_local_idx] + self.llattf_btf_delta_min - tol
+            )
+        if self._all_present(self._context_btf_local_idx, self._context_aft_local_idx):
+            valid &= (
+                x[:, self._context_aft_local_idx]
+                <= x[:, self._context_btf_local_idx] + self.aft_btf_delta_max + tol
+            )
+
+        if self._all_present(self._context_side_local_idx, self._context_ot_local_idx, self._context_ra_local_idx):
+            side, ot = self._get_context_side_ot_codes(x)
+            for (rule_side, rule_ot), (ra_min, ra_max) in self.ra_range_cache.items():
+                mask = (side == rule_side) & (ot == rule_ot)
+                if not mask.any():
+                    continue
+                valid[mask] &= (
+                    (x[mask, self._context_ra_local_idx] >= ra_min - tol)
+                    & (x[mask, self._context_ra_local_idx] <= ra_max + tol)
+                )
+
+        if self._all_present(self._context_side_local_idx, self._context_ot_local_idx, self._context_sp_local_idx, self._context_sh_local_idx):
+            side, ot = self._get_context_side_ot_codes(x)
+            for (rule_side, rule_ot), info in self.seat_cache.items():
+                mask = (side == rule_side) & (ot == rule_ot)
+                if not mask.any():
+                    continue
+                points = torch.stack(
+                    [x[mask, self._context_sp_local_idx], x[mask, self._context_sh_local_idx]],
+                    dim=1,
+                )
+                valid_local = self._validate_seat_points_numpy(points.detach().cpu().numpy(), info)
+                valid[mask] &= torch.as_tensor(valid_local, dtype=torch.bool, device=x.device)
+
+        return valid
 
     def project_forward(self, full_features: torch.Tensor, strict: bool = False) -> torch.Tensor:
         """对完整特征张量做前向投影。
 
-        `strict=False` 用于策略直推训练和局部精调的中间迭代，做连续可微的共享耦合投影、
-        输出端额外约束投影、bbox 裁剪及 RA 条件区间投影（均为纯 torch 可微操作，不阻断反向传播）。
-        `strict=True` 只用于最终输出，在此基础上追加 numpy 多边形边界精确投影。
+        现在 strict=False 与 strict=True 共享同一套精确座椅投影逻辑：
+        - 中间迭代阶段也必须保证 surrogate 不看到域外的 SP/SH；
+        - 最终输出阶段只是沿用同一条合法化链路，不再维护一套 bbox/多边形双轨逻辑。
+
+        保留 strict 参数只是为了让调用点继续显式表达“中间候选解”与“最终落盘解”；
+        当前两条路径的核心几何投影已经统一，不再人为拆成两套实现。
         """
         x = self._ensure_2d(full_features, self.total_dim, "full_features").clone()
         x = self._apply_trainable_bounds(x)
         x = self._project_control_couplings(x)
         x = self._project_output_extra_constraints(x)
-        x = self._project_seat_bbox(x)
+        x = self._project_seat_feasible_region(x)
         # RA 条件区间需在 strict=False 路径中执行：yaml 全局范围 [15, 40] 远宽于
         # 特定 (side, OT) 组合的合法子区间（如主驾 OT=1 上限 25°），若不在此处投影，
         # 训练/精调中间步会把超出条件区间的 RA 值送入 surrogate 模型，导致域外外推。
         x = self._project_ra_ranges(x)
 
         if strict:
-            x = self._project_seat_polygon(x)
             x = self._apply_trainable_bounds(x)
 
         return x

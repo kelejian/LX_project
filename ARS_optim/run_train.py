@@ -1,3 +1,7 @@
+import os
+os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = 'T'
+import warnings
+warnings.filterwarnings('ignore')
 import argparse
 import csv
 import shutil
@@ -51,11 +55,9 @@ def _build_scheduler(optimizer, train_cfg: dict, max_iters: int):
         )
     return None
 
-
 def _build_training_summary(
     train_cfg: dict,
     val_interval: int,
-    val_batch_size: int,
     ema_enabled: bool,
     ema_alpha: float,
     ema_warmup_iters: int,
@@ -64,9 +66,8 @@ def _build_training_summary(
     param_manager: ParamManager,
     train_sampler: StateDataSampler,
     val_sampler: StateDataSampler,
-    dist_ref_sample_count: Optional[int],
+    dist_ref_info: Optional[dict],
     run_norm_snapshot_path: Path,
-    config: dict,
     train_best_iter: int,
     train_best_loss: float,
     train_metric_name: str,
@@ -75,11 +76,102 @@ def _build_training_summary(
     val_best_loss: float,
     val_best_path: Path,
     final_path: Path,
+    save_best: bool,
+    save_last: bool,
 ) -> dict:
+    def checkpoint_record(
+        saved: bool,
+        path: Path,
+        *,
+        status: str,
+        iter_idx: Optional[int] = None,
+        loss: Optional[float] = None,
+        metric: Optional[str] = None,
+    ) -> dict:
+        """把 checkpoint 摘要统一成同一结构。
+
+        训练摘要里必须区分三种状态：
+        - `saved`：该类权重真实落盘，ckpt 指向真实文件名；
+        - `disabled` / `validation_disabled`：本次运行压根没有启用这类产物；
+        - `not_triggered`：逻辑允许生成，但本次运行中没有触发保存。
+
+        这样摘要文件才能和磁盘事实一一对应，避免出现“summary 里写着有 final_model，
+        但实际因为 save_last=False 根本没有生成”的误导记录。
+        """
+        return {
+            "saved": bool(saved),
+            "status": status,
+            "iter": None if iter_idx is None or iter_idx < 0 else int(iter_idx),
+            "loss": None if loss is None else float(loss),
+            "metric": metric,
+            "ckpt": path.name if saved else None,
+        }
+
+    if not save_best:
+        train_best_record = checkpoint_record(
+            saved=False,
+            path=train_best_path,
+            status="disabled",
+            metric=train_metric_name,
+        )
+    elif train_best_iter < 0:
+        train_best_record = checkpoint_record(
+            saved=False,
+            path=train_best_path,
+            status="not_triggered",
+            metric=train_metric_name,
+        )
+    else:
+        train_best_record = checkpoint_record(
+            saved=True,
+            path=train_best_path,
+            status="saved",
+            iter_idx=train_best_iter,
+            loss=train_best_loss,
+            metric=train_metric_name,
+        )
+
+    if val_interval <= 0:
+        val_best_record = checkpoint_record(
+            saved=False,
+            path=val_best_path,
+            status="validation_disabled",
+            metric="val_loss",
+        )
+    elif val_best_iter < 0:
+        val_best_record = checkpoint_record(
+            saved=False,
+            path=val_best_path,
+            status="not_triggered",
+            metric="val_loss",
+        )
+    else:
+        val_best_record = checkpoint_record(
+            saved=True,
+            path=val_best_path,
+            status="saved",
+            iter_idx=val_best_iter,
+            loss=val_best_loss,
+            metric="val_loss",
+        )
+
+    if save_last:
+        final_model_record = checkpoint_record(
+            saved=True,
+            path=final_path,
+            status="saved",
+            iter_idx=train_cfg["max_iterations"],
+        )
+    else:
+        final_model_record = checkpoint_record(
+            saved=False,
+            path=final_path,
+            status="disabled",
+        )
+
     return {
         "max_iterations": train_cfg["max_iterations"],
         "val_interval": val_interval,
-        "val_batch_size": val_batch_size,
         "ema": {
             "enabled": ema_enabled,
             "alpha": ema_alpha,
@@ -89,8 +181,6 @@ def _build_training_summary(
         "data_flow": {
             "train_sampler": train_sampler.get_source_info(),
             "val_sampler": val_sampler.get_source_info(),
-            "train_stream_semantics": "从 injury_train 经验池按批采样并做连续 context 扰动，不使用 epoch 概念",
-            "val_stream_semantics": "每个 val_interval 在 injury_val 全量样本上评估一次，不加扰动",
         },
         "distribution_penalty": {
             "enabled": bool(surrogate.distribution_penalty.enabled),
@@ -101,33 +191,19 @@ def _build_training_summary(
             "eps": surrogate.distribution_penalty.eps,
             "clip_max": surrogate.distribution_penalty.clip_max,
             "normalize_by_train_stats": surrogate.distribution_penalty.normalize_by_train_stats,
-            "reference_sample_count": dist_ref_sample_count,
+            "reference_sampling": dist_ref_info,
         },
         "parameter_roles": {
             "context": param_manager.get_context_names(),
             "trainable_control": param_manager.get_trainable_names(),
             "fixed_control": param_manager.get_fixed_control_names(),
         },
-        "external_artifacts": {
-            "normalization_config": run_norm_snapshot_path.name,
-            "pulse_checkpoint": config.get("surrogate", {}).get("pulse_checkpoint"),
-            "injury_checkpoint": config.get("surrogate", {}).get("checkpoint_rel_path"),
-        },
-        "train_best": {
-            "iter": train_best_iter,
-            "loss": None if train_best_iter < 0 else float(train_best_loss),
-            "metric": train_metric_name,
-            "ckpt": train_best_path.name,
-        },
-        "val_best": {
-            "iter": val_best_iter,
-            "loss": None if val_best_iter < 0 else float(val_best_loss),
-            "ckpt": val_best_path.name,
-        },
-        "final_model": {
-            "iter": train_cfg["max_iterations"],
-            "ckpt": final_path.name,
-        },
+        # 运行目录里已经直接保存了 config_used.yaml / param_space.yaml / normalization_config.json；
+        # 这里不再把同一批外部工件路径重复展开到 summary，避免摘要和快照文件各维护一份信息。
+        "normalization_config_snapshot": run_norm_snapshot_path.name,
+        "train_best": train_best_record,
+        "val_best": val_best_record,
+        "final_model": final_model_record,
     }
 
 
@@ -260,7 +336,7 @@ def main():
         config=config,
     ).to(device)
 
-    optimizer = optim.Adam(strategy_net.parameters(), lr=train_cfg["lr"], weight_decay=train_cfg["weight_decay"])
+    optimizer = optim.AdamW(strategy_net.parameters(), lr=train_cfg["lr"], weight_decay=train_cfg["weight_decay"])
     scheduler = _build_scheduler(optimizer, train_cfg, train_cfg["max_iterations"])
     val_batch_size = int(train_cfg.get("val_batch_size", 1024))
 
@@ -285,17 +361,19 @@ def main():
         jitter_prob=0.0,
     )
     train_generator = train_sampler.get_infinite_generator()
-    dist_ref_sample_count = None
+    dist_ref_info = None
 
     if surrogate.distribution_penalty.enabled:
         dist_cfg = config.get("optimization", {}).get("distribution_penalty", {})
-        ref_context = train_sampler.get_distribution_reference(
+        # 分布惩罚的参考集必须尽量代表整个训练经验池，而不是池中前缀切片。
+        # 这里统一使用“完整训练池”或“基于全局 seed 的一次性随机子样本”，
+        # 让训练和评估两端拟合出的参考分布保持同源、可复现。
+        ref_context, dist_ref_info = train_sampler.get_distribution_reference(
             max_samples=int(dist_cfg.get("max_ref_samples", 0)),
-            shuffle=False,
             feature_space=surrogate.distribution_penalty.feature_space,
             trainable_indices=param_manager.get_control_trainable_indices(),
+            sample_seed=seed,
         )
-        dist_ref_sample_count = int(ref_context.shape[0])
         surrogate.fit_distribution_reference(ref_context)
 
     sanity_context = next(train_generator)
@@ -458,7 +536,6 @@ def main():
                 _build_training_summary(
                     train_cfg=train_cfg,
                     val_interval=val_interval,
-                    val_batch_size=val_batch_size,
                     ema_enabled=ema_enabled,
                     ema_alpha=ema_alpha,
                     ema_warmup_iters=ema_warmup_iters,
@@ -467,9 +544,8 @@ def main():
                     param_manager=param_manager,
                     train_sampler=train_sampler,
                     val_sampler=val_sampler,
-                    dist_ref_sample_count=dist_ref_sample_count,
+                    dist_ref_info=dist_ref_info,
                     run_norm_snapshot_path=run_norm_snapshot_path,
-                    config=config,
                     train_best_iter=train_best_iter,
                     train_best_loss=train_best_loss,
                     train_metric_name=train_metric_name,
@@ -478,6 +554,8 @@ def main():
                     val_best_loss=val_best_loss,
                     val_best_path=val_best_path,
                     final_path=final_path,
+                    save_best=save_best,
+                    save_last=save_last,
                 ),
                 file,
                 allow_unicode=True,

@@ -18,23 +18,23 @@ surrogate:
 # 3. 策略网络(Strategy Net)训练 - 摊销优化超参
 # ===========================
 strategy_net:
-  hidden_dims: [128, 256, 128] # MLP 隐藏层架构
+  hidden_dims: [128, 256, 256] # MLP 隐藏层架构
   activation: "LeakyReLU"
-  dropout: 0.1
+  dropout: 0
   pulse_channels: 2      # 波形输入通道（当前为 XY 两通道）
-  pulse_embed_dim: 32    # 波形编码后的嵌入维度
+  pulse_embed_dim: 64    # 波形编码后的嵌入维度
   
   train:
-    batch_size: 256
-    max_iterations: 50000  # 放弃 Epoch 概念，使用最大迭代步数控制无标签自监督数据流
-    lr: 0.001
+    batch_size: 1024
+    max_iterations: 20000  # 放弃 Epoch 概念，使用最大迭代步数控制无标签自监督数据流
+    lr: 2e-4
     weight_decay: 1e-4
     log_interval: 10
     save_best: true
     save_last: true
     scheduler:
       type: "cosine"      # none | cosine | step
-      T_max: 50000
+      T_max: 20000
       eta_min: 1.0e-5
     val_interval: 500       # 每隔多少 iterations 评估一次完整验证集
     val_batch_size: 1024    # 验证阶段批大小（不影响训练batch）
@@ -53,13 +53,13 @@ strategy_net:
 # ===========================
 optimization:
   # 是否直推
-  direct_inference: False    # 为True且有效策略权重指定后再开启 Opt1
-  refine_steps: 1000         # 局部精调迭代次数 k。若为 0，则不生成 Opt2；若大于 0，则输出局部精调后的 Opt2
-  lr: 0.005                   # 局部精调阶段在物理参数空间中的 Adam 步长
+  direct_inference: True  # 为True且有效策略权重指定后再开启 Opt1
+  refine_steps: 2000   # 局部精调迭代次数 k。若为 0，则不生成 Opt2 (仅输出直推结果Opt1)
+  lr: 0.005        # 局部精调阶段在物理参数空间中的 Adam 步长
   
   # 综合目标函数(Loss)各部位风险权重
   objectives:
-    weight_hic: 5.0
+    weight_hic: 2.0
     weight_dmax: 1.0
     weight_nij: 1.0
     weight_penalty: 10.0   # 物理约束惩罚项系数
@@ -80,5 +80,5 @@ optimization:
 # 5. 评估(Evaluation)
 # ===========================
 evaluation:
-  eval_batch_size: 512   # 评估时分批推理的批大小，用于降低显存峰值
-  strategy_checkpoint: null  # 可选：仅在需要策略直推时显式指定兼容当前参数空间的权重
+  eval_batch_size: 1024   # 评估时分批推理的批大小，用于降低显存峰值
+  strategy_checkpoint: "E:/WPS Office/1628575652/WPS企业云盘/清华大学/我的企业文档/课题组相关/理想项目/LX_project/ARS_optim/saved_models/strategy_net_0319_082917/val_best_model.pth"  # 可选：仅在需要策略直推时显式指定兼容当前参数空间的权重; 不需要时保持 null

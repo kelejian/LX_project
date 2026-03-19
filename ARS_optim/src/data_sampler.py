@@ -37,13 +37,14 @@ class StateDataSampler:
         self.constraint_engine = constraint_engine
         self.batch_size = int(batch_size)
         self.device = device
+        self.seed = int(seed) if seed is not None else None
         self.jitter_ratio = float(jitter_ratio)
         self.jitter_prob = float(jitter_prob)
         self._last_rejection_rate = 0.0
 
         self.rng = torch.Generator(device=device)
-        if seed is not None:
-            self.rng.manual_seed(int(seed))
+        if self.seed is not None:
+            self.rng.manual_seed(self.seed)
 
         self.context_params = self.param_manager.get_context_params()
         self.context_indices = self.param_manager.get_context_indices()
@@ -151,7 +152,10 @@ class StateDataSampler:
 
         # 掩码后的扰动只生成“试探样本”；这里不做任何后置修补或边界截断。
         # 只要某行试探样本破坏硬约束，就整行拒绝并回退为原始经验池样本。
-        valid_mask = self.constraint_engine.is_valid_context(batch_context)
+        # 训练采样阶段的输入端合法性只针对当前 context 列本身，
+        # 不再补任何默认 trainable control 去“凑完整特征”后再校验。
+        # 否则一旦未来切换 trainable 属性，采样器的语义就会被默认值污染。
+        valid_mask = self.constraint_engine.validate_context_input(batch_context)
         self._last_rejection_rate = float((~valid_mask).to(dtype=torch.float32).mean().item())
         if (~valid_mask).any():
             batch_context[~valid_mask] = original_context[~valid_mask]
@@ -183,8 +187,8 @@ class StateDataSampler:
         return {
             "pool_npz_path": str(self.pool_path.resolve()),
             "split_indices_path": str(self.split_path.resolve()),
-            "using_split_indices": True,
             "dataset_size": int(self.pool_size),
+            "seed": self.seed,
             "batch_size": int(self.batch_size),
             "jitter_ratio": float(self.jitter_ratio),
             "jitter_prob": float(self.jitter_prob),
@@ -193,28 +197,58 @@ class StateDataSampler:
             ],
         }
 
-    def get_distribution_reference(self, max_samples: int = 0, shuffle: bool = False, feature_space: str = "context", trainable_indices: Optional[list] = None) -> torch.Tensor:
+    def get_distribution_reference(
+        self,
+        max_samples: int = 0,
+        feature_space: str = "context",
+        trainable_indices: Optional[list] = None,
+        sample_seed: Optional[int] = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """返回分布惩罚参考集及其抽样元信息。
+
+        训练和评估都必须复用同一条抽样语义：
+        - 若未截断，直接使用完整训练经验池；
+        - 若需要截断，则基于固定 seed 做一次性随机子采样。
+
+        这里故意不用采样器主 RNG 的当前状态，也不采用“前 N 条样本”前缀切片。
+        前者会让是否启用分布惩罚反过来污染训练数据流；后者则可能把参考分布偏成
+        训练池存储顺序的前缀，而不再代表整体经验池。
+        """
         # feature_space="context" 时，仅返回经验池中的 context 列，用于度量工况分布偏离。
         # feature_space="context_control" 时，返回 [context | trainable_control] 的拼接矩阵；
         # 其中 trainable_control 部分直接取自经验池原始样本中的对应控制参数列，而不是 default 值或策略网络输出。
         if feature_space == "context":
-            ref = self.pool_context
+            full_reference = self.pool_context
         elif feature_space == "context_control":
             if trainable_indices is None:
                 raise ValueError("feature_space=context_control 时必须提供 trainable_indices")
             control_ref = self.pool_full[:, trainable_indices] if trainable_indices else self.pool_full[:, :0]
-            ref = torch.cat([self.pool_context, control_ref], dim=1)
+            full_reference = torch.cat([self.pool_context, control_ref], dim=1)
         else:
             raise ValueError(f"不支持的 feature_space: {feature_space}")
 
-        if max_samples is None or int(max_samples) <= 0 or ref.shape[0] <= int(max_samples):
-            return ref
-        count = int(max_samples)
-        if shuffle:
-            indices = torch.randperm(ref.shape[0], generator=self.rng, device=self.device)[:count]
-        else:
-            indices = torch.arange(count, device=self.device)
-        return ref[indices]
+        total_count = int(full_reference.shape[0])
+        requested_max = int(max_samples or 0)
+        if requested_max <= 0 or total_count <= requested_max:
+            return full_reference, {
+                "pool_size": total_count,
+                "sample_count": total_count,
+                "requested_max_samples": requested_max,
+                "sampling_mode": "full_pool",
+                "seed": None,
+            }
+
+        seed_value = self.seed if sample_seed is None else int(sample_seed)
+        local_rng = torch.Generator(device=self.device)
+        local_rng.manual_seed(0 if seed_value is None else seed_value)
+        indices = torch.randperm(total_count, generator=local_rng, device=self.device)[:requested_max]
+        return full_reference[indices], {
+            "pool_size": total_count,
+            "sample_count": int(indices.numel()),
+            "requested_max_samples": requested_max,
+            "sampling_mode": "seeded_random_subset",
+            "seed": 0 if seed_value is None else seed_value,
+        }
 
     def iter_dataset_batches(self, batch_size: Optional[int] = None, shuffle: bool = False) -> Iterator[torch.Tensor]:
         batch_size = int(batch_size) if batch_size is not None else self.batch_size
