@@ -360,7 +360,7 @@ if __name__ == "__main__":
     all_folds_results = {metric_name: {'best_values': [], 'best_epochs': [], 'eval_results': []} 
                          for metric_name in metric_trackers.keys()}
 
-    # --- add：初始保存 K-Fold 配置 ---
+    # --- 初始保存 K-Fold 配置 ---
     results_path = os.path.join(main_run_dir, "TrainingRecord.json")
     initial_kfold_record = {
         "model_type": "InjuryPredictModel",
@@ -369,6 +369,7 @@ if __name__ == "__main__":
             "trainable_params": trainable_params
         },
         "kfold_info": {
+            "INJURY_PROCESSED_DIR": str(INJURY_PROCESSED_DIR),
             "total_samples_for_kfold": len(combined_indices),
             "k_value": K,
             "val_metrics_to_track": val_metrics_to_track  # 记录所有跟踪的指标

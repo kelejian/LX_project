@@ -1,84 +1,124 @@
 # ARS_optim/configs/default_config.yaml
+#
+# 这个配置文件只描述 ARS_optim 自己需要关心的训练/评估超参数与外部模型权重位置。
+# 其中：
+# 1. 输入归一化仍然统一以项目根目录下的 normalization_config.json 为准；
+# 2. 参数可调范围与硬约束来自 param_space.yaml；
+# 3. 训练/评估脚本均默认在 LX_project 根目录下以 `python -m xxx` 方式运行。
 
 seed: 123
-device: "cuda" # 或 "cpu"
+device: "cuda"
 
-# ===========================
-# 2. 外部依赖配置 (与环境解耦)
-# ===========================
-# 仅指定代理模型权重的相对位置，根路径由代码从 common.settings.PULSE_PREDICT_DIR
-# 和 common.settings.INJURY_PREDICT_DIR 分别解析。
 surrogate:
-  # pulse 模型相对路径
+  # PulsePredict 最优权重，相对 PulsePredict 根目录解析。
   pulse_checkpoint: "saved/models/HybridPulseCNN/0303_213959/model_best.pth"
-  # injury 模型相对路径
+  # InjuryPredict 最优权重，相对 InjuryPredict 根目录解析。
   checkpoint_rel_path: "runs/InjuryPredictModel_03032051/best_val_loss.pth"
 
-# ===========================
-# 3. 策略网络(Strategy Net)训练 - 摊销优化超参
-# ===========================
 strategy_net:
-  hidden_dims: [128, 256, 256] # MLP 隐藏层架构
-  activation: "LeakyReLU"
-  dropout: 0
-  pulse_channels: 2      # 波形输入通道（当前为 XY 两通道）
-  pulse_embed_dim: 64    # 波形编码后的嵌入维度
-  
+  # 波形编码器输入通道数。当前代理链路输出为二维碰撞加速度波形。
+  pulse_channels: 2
+  # TCN 主干的逐层通道配置。
+  tcn_channels_list: [64, 128, 256]
+  tcn_output_dim: 128
+  tcn_kernel_init: 8
+  tcn_kernel_mid: 3
+
+  # context 编码器与融合后解码器的 MLP 规模。
+  mlp_encoder_hidden: 192
+  mlp_encoder_layers: 3
+  mlp_encoder_output_dim: 128
+  mlp_decoder_hidden: 160
+  mlp_decoder_layers: 3
+  mlp_decoder_output_dim: 96
+  dropout_mlp: 0.1
+  dropout_tcn: 0.0
+
   train:
+    # 自监督训练采用无限数据流，因此不使用 epoch，而用最大迭代步数停止。
     batch_size: 1024
-    max_iterations: 20000  # 放弃 Epoch 概念，使用最大迭代步数控制无标签自监督数据流
-    lr: 2e-4
-    weight_decay: 1e-4
+    max_iterations: 20000
+    lr: 2.0e-4
+    weight_decay: 1.0e-4
     log_interval: 10
     save_best: true
     save_last: true
+
     scheduler:
-      type: "cosine"      # none | cosine | step
-      T_max: 20000
+      # 只调训练阶段的策略网络权重学习率。
+      # 可选: none | cosine | step
+      type: "cosine"
+      # 当 type=cosine 时，T_max 可写整数，也可写 "max_iters"。
+      T_max: "max_iters" # "max_iters" 表示与本段 max_iterations 保持一致，避免手动重复维护两份迭代上限。
       eta_min: 1.0e-5
-    val_interval: 500       # 每隔多少 iterations 评估一次完整验证集
-    val_batch_size: 1024    # 验证阶段批大小（不影响训练batch）
-    gradient_clip_max_norm: 1.0 # 梯度裁剪阈值
-    jitter_ratio: 0.01      # 经验池连续参数扰动幅度（占参数范围比例）
-    jitter_prob: 1.0        # 每个连续参数施加扰动的概率
-    tensorboard: true       # 若工作目录不允许写入 events 文件，可临时关闭
+      # 当 type=step 时，按 schedule_step_size 步长衰减 lr，gamma 是衰减率。
+      step_size: 400
+      gamma: 0.5
+
+    val_interval: 500 # 每隔多少个 iteration 在 injury_val 固定切片上做一次完整验证。
+    val_batch_size: 1024 # 验证阶段批大小，不影响实际评估语义。
+    gradient_clip_max_norm: 2.0 # 梯度裁剪最大范数，抑制训练初期不稳定的梯度爆炸。
+
+    # 训练流来自 injury_train 经验池 + 合法扰动。
+    # 扰动后的样本若破坏 base 范围或耦合约束，会整行回退原样本。
+    jitter_ratio: 0.01
+    jitter_prob: 1.0
+
+    # TensorBoard 文件会单独写到本次训练目录下的 tensorboard/ 子目录。
+    tensorboard: true
+
     ema:
-      enabled: true          # 是否启用 EMA 作为 train_best 的判据
-      alpha: 0.98            # EMA 平滑系数，越大越平滑
-      warmup_iters: 500     # EMA 选优预热步数，预热前不更新 train_best
+      # train_best 权重按 EMA 平滑后的 train_loss 选取；
+      # val_best 则始终按固定验证集上的 val_loss 选取。
+      enabled: true
+      alpha: 0.98
+      warmup_iters: 500
       log_to_tensorboard: true
 
-# ===========================
-# 4. 在线寻优(Online Optimization) - 策略网络直推和局部精调超参
-# ===========================
 optimization:
-  # 是否直推
-  direct_inference: True  # 为True且有效策略权重指定后再开启 Opt1
-  refine_steps: 2000   # 局部精调迭代次数 k。若为 0，则不生成 Opt2 (仅输出直推结果Opt1)
-  lr: 0.005        # 局部精调阶段在物理参数空间中的 Adam 步长
-  
-  # 综合目标函数(Loss)各部位风险权重
+  # true: 先做策略直推生成 Opt1，再从 Opt1 或 default 出发做局部精调；
+  # false: 不加载策略权重，局部精调直接从 default 起步。
+  direct_inference: true
+
+  # 局部精调步数。=0 时不生成 Opt2。
+  refine_steps: 2000
+  # Adam 在无量纲潜空间 z 上的初始学习率。
+  lr: 0.005
+
+  scheduler:
+    # 局部精调全程都使用这里定义的学习率调度器，避免后期震荡。
+    # 可选: none | cosine | step
+    type: "cosine"
+    # 当 type=cosine 时，T_max 可写整数，也可写 "max_iters"。
+    # 这里的 "max_iters" 专指局部精调总步数 refine_steps。
+    T_max: "max_iters"
+    eta_min: 0.0
+    # 当 type=step 时，按 schedule_step_size 步长衰减 lr，gamma 是衰减率。
+    step_size: 400
+    gamma: 0.5
+
   objectives:
     weight_hic: 2.0
     weight_dmax: 1.0
     weight_nij: 1.0
-    weight_penalty: 10.0   # 物理约束惩罚项系数
+    # 物理约束软惩罚权重，作用于投影前的原始游离解。
+    weight_penalty: 10.0
 
-  # 训练分布偏离惩罚项（用于抑制策略输出落入经验池稀疏区域）
   distribution_penalty:
-    enabled: False
+    # 合法域内的分布偏离惩罚，抑制解落入训练经验池未覆盖的空洞区域。
+    enabled: false
     method: "mahalanobis"      # mahalanobis | knn
-    weight: 0.01               # 默认小权重，避免策略过于保守
+    weight: 0.01
     feature_space: "context_control"  # context | context_control
-    k: 8                       # knn 模式的近邻数量
-    eps: 1.0e-6                # 数值稳定项
-    clip_max: 10.0             # 单样本惩罚上限，避免极端值主导训练
-    max_ref_samples: 20000     # 构建参考分布时使用的最大样本数，0表示不截断
+    k: 8
+    eps: 1.0e-6
+    clip_max: 10.0
+    # <=0 表示使用完整 injury_train 参考池；>0 时按 seed 做一次性随机子采样。
+    max_ref_samples: 20000
     normalize_by_train_stats: true
 
-# ===========================
-# 5. 评估(Evaluation)
-# ===========================
 evaluation:
-  eval_batch_size: 1024   # 评估时分批推理的批大小，用于降低显存峰值
-  strategy_checkpoint: "E:/WPS Office/1628575652/WPS企业云盘/清华大学/我的企业文档/课题组相关/理想项目/LX_project/ARS_optim/saved_models/strategy_net_0319_082917/val_best_model.pth"  # 可选：仅在需要策略直推时显式指定兼容当前参数空间的权重; 不需要时保持 null
+  # 评估阶段批大小，只影响分批推理开销，不改变逐 case 优化语义。
+  eval_batch_size: 1024
+  # 建议在每次切换评估权重时显式填写当前策略权重，或在运行 run_eval 时用 --strategy_ckpt 指定。
+  strategy_checkpoint: null # 仅在 direct_inference=true 时使用。

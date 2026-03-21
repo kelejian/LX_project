@@ -3,6 +3,8 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 
+from InjuryPredict.utils.models import BaseMLP, DiscreteFeatureEmbedding, FeatureSELayer, TemporalBlock
+
 from ARS_optim.src.constraints import ConstraintEngine
 from ARS_optim.src.param_manager import ParamManager
 from common.data_utils.processor import UnifiedDataProcessor
@@ -14,30 +16,93 @@ def build_strategy_net_from_config(
     data_processor: UnifiedDataProcessor,
     config: dict,
 ) -> "StrategyNet":
-    """根据配置构造策略网络。
-
-    训练与评估必须读取同一份策略网络超参数，否则同名权重可能在两端对应到不同结构。
-    这里保留一个很薄的构造函数，只负责把 config 中的结构参数解包出来，避免入口脚本各自重复拼装。
-    """
-    strat_cfg = config.get("strategy_net", {})
+    """根据配置构造策略网络。"""
+    strat_cfg = config.get("strategy_net", {}) or {}
     return StrategyNet(
         param_manager=param_manager,
         constraint_engine=constraint_engine,
         data_processor=data_processor,
-        hidden_dims=strat_cfg.get("hidden_dims", [128, 256, 128]),
-        activation=strat_cfg.get("activation", "LeakyReLU"),
-        dropout=float(strat_cfg.get("dropout", 0.1)),
         pulse_channels=int(strat_cfg.get("pulse_channels", 2)),
-        pulse_embed_dim=int(strat_cfg.get("pulse_embed_dim", 32)),
+        tcn_channels_list=[int(value) for value in strat_cfg.get("tcn_channels_list", [64, 128, 256])],
+        tcn_output_dim=int(strat_cfg.get("tcn_output_dim", 128)),
+        tcn_kernel_init=int(strat_cfg.get("tcn_kernel_init", 8)),
+        tcn_kernel_mid=int(strat_cfg.get("tcn_kernel_mid", 3)),
+        mlp_encoder_hidden=int(strat_cfg.get("mlp_encoder_hidden", 192)),
+        mlp_encoder_layers=int(strat_cfg.get("mlp_encoder_layers", 3)),
+        mlp_encoder_output_dim=int(strat_cfg.get("mlp_encoder_output_dim", 128)),
+        mlp_decoder_hidden=int(strat_cfg.get("mlp_decoder_hidden", 160)),
+        mlp_decoder_layers=int(strat_cfg.get("mlp_decoder_layers", 3)),
+        mlp_decoder_output_dim=int(strat_cfg.get("mlp_decoder_output_dim", 96)),
+        dropout_mlp=float(strat_cfg.get("dropout_mlp", 0.1)),
+        dropout_tcn=float(strat_cfg.get("dropout_tcn", 0.0)),
     )
+
+
+class PulseTCNEncoder(nn.Module):
+    """轻量 TCN 波形编码器。
+
+    这里复用 InjuryPredict 中的 `TemporalBlock` 残差块，但不再引入 ChannelAttention。
+    策略网络只需要稳定提取 pulse 的阶段性模式作为决策增强特征，
+    没必要把 InjuryPredict 的多任务输出与注意力分支整套搬进来。
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        channels_list: List[int],
+        output_dim: int,
+        kernel_size_init: int,
+        kernel_size_mid: int,
+        dropout: float,
+    ):
+        super().__init__()
+        if not channels_list:
+            raise ValueError("tcn_channels_list 不能为空")
+        if kernel_size_init < 2 or kernel_size_mid < 1:
+            raise ValueError("TCN 卷积核大小必须为正整数")
+
+        padding_init = max(0, (kernel_size_init - 2) // 2)
+        self.initial_conv = nn.Sequential(
+            nn.Conv1d(in_channels, channels_list[0], kernel_size=kernel_size_init, stride=2, padding=padding_init, bias=False),
+            nn.BatchNorm1d(channels_list[0]),
+            nn.SiLU(inplace=True),
+        )
+
+        blocks = []
+        in_dim = channels_list[0]
+        for out_dim in channels_list[1:]:
+            blocks.append(
+                TemporalBlock(
+                    in_channels=in_dim,
+                    out_channels=out_dim,
+                    kernel_size=kernel_size_mid,
+                    dropout=dropout,
+                )
+            )
+            in_dim = out_dim
+        self.temporal_blocks = nn.Sequential(*blocks)
+        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.output_proj = nn.Linear(in_dim, output_dim)
+
+    def forward(self, pulse_features: torch.Tensor) -> torch.Tensor:
+        x = self.initial_conv(pulse_features)
+        x = self.temporal_blocks(x)
+        x = self.global_avg_pool(x).squeeze(-1)
+        return self.output_proj(x)
 
 
 class StrategyNet(nn.Module):
     """策略网络：context + pulse -> trainable controls。
 
-    这个模块只负责学习“给定工况时应该往哪个控制量方向调”。
-    约束处理仍交给 ConstraintEngine，原因是同一套合法化规则还要被训练采样、
-    评估 CSV、局部精调共同复用；若把规则散落到网络内部，训练端和评估端很容易逐渐偏离。
+    结构借鉴 InjuryPredictModel：
+    - TCN 波形编码器负责提取碰撞 pulse 的时序表征；
+    - MLP 编码器负责处理 context 中的连续量与离散嵌入；
+    - 融合层把 [pulse 编码, context 编码, 原始标量特征] 拼接后再做规范化与重标定；
+    - MLP 解码器输出共享决策表示；
+    - 最终输出头只保留一个共享 Linear，把表示映射到所有 trainable 控制参数的 logits。
+
+    约束投影仍由 ConstraintEngine 统一执行，避免策略网络、局部精调和评估 CSV
+    各自复制一套物理规则。
     """
 
     def __init__(
@@ -45,115 +110,155 @@ class StrategyNet(nn.Module):
         param_manager: ParamManager,
         constraint_engine: ConstraintEngine,
         data_processor: UnifiedDataProcessor,
-        hidden_dims: List[int] = None,
-        activation: str = "LeakyReLU",
-        dropout: float = 0.1,
         pulse_channels: int = 2,
-        pulse_embed_dim: int = 32,
+        tcn_channels_list: List[int] = None,
+        tcn_output_dim: int = 128,
+        tcn_kernel_init: int = 8,
+        tcn_kernel_mid: int = 3,
+        mlp_encoder_hidden: int = 192,
+        mlp_encoder_layers: int = 3,
+        mlp_encoder_output_dim: int = 128,
+        mlp_decoder_hidden: int = 160,
+        mlp_decoder_layers: int = 3,
+        mlp_decoder_output_dim: int = 96,
+        dropout_mlp: float = 0.1,
+        dropout_tcn: float = 0.0,
     ):
         super().__init__()
         self.param_manager = param_manager
         self.constraint_engine = constraint_engine
         self.data_processor = data_processor
-        self.context_dim = self.param_manager.get_context_dim()
-        self.output_dim = self.param_manager.get_trainable_dim()
+
         self.context_names = self.param_manager.get_context_names()
         self.trainable_params = self.param_manager.get_trainable_params()
-        self.pulse_embed_dim = int(pulse_embed_dim)
-
-        if hidden_dims is None:
-            hidden_dims = [128, 256, 256]
+        self.context_dim = self.param_manager.get_context_dim()
+        self.output_dim = self.param_manager.get_trainable_dim()
         if self.output_dim == 0:
             raise ValueError("当前 param_space.yaml 中没有 trainable=True 的控制参数")
 
-        act_layer = getattr(nn, activation) if hasattr(nn, activation) else nn.ReLU
-        self.pulse_encoder = nn.Sequential(
-            nn.Conv1d(pulse_channels, self.pulse_embed_dim // 2, kernel_size=5, stride=1, padding=0, bias=False),
-            nn.BatchNorm1d(self.pulse_embed_dim // 2),
-            act_layer(inplace=True),
-            nn.Conv1d(self.pulse_embed_dim // 2, self.pulse_embed_dim, kernel_size=3, stride=1, padding=0, bias=False),
-            nn.BatchNorm1d(self.pulse_embed_dim),
-            act_layer(inplace=True),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
+        discrete_num_classes = self.data_processor.get_discrete_num_classes()
+        required_discrete = ["is_driver_side", "OT"]
+        for name in required_discrete:
+            if name not in self.context_names:
+                raise ValueError(f"策略网络的 context 输入中必须包含离散特征 {name}")
+            if name not in discrete_num_classes:
+                raise ValueError(f"normalization_config 中缺少离散特征 {name} 的类别配置")
+
+        self.continuous_context_names = [name for name in self.context_names if name not in required_discrete]
+        self.discrete_context_names = required_discrete
+        self.continuous_context_indices = [self.context_names.index(name) for name in self.continuous_context_names]
+        self.discrete_context_indices = [self.context_names.index(name) for name in self.discrete_context_names]
+
+        discrete_classes = [int(discrete_num_classes[name]) for name in self.discrete_context_names]
+        self.discrete_embedding = DiscreteFeatureEmbedding(discrete_classes)
+        self.discrete_embedding_dim = int(self.discrete_embedding.output_dim)
+        self.scalar_feature_dim = len(self.continuous_context_names) + self.discrete_embedding_dim
+
+        if tcn_channels_list is None:
+            tcn_channels_list = [64, 128, 256]
+        self.pulse_encoder = PulseTCNEncoder(
+            in_channels=pulse_channels,
+            channels_list=tcn_channels_list,
+            output_dim=tcn_output_dim,
+            kernel_size_init=tcn_kernel_init,
+            kernel_size_mid=tcn_kernel_mid,
+            dropout=dropout_tcn,
         )
 
-        layers = []
-        in_features = self.context_dim + self.pulse_embed_dim
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(in_features, hidden_dim, bias=False))
-            layers.append(nn.BatchNorm1d(hidden_dim))
-            if act_layer is nn.PReLU:
-                layers.append(act_layer())
-            else:
-                layers.append(act_layer(inplace=True))
-            if dropout > 0:
-                layers.append(nn.Dropout(float(dropout)))
-            in_features = hidden_dim
-        layers.append(nn.Linear(in_features, self.output_dim)) # 输出层不带激活函数，由后续的 sigmoid 和边界映射处理约束
-        self.mlp = nn.Sequential(*layers)
+        self.context_encoder = BaseMLP(
+            in_features=self.scalar_feature_dim,
+            hidden_features=mlp_encoder_hidden,
+            out_features=mlp_encoder_output_dim,
+            num_layers=mlp_encoder_layers,
+            dropout=dropout_mlp,
+        )
+
+        fusion_dim = tcn_output_dim + mlp_encoder_output_dim + self.scalar_feature_dim
+        self.fusion_norm = nn.LayerNorm(fusion_dim)
+        self.fusion_se = FeatureSELayer(fusion_dim, reduction=8)
+        self.decoder = BaseMLP(
+            in_features=fusion_dim,
+            hidden_features=mlp_decoder_hidden,
+            out_features=mlp_decoder_output_dim,
+            num_layers=mlp_decoder_layers,
+            dropout=dropout_mlp,
+        )
+        self.post_decoder_block = nn.Sequential(
+            nn.BatchNorm1d(mlp_decoder_output_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.output_head = nn.Linear(mlp_decoder_output_dim, self.output_dim)
 
         min_bounds, max_bounds = self.param_manager.get_trainable_opt_bounds()
         self.register_buffer("min_bounds", min_bounds)
         self.register_buffer("max_bounds", max_bounds)
         defaults = self.param_manager.get_default_values(self.trainable_params)
         self.register_buffer("default_actions", torch.tensor(defaults, dtype=torch.float32))
+
+        self.arch_info = {
+            "context_dim": self.context_dim,
+            "continuous_context_names": list(self.continuous_context_names),
+            "discrete_context_names": list(self.discrete_context_names),
+            "scalar_feature_dim": self.scalar_feature_dim,
+            "pulse_channels": int(pulse_channels),
+            "tcn_channels_list": [int(value) for value in tcn_channels_list],
+            "tcn_output_dim": int(tcn_output_dim),
+            "mlp_encoder_output_dim": int(mlp_encoder_output_dim),
+            "mlp_decoder_output_dim": int(mlp_decoder_output_dim),
+            "output_dim": self.output_dim,
+        }
+
         self._initialize_weights()
 
     def _initialize_weights(self) -> None:
         for module in self.modules():
             if isinstance(module, (nn.Conv1d, nn.Linear)):
                 nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-                if getattr(module, "bias", None) is not None:
+                if module.bias is not None:
                     nn.init.constant_(module.bias, 0.0)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-        out_layer = self.mlp[-1]
-        if not isinstance(out_layer, nn.Linear) or out_layer.bias is None:
-            raise ValueError("策略网络最后一层必须是带 bias 的 Linear")
         with torch.no_grad():
-            nn.init.constant_(out_layer.weight, 0.0)
-            # 令 sigmoid(bias) 恰好等于默认值在线性边界盒中的归一化位置：
-            # ratio = (default - min) / (max - min), bias = log(ratio / (1 - ratio))。
-            # 这样在最后一层权重清零时，网络未训练前就会稳定输出 default 动作。
+            self.output_head.weight.zero_()
+            # 输出头权重清零后，网络对任意输入都会退化为一个固定 bias。
+            # 这里把 bias 设为 default 动作在 [opt_min, opt_max] 内的 logit，
+            # 从而保证训练开始前任何合法输入都会输出 param_space.yaml 中的 default。
             ratio = (self.default_actions - self.min_bounds) / torch.clamp(self.max_bounds - self.min_bounds, min=1e-12)
-            ratio = torch.clamp(ratio, min=1e-6, max=1.0 - 1e-6) # 避免 ratio 极端值导致 bias 无穷大
-            out_layer.bias.copy_(torch.log(ratio / (1.0 - ratio)))
+            ratio = torch.clamp(ratio, min=1e-6, max=1.0 - 1e-6)
+            self.output_head.bias.copy_(torch.log(ratio / (1.0 - ratio)))
 
-    def _normalize_context(self, context_features: torch.Tensor) -> torch.Tensor:
-        # context_features 的列顺序来自 ParamManager，而不是 data_processor 内部的固定顺序。
-        # 这里按名称归一化，目的是把“特征顺序由谁定义”收敛到 ParamManager 一处，
-        # 避免后续参数角色调整时因为列顺序假设失效而产生隐蔽错误。
-        # 其中 is_driver_side / OT 会被 process_by_name 映射为整数类别编码，并直接作为标量输入 MLP。
-        # 这与 InjuryPredictModel 为离散变量单独做 Embedding 的设计不同：策略网络这里只需要一个轻量决策器，
-        # 而 OT 本身又带有明确的序数语义（5th < 50th < 95th），因此标量编码已经足够让 MLP 学到体型趋势。
-        return self.data_processor.process_by_name(context_features, self.context_names, inverse=False)
+    def _prepare_scalar_context_features(self, context_features: torch.Tensor) -> torch.Tensor:
+        parts = []
+        if self.continuous_context_indices:
+            continuous_raw = context_features[:, self.continuous_context_indices]
+            continuous_norm = self.data_processor.process_by_name(
+                continuous_raw,
+                self.continuous_context_names,
+                inverse=False,
+            )
+            parts.append(continuous_norm.to(dtype=context_features.dtype))
+
+        discrete_raw = context_features[:, self.discrete_context_indices]
+        discrete_encoded = self.data_processor.process_by_name(
+            discrete_raw,
+            self.discrete_context_names,
+            inverse=False,
+        ).to(dtype=torch.long)
+        discrete_embed = self.discrete_embedding(discrete_encoded).to(dtype=context_features.dtype)
+        parts.append(discrete_embed)
+
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
 
     def _decode_actions_from_logits(
         self,
         raw_output: torch.Tensor,
         context_features: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """将网络输出的无界 logits 还原为物理参数，并返回训练所需的两类结果。
-
-        这里把“网络回归”和“动作约束”拆成两个连续步骤：
-        1. 先用 sigmoid 和 opt 边界盒把输出限制在 trainable 参数的寻优子范围内；
-        2. 再把动作拼回完整特征张量，由约束引擎统一做连续耦合投影。
-
-        这样做的目的不是增加层次，而是避免让网络直接学习一整套硬规则；
-        策略网络只负责学习从状态到动作的映射，参数合法化仍然由统一的约束层定义。
-
-        返回值分成两部分：
-        - projected_actions：投影后的可行动作，送入代理模型计算损伤；
-        - raw_full_features：Sigmoid 后、DAG 投影前的完整物理特征，专门给训练阶段
-          的软惩罚使用，确保当前向投影截断掉违约量时，惩罚项仍能从原始违约方向提供梯度补偿。
-        """
+        """把网络输出的 logits 映射回物理动作，并做前向投影。"""
         norm_actions = torch.sigmoid(raw_output)
-        span = torch.where(
-            self.max_bounds > self.min_bounds,
-            self.max_bounds - self.min_bounds,
-            torch.ones_like(self.max_bounds),
-        )
-        actions = norm_actions * span.unsqueeze(0) + self.min_bounds.unsqueeze(0)
+        spans = torch.clamp(self.max_bounds - self.min_bounds, min=1e-12)
+        actions = norm_actions * spans.unsqueeze(0) + self.min_bounds.unsqueeze(0)
         raw_full_features = self.constraint_engine.compose_full_features(context_features, actions)
         projected_full = self.constraint_engine.project_forward(raw_full_features, strict=False)
         _, projected_actions = self.constraint_engine.split_from_full(projected_full)
@@ -164,12 +269,13 @@ class StrategyNet(nn.Module):
         context_features: torch.Tensor,
         pulse_features: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # pulse 只作为工况补充信息编码进策略，不在这里重复生成，
-        # 这样训练、验证和评估都可以复用同一份 pulse，避免同批样本重复跑代理前端。
-        # 评估阶段的 LocalRefiner 也遵守同一约定：pulse 必须由外层显式传入，
-        # 不再在策略网或优化器内部各自补跑一次 surrogate.generate_pulse。
-        pulse_embed = self.pulse_encoder(pulse_features)
-        context_norm = self._normalize_context(context_features)
-        combined = torch.cat([context_norm, pulse_embed], dim=1)
-        raw_output = self.mlp(combined)
+        pulse_encoded = self.pulse_encoder(pulse_features)
+        scalar_context = self._prepare_scalar_context_features(context_features)
+        context_encoded = self.context_encoder(scalar_context)
+        fusion_vec = torch.cat([pulse_encoded, context_encoded, scalar_context], dim=1)
+        fusion_vec = self.fusion_norm(fusion_vec)
+        fusion_vec = self.fusion_se(fusion_vec)
+        decoded = self.decoder(fusion_vec)
+        decoded = self.post_decoder_block(decoded)
+        raw_output = self.output_head(decoded)
         return self._decode_actions_from_logits(raw_output, context_features)

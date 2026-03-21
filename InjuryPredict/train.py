@@ -238,6 +238,7 @@ if __name__ == "__main__":
         'GLOBAL_SEED': GLOBAL_SEED,
         "Trainset_size": len(train_dataset),
         "Valset_size": len(val_dataset),
+        "INJURY_PROCESSED_DIR": str(INJURY_PROCESSED_DIR),
         "model_params_count": {
             "total_params": total_params,
             "trainable_params": trainable_params

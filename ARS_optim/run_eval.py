@@ -1,4 +1,4 @@
-import os
+﻿import os
 os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = 'T'
 import warnings
 warnings.filterwarnings('ignore')
@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 import yaml
+from tqdm import tqdm
 
 from common.data_utils.split_io import load_int_vector_csv
 from common.data_utils.processor import UnifiedDataProcessor
@@ -93,9 +94,11 @@ def _resolve_strategy_ckpt(args, base_dir: Path, config: Dict) -> Optional[Path]
 
 
 def _copy_config_snapshots(cfg_path: Path, param_space_path: Path, output_dir: Path) -> Dict[str, str]:
-    cfg_snapshot = output_dir / "config_used.yaml"
-    param_snapshot = output_dir / "param_space.yaml"
-    norm_snapshot = output_dir / "normalization_config.json"
+    config_dir = output_dir / "configs"
+    config_dir.mkdir(parents=True, exist_ok=False)
+    cfg_snapshot = config_dir / "config_used.yaml"
+    param_snapshot = config_dir / "param_space.yaml"
+    norm_snapshot = config_dir / "normalization_config.json"
     shutil.copy2(str(cfg_path), str(cfg_snapshot))
     shutil.copy2(str(param_space_path), str(param_snapshot))
     shutil.copy2(str(NORMALIZATION_CONFIG_PATH), str(norm_snapshot))
@@ -106,14 +109,55 @@ def _copy_config_snapshots(cfg_path: Path, param_space_path: Path, output_dir: P
     }
 
 
-def _write_yaml(path: Path, content: Dict) -> None:
-    with open(path, "w", encoding="utf-8") as file:
-        yaml.safe_dump(content, file, allow_unicode=True, sort_keys=False)
+def _build_stage_summary_metrics(result_df: pd.DataFrame, available_opt_stages: List[str]) -> Dict[str, object]:
+    def safe_nanmean(series: pd.Series) -> float:
+        values = np.asarray(series, dtype=np.float32)
+        return float(np.nan) if np.isnan(values).all() else float(np.nanmean(values))
+
+    metrics = {
+        "stage_mean": {},
+        "reduction_vs_base": {},
+    }
+    stage_names = ["Base"] + available_opt_stages
+    for stage_name in stage_names:
+        metrics["stage_mean"][stage_name] = {
+            metric_name: safe_nanmean(result_df[f"{stage_name}_{metric_name}"])
+            for metric_name in RESULT_METRIC_NAMES
+        }
+    for stage_name in available_opt_stages:
+        metrics["reduction_vs_base"][stage_name] = {
+            metric_name: safe_nanmean(result_df[f"Reduction_{stage_name}_{metric_name}"])
+            for metric_name in RESULT_METRIC_NAMES
+        }
+    return metrics
 
 
-def _safe_nanmean(series: pd.Series) -> float:
-    values = np.asarray(series, dtype=np.float32)
-    return float(np.nan) if np.isnan(values).all() else float(np.nanmean(values))
+def _build_top_cases_summary(
+    result_df: pd.DataFrame,
+    optimized_stage_name: Optional[str],
+    top_n: int = 5,
+) -> List[Dict[str, object]]:
+    if optimized_stage_name is None:
+        return []
+    joint_col = f"Reduction_{optimized_stage_name}_JointRisk"
+    mais_col = f"Reduction_{optimized_stage_name}_MAIS"
+    if joint_col not in result_df.columns or mais_col not in result_df.columns:
+        return []
+    top_df = (
+        result_df.loc[result_df[joint_col].notna(), ["case_id", joint_col, mais_col]]
+        .sort_values(by=joint_col, ascending=False)
+        .head(top_n)
+    )
+    output = []
+    for _, row in top_df.iterrows():
+        output.append(
+            {
+                "case_id": row["case_id"],
+                "reduction_joint_risk": float(row[joint_col]),
+                "reduction_mais": float(row[mais_col]),
+            }
+        )
+    return output
 
 
 def _build_param_dataframe(
@@ -344,6 +388,8 @@ def _load_eval_input(args, logger) -> tuple[pd.DataFrame, Dict[str, np.ndarray],
         raise FileNotFoundError("自动测试集模式需要 raw_data_packed.npz 和 injury_test_indices.csv")
 
     test_indices = load_int_vector_csv(test_idx_path)
+    if test_indices.size == 0:
+        raise ValueError("自动测试集模式对应的 injury_test_indices.csv 为空；请提供 --input_csv 或重新生成划分。")
     with np.load(str(pool_path), allow_pickle=True) as data:
         x_att_raw = data["x_att_raw"][test_indices]
         df_input = pd.DataFrame(x_att_raw, columns=FEATURE_ORDER)
@@ -394,7 +440,8 @@ def _compute_predictions_batch(
     def cat_or_nan(parts: List[torch.Tensor]) -> torch.Tensor:
         return torch.cat(parts, dim=0) if parts else torch.full((sample_count,), float("nan"), device=device)
 
-    for start in range(0, sample_count, eval_batch_size):
+    batch_starts = range(0, sample_count, eval_batch_size)
+    for start in tqdm(batch_starts, total=(sample_count + eval_batch_size - 1) // eval_batch_size, desc="Evaluating Cases"):
         end = min(start + eval_batch_size, sample_count)
         context_batch = context_tensor[start:end]
         baseline_batch = baseline_trainable[start:end]
@@ -617,8 +664,7 @@ def _build_result_dataframe(
     stage_outputs: Dict[str, object],
     truth_arrays: Dict[str, np.ndarray],
     trainable_names: List[str],
-    optimized_stage_name: Optional[str],
-) -> tuple[pd.DataFrame, Dict[str, float]]:
+) -> tuple[pd.DataFrame, Dict[str, object]]:
     """组装最终导出 CSV 和宏观汇总指标。
 
     对外结果表只保留：
@@ -680,38 +726,14 @@ def _build_result_dataframe(
         # True_vs_ 放在所有 Reduction_ 列之后，便于先看各阶段本体，再看降幅，再看与真值的偏差。
         result_df = pd.concat([result_df, truth_vs_df.reset_index(drop=True)], axis=1)
 
-    reported_stage_prefix = optimized_stage_name if optimized_stage_name is not None else None
-    summary = {
-        "optimized_stage_source": optimized_stage_name,
-        "mean_base_joint_risk": _safe_nanmean(result_df["Base_JointRisk"]),
-        "mean_base_mais": _safe_nanmean(result_df["Base_MAIS"]),
-        "mean_opt_joint_risk": float(np.nan) if reported_stage_prefix is None else _safe_nanmean(result_df[f"{reported_stage_prefix}_JointRisk"]),
-        "mean_opt_mais": float(np.nan) if reported_stage_prefix is None else _safe_nanmean(result_df[f"{reported_stage_prefix}_MAIS"]),
-        "n_samples": int(len(result_df)),
-    }
-    reduction_summary_keys = {
-        "HIC": "mean_reduction_HIC",
-        "Dmax": "mean_reduction_Dmax",
-        "Nij": "mean_reduction_Nij",
-        "Phead": "mean_reduction_Phead",
-        "Pchest": "mean_reduction_Pchest",
-        "Pneck": "mean_reduction_Pneck",
-        "JointRisk": "mean_reduction_joint_risk",
-        "AIS_head": "mean_reduction_AIS_head",
-        "AIS_chest": "mean_reduction_AIS_chest",
-        "AIS_neck": "mean_reduction_AIS_neck",
-        "MAIS": "mean_reduction_MAIS",
-    }
-    for metric_name in RESULT_METRIC_NAMES:
-        if reported_stage_prefix is None:
-            summary[reduction_summary_keys[metric_name]] = float(np.nan)
-        else:
-            summary[reduction_summary_keys[metric_name]] = _safe_nanmean(result_df[f"Reduction_{reported_stage_prefix}_{metric_name}"])
-    return result_df, summary
+    summary_metrics = _build_stage_summary_metrics(
+        result_df=result_df,
+        available_opt_stages=available_opt_stages,
+    )
+    return result_df, summary_metrics
 
 
-def _build_eval_info(
-    args,
+def _build_evaluation_record(
     output_dir: Path,
     output_csv_path: Path,
     config_snapshots: Dict[str, str],
@@ -730,7 +752,8 @@ def _build_eval_info(
     optimized_stage_name: Optional[str],
     surrogate: SurrogateAdapter,
     dist_ref_info: Optional[Dict[str, object]],
-    summary_metrics: Dict[str, float],
+    summary_metrics: Dict[str, object],
+    top_cases: List[Dict[str, object]],
     stage_outputs: Dict[str, object],
     evaluated_case_count: int,
 ) -> Dict[str, object]:
@@ -751,18 +774,11 @@ def _build_eval_info(
         },
         "missing_context_columns": missing_context,
         "missing_trainable_columns_triggering_default_baseline": missing_trainable,
+        "evaluated_case_count": evaluated_case_count,
         "skipped_case_rows": skipped_case_rows,
         "skipped_cases_count": len(skipped_case_rows),
         "reverted_baseline_rows": reverted_baseline_rows,
-        "input_validation_policy": {
-            "input_csv": "context:context_only_rowwise_skip; baseline_trainable:all_columns_present_and_full_physical_domain_else_rowwise_default" if args.input_csv else None,
-            "test_split": "missing_value_check_only; baseline_uses_raw_test_controls_without_optimization_range_filter" if not args.input_csv else None,
-        },
-        "stage_definition": {
-            "Base": "baseline control；input_csv 只有在整组 trainable control 列齐全且整组合法时才采用用户值，否则整行回退 default；test_split 直接使用测试集原始控制参数",
-            "Opt1": "策略网络直推结果；仅在 direct_inference=True 且显式提供兼容权重时存在",
-            "Opt2": "局部精调结果；仅在 refine_steps>0 时存在。内部使用按 yaml 量程归一化后的潜空间 Adam，并以逐 case 独立梯度的并行向量化方式更新，再映射回物理尺度进入投影与代理评估链路",
-        },
+        "reverted_baseline_count": len(reverted_baseline_rows),
         "stage_status": {
             "base_generated": True,
             "opt1_generated": opt1_generated,
@@ -775,10 +791,7 @@ def _build_eval_info(
             "reference_sampling": dist_ref_info,
         },
         "summary_metrics": summary_metrics,
-        "formulas": {
-            "joint_risk": "L_risk = 1 - Π_k (1 - P_k)",
-            "reported_reduction": "mean(Base - ReportedOpt)",
-        },
+        "top_cases_by_reported_joint_risk_reduction": top_cases,
         "runtime": {
             "total_time_cost_sec": float(stage_outputs["total_time_cost"]),
             "avg_time_cost_sec": float(stage_outputs["total_time_cost"] / max(1, evaluated_case_count)),
@@ -818,18 +831,19 @@ def main():
         data_processor=data_processor,
     ).to(device)
 
-    ref_sampler = StateDataSampler(
-        param_manager=param_manager,
-        constraint_engine=constraint_engine,
-        batch_size=1024,
-        device=device,
-        seed=seed,
-        split_indices_path=str(SPLIT_INDICES_DIR / "injury_train_indices.csv"),
-        jitter_ratio=0.0,
-        jitter_prob=0.0,
-    )
     dist_ref_info = None
     if surrogate.distribution_penalty.enabled:
+        logger.info("Distribution Penalty 已启用：正在读取 injury_train split，用于拟合评估阶段的训练流形参考分布。")
+        ref_sampler = StateDataSampler(
+            param_manager=param_manager,
+            constraint_engine=constraint_engine,
+            batch_size=1024,
+            device=device,
+            seed=seed,
+            split_indices_path=str(SPLIT_INDICES_DIR / "injury_train_indices.csv"),
+            jitter_ratio=0.0,
+            jitter_prob=0.0,
+        )
         max_ref_samples = int(config.get("optimization", {}).get("distribution_penalty", {}).get("max_ref_samples", 0))
         # 评估端必须与训练端复用同一条参考集抽样语义：
         # 未截断时取完整训练池，截断时用固定 seed 的一次性随机子样本。
@@ -841,6 +855,9 @@ def main():
             sample_seed=seed,
         )
         surrogate.fit_distribution_reference(reference)
+        logger.info("Distribution Penalty 参考分布拟合完成：mode=%s, sample_count=%s, pool_size=%s", dist_ref_info["sampling_mode"], dist_ref_info["sample_count"], dist_ref_info["pool_size"])
+    else:
+        logger.info("Distribution Penalty 未启用：跳过训练流形参考分布加载与拟合。")
 
     strategy_ckpt_path = _resolve_strategy_ckpt(args, base_dir, config)
     strategy_net = None
@@ -867,6 +884,12 @@ def main():
         surrogate=surrogate,
         strategy_net=strategy_net,
     )
+    logger.info(
+        "评估配置: direct_inference=%s, refine_steps=%d, eval_batch_size=%d",
+        optimizer.direct_inference,
+        optimizer.refine_steps,
+        int(config.get("evaluation", {}).get("eval_batch_size", 512)),
+    )
 
     df_input, truth_arrays, input_source = _load_eval_input(args, logger)
 
@@ -884,6 +907,9 @@ def main():
     context_names = param_manager.get_context_names()
     trainable_names = param_manager.get_trainable_names()
     valid_indices = np.flatnonzero(valid_mask)
+    logger.info("评估样本统计: total=%d, valid=%d, skipped=%d, reverted_baseline=%d", len(df_input), int(valid_mask.sum()), len(skipped_case_rows), len(reverted_baseline_rows))
+    if valid_indices.size == 0:
+        raise ValueError("所有 case 都因输入端校验失败被跳过，未生成任何可评估样本。")
     context_tensor = torch.tensor(context_eval_df.loc[valid_indices, context_names].values, dtype=torch.float32, device=device)
     baseline_tensor = torch.tensor(baseline_df.loc[valid_indices, trainable_names].values, dtype=torch.float32, device=device)
 
@@ -905,6 +931,7 @@ def main():
     )
 
     optimized_stage_name = "Opt2" if stage_outputs["Opt2"]["preds"] is not None else ("Opt1" if stage_outputs["Opt1"]["preds"] is not None else None)
+    logger.info("阶段结果: Base=always, Opt1=%s, Opt2=%s, reported_stage=%s", stage_outputs["Opt1"]["preds"] is not None, stage_outputs["Opt2"]["preds"] is not None, optimized_stage_name)
 
     result_df, summary_metrics = _build_result_dataframe(
         df_input=df_input,
@@ -913,21 +940,20 @@ def main():
         stage_outputs=stage_outputs,
         truth_arrays=truth_arrays,
         trainable_names=trainable_names,
-        optimized_stage_name=optimized_stage_name,
     )
     evaluated_case_count = int(valid_mask.sum())
-    summary_metrics["n_evaluated_cases"] = evaluated_case_count
-    summary_metrics["n_skipped_cases"] = int(len(skipped_case_rows))
+    top_cases = _build_top_cases_summary(result_df, optimized_stage_name=optimized_stage_name, top_n=5)
     # 在所有前置校验和模型推理都完成后再创建输出目录，避免早退时留下空目录。
     output_dir = _build_output_dir(base_dir, args.input_csv)
-    output_csv_path = output_dir / Path(args.output_csv).name
+    results_dir = output_dir / "results"
+    results_dir.mkdir(parents=True, exist_ok=False)
+    output_csv_path = results_dir / Path(args.output_csv).name
     config_snapshots = _copy_config_snapshots(cfg_path, param_space_path, output_dir)
     result_df.to_csv(str(output_csv_path), index=False)
     opt1_generated = stage_outputs["Opt1"]["preds"] is not None
     opt2_generated = stage_outputs["Opt2"]["preds"] is not None
 
-    eval_info = _build_eval_info(
-        args=args,
+    evaluation_record = _build_evaluation_record(
         output_dir=output_dir,
         output_csv_path=output_csv_path,
         config_snapshots=config_snapshots,
@@ -947,31 +973,16 @@ def main():
         surrogate=surrogate,
         dist_ref_info=dist_ref_info,
         summary_metrics=summary_metrics,
+        top_cases=top_cases,
         stage_outputs=stage_outputs,
         evaluated_case_count=evaluated_case_count,
     )
-    _write_yaml(output_dir / "eval_info.yaml", eval_info)
-    summary_report = {
-        "timestamp": eval_info["timestamp"],
-        "input_source": eval_info["input_source"],
-        "strategy_checkpoint_path": eval_info["strategy_checkpoint_path"],
-        "config_files": eval_info["config_files"],
-        "evaluation_config": eval_info["evaluation_config"],
-        "optimization_config": eval_info["optimization_config"],
-        "stage_status": eval_info["stage_status"],
-        "case_accounting": {
-            "evaluated_case_count": evaluated_case_count,
-            "skipped_case_rows": skipped_case_rows,
-            "skipped_cases_count": len(skipped_case_rows),
-            "reverted_baseline_rows": reverted_baseline_rows,
-            "reverted_baseline_count": len(reverted_baseline_rows),
-        },
-        "summary_metrics": eval_info["summary_metrics"],
-    }
-    _write_yaml(output_dir / "summary.yaml", summary_report)
+    with open(results_dir / "evaluation_record.yaml", "w", encoding="utf-8") as file:
+        yaml.safe_dump(evaluation_record, file, allow_unicode=True, sort_keys=False)
     logger.info(f"评估完成，结果目录: {output_dir}")
     logger.info(f"结果 CSV: {output_csv_path}")
 
 
 if __name__ == "__main__":
     main()
+

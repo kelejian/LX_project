@@ -1,398 +1,234 @@
-# ARS_optim 使用说明
+# ARS_optim 项目说明
 
-## 1. 简要说明
+## 1. 项目定位
 
-ARS_optim 是 LX_project 中面向自适应乘员约束系统参数寻优的子项目。
+`ARS_optim` 是 `LX_project` 中用于**约束条件下参数寻优**的子项目。  
+它的目标不是重新训练碰撞仿真模型，而是基于已经完成训练的：
 
-它不直接重新训练碰撞波形预测模型和损伤预测模型，而是在二者已经训练完成并具备可用权重的前提下，完成以下两类任务：
+- 碰撞波形预测模型 `PulsePredict`
+- 损伤预测模型 `InjuryPredict`
 
-1. 训练策略网络
-   - 输入为 context 参数，即 state 参数与当前不可调 control 参数
-   - 输出为当前可调 control 参数
-   - 训练方式为自监督的无限数据流训练，不使用 epoch 概念
+在给定工况条件下，为可调控制参数自动给出一组更优建议，并评估优化前后的损伤指标变化情况。
 
-2. 执行完整寻优评估
-   - baseline 评估
-   - 策略网络直推 Opt1
-   - 局部梯度精调 Opt2
+简单理解，`ARS_optim` 做的是：
 
-整个子项目严格依赖根目录下统一的 normalization_config.json，并调用以下现有模块：
+1. 读取给定工况；
+2. 结合已有代理模型，生成可调参数建议；
+3. 对建议方案做进一步精调；
+4. 输出优化前后损伤结果对比，便于决策参考。
 
-- PulsePredict：生成归一化碰撞波形
-- InjuryPredict：根据波形和标量参数预测 HIC、Dmax、Nij
-- common：提供统一归一化、AIS 计算、路径常量等公共接口
+---
 
+## 2. 面向的问题
 
-## 2. 目录概览
+本项目面向的是这样一类问题：
 
-```text
-ARS_optim/
-├─ configs/
-│  ├─ default_config.yaml   # 训练与评估主配置
-│  └─ param_space.yaml      # 参数角色、默认值、范围、耦合规则
-├─ plot_eval_cases.py       # 按 case_id 从评估 CSV 批量出图
-├─ src/
-│  ├─ constraints.py        # 统一硬约束与可微投影
-│  ├─ data_sampler.py       # 基于 injury_train 经验池的训练数据流
-│  ├─ distribution_penalty.py
-│  ├─ optimizer.py          # 局部精调优化器
-│  ├─ param_manager.py      # 参数空间定义解析与索引管理
-│  ├─ strategy_net.py       # 策略网络
-│  └─ surrogate.py          # PulsePredict + InjuryPredict 代理接口
-├─ saved_models/            # 策略网络训练结果
-├─ saved_eval/              # 寻优评估结果
-├─ run_train.py             # 策略网络训练入口
-└─ run_eval.py              # 寻优评估入口
-```
+- 已知某一碰撞工况的状态条件；
+- 有一部分控制参数允许在限定范围内调整；
+- 希望在满足工程约束的前提下，尽量降低头部、胸部、颈部等损伤风险。
 
+项目输出的不是抽象分数，而是可直接用于对比的结果，包括：
 
-## 3. 运行前提
+- 优化前后的参数值；
+- 优化前后的损伤指标；
+- 对应的 AIS 等级；
+- 风险降低幅度。
 
-在使用 ARS_optim 之前，需满足以下前提：
+---
 
-1. 已在项目根目录完成数据打包与索引划分
-   - 即 prepare_data.py 已成功运行
+## 3. 整体工作流程
 
-2. 已训练好 PulsePredict 模型
-   - 当前默认权重路径由 ARS_optim/configs/default_config.yaml 中 surrogate.pulse_checkpoint 指定
+项目整体流程与 `ARS_Pipeline.md` 保持一致，可以概括为以下三个阶段。
 
-3. 已训练好 InjuryPredict 模型
-   - 当前默认权重路径由 ARS_optim/configs/default_config.yaml 中 surrogate.checkpoint_rel_path 指定
+### 3.1 策略网络直推
 
-4. 当前数据目录下存在统一归一化文件
-  - 由 common/settings.py 中的 NORMALIZATION_CONFIG_PATH 决定
-  - 默认随 DATA_DIR 指向 data_PS/normalization_config.json
-  - 若要切换到 data_DS，请在运行前显式设置环境变量 LX_DATA_DIR
+系统先根据输入工况，直接给出一组可调参数建议。  
+这一步可理解为“快速给出初始优化方案”，对应结果中的 **Opt1**。
 
-5. 运行命令必须在 LX_project 根目录下执行
-   - 本子项目当前只考虑这种运行方式
+### 3.2 局部迭代精调
 
-例如在 Windows PowerShell 中可先执行：
+在直推结果基础上，再针对当前 case 做逐点优化，进一步细调参数。  
+这一步可理解为“在初始方案附近继续优化”，对应结果中的 **Opt2**。
 
-```powershell
-$env:LX_DATA_DIR = "E:/.../LX_project/data_DS"
-python -m ARS_optim.run_eval
-```
+### 3.3 结果评估与可视化
 
+系统会把以下方案放在同一份结果中对比：
 
-## 4. 参数与数据流约定
+- **Base**：优化前基线方案
+- **Opt1**：策略网络直推方案
+- **Opt2**：局部精调后的方案
+- **True**：如果使用测试集评估，则会额外包含仿真真值
 
-### 4.1 参数角色
+---
 
-本项目中的参数分为以下两类：
+## 4. 项目输入
 
-- state 参数
-  - 必然不可调
-- control 参数
-  - 当前可调或当前不可调都属于 control
-  - trainable=false 的 control 在当前配置下会并入 context
-  - trainable=true 的 control 由策略网络输出或局部精调优化
+本项目依赖以下前置条件：
 
-因此：
+- 已完成数据打包与训练/验证/测试划分；
+- 已具备可用的 `PulsePredict` 模型权重；
+- 已具备可用的 `InjuryPredict` 模型权重；
+- 在 `LX_project` 根目录下通过 `python -m xxx` 方式运行。
 
-- context = state + 当前 trainable=false 的 control
-- trainable_control = 当前 trainable=true 的 control
+评估时支持两类输入：
 
-这种划分由 ARS_optim/configs/param_space.yaml 统一定义。后续若修改 trainable 属性，代码会按配置自动切换角色，不需要额外改训练主链路。
+### 4.1 自定义 CSV
 
-### 4.2 训练数据流
+用户提供一份包含工况参数的本地 CSV 文件。  
+系统会读取其中的 context 参数，并在合法前提下完成寻优与评估。
 
-策略网络训练不是基于固定训练集 epoch 循环，而是基于 injury_train 经验池构造无限数据流：
+### 4.2 默认测试集
 
-1. 从损伤预测任务的训练集索引中取样
-2. 对连续 context 特征加入轻微扰动
-3. 若扰动破坏 base 范围或共享耦合规则，则整行 reject rollback 回退为经验池原样本，不额外做 sanitize
+若未指定输入 CSV，则系统使用损伤预测任务对应的测试集进行评估。  
+此时结果中除模型评估值外，还会保留测试集中的仿真真值，便于对比。
 
-这里刻意不把“仅针对寻优解”的额外约束混入输入端采样规则。例如 AFT >= BTF 只约束策略网络或局部精调产出的优化解，不参与 context 数据流的合法性筛查。
+---
 
-验证阶段则使用 injury_val 全量样本，不加扰动，并按 val_interval 定期评估完整验证集。
+## 5. 项目输出
 
-### 4.3 约束规则来源
+### 5.1 训练输出
 
-参数范围、耦合关系、座椅几何约束、离散 RA 档位等规则统一集中在：
+策略网络训练完成后，会在 `ARS_optim/saved_models` 下生成对应目录，主要分为：
 
-- ARS_optim/configs/param_space.yaml
-- ARS_optim/src/constraints.py
+- `configs/`：训练配置记录
+- `checkpoints/`：模型权重
+- `records/`：训练记录与总结
+- `tensorboard/`：训练过程可视化文件
 
-不要在其他脚本中重复硬编码同类逻辑。
+这样做的目的是把“训练配置”和“训练结果”分开保存，避免混杂。
 
+### 5.2 评估输出
 
-## 5. 配置文件
+评估完成后，会在 `ARS_optim/saved_eval` 下生成独立结果目录，主要分为：
 
-### 5.1 default_config.yaml
+- `configs/`：本次评估使用的配置副本
+- `results/`：评估结果文件
 
-该文件统一管理以下内容：
+其中常见结果包括：
 
-- 设备与随机种子
-- 外部代理模型权重路径
-- 策略网络结构超参数
-- 策略网络训练超参数
-- 局部精调超参数
-- 分布偏离惩罚超参数
-- 评估批大小与可选策略权重路径
+- `evaluation_results.csv`：逐 case 的完整结果表
+- `evaluation_record.yaml`：本次评估的整体记录与汇总信息
 
-常用配置项包括：
+### 5.3 绘图输出
 
-- strategy_net.train.batch_size
-- strategy_net.train.max_iterations
-- strategy_net.train.val_interval
-- optimization.direct_inference
-- optimization.refine_steps
-- optimization.lr
-- optimization.distribution_penalty.weight
-- evaluation.strategy_checkpoint
+`plot_eval_cases.py` 可基于评估结果表自动生成柱状对比图，用于展示：
 
-### 5.2 param_space.yaml
+- 参数优化前后变化；
+- 损伤指标变化；
+- AIS 等级变化；
+- 风险概率变化。
 
-该文件定义：
+支持两种选图方式：
 
-- 参数顺序
-- 参数角色与 trainable 属性
-- 默认值
-- 连续参数范围
-- 离散参数允许值
-- 输入端与输出端共享的耦合规则
-- 仅在寻优解阶段生效的额外约束
-- overlap 与 angle 的规则
-- 座椅 SP/SH 多边形约束
-- RA 条件区间
+- 指定 case_id；
+- 自动选取优化效果最好的 TopN case。
 
-如果后续要切换某个 control 参数是否可调，应优先修改此文件，而不是修改训练或评估脚本。
+---
 
+## 6. 结果如何理解
 
-## 6. 训练策略网络
+### 6.1 Base / Opt1 / Opt2 / True
 
-### 6.1 基本命令
+- **Base**：基线方案，即未优化前的输入方案
+- **Opt1**：策略网络直接输出的第一阶段优化结果
+- **Opt2**：在 Opt1 基础上进一步精调后的第二阶段优化结果
+- **True**：仅测试集评估时存在，表示仿真真值
 
-请在 LX_project 根目录执行：
+### 6.2 常见指标
+
+结果表和图中通常会包含以下信息：
+
+- **HIC / Dmax / Nij**：头部、胸部、颈部相关损伤指标
+- **AIS 等级**：损伤等级表征
+- **MAIS**：多部位损伤等级中的最大值
+- **P(AIS3+) 风险**：损伤达到较高等级的概率
+- **JointRisk**：联合风险指标
+
+### 6.3 Reduction 的含义
+
+`Reduction` 表示与基线方案相比的降低幅度。  
+例如：
+
+- `Opt1` 相比 `Base` 的下降值
+- `Opt2` 相比 `Base` 的下降值
+
+如果 `Opt2` 优于 `Opt1`，通常说明局部精调进一步改善了方案。
+
+---
+
+## 7. 约束与可信性说明
+
+项目在生成优化建议时，不是无约束搜索，而是在明确边界下进行：
+
+- 必须满足参数取值范围限制；
+- 必须满足参数之间的耦合关系；
+- 必须满足额外的工程约束；
+- 会考虑与训练经验分布的偏离程度，避免明显脱离已知可靠区域。
+
+因此，输出结果可以理解为：
+
+**在既定约束和代理模型能力范围内，给出的相对更优参数建议。**
+
+---
+
+## 8. 典型使用方式
+
+### 8.1 训练策略网络
+
+在项目根目录执行：
 
 ```bash
 python -m ARS_optim.run_train
 ```
 
-### 6.2 常用参数覆盖
-
-```bash
-python -m ARS_optim.run_train --config ARS_optim/configs/default_config.yaml
-
-python -m ARS_optim.run_train --batch_size 512 --lr 0.0005 --max_iterations 30000
-
-python -m ARS_optim.run_train --device cpu
-```
-
-### 6.3 训练过程说明
-
-训练入口会自动完成以下工作：
-
-1. 读取参数空间定义与主配置
-2. 加载 PulsePredict 与 InjuryPredict 权重
-3. 构建策略网络
-4. 从 injury_train 构造训练数据流
-5. 如启用分布惩罚，则先拟合训练参考分布
-6. 在正式训练前执行一次梯度流自检
-7. 按最大 iteration 数进行训练
-8. 周期性评估 injury_val 全量样本
-9. 保存 train_best、val_best、final 三套权重
-
-### 6.4 训练输出目录
-
-训练结果保存在：
-
-```text
-ARS_optim/saved_models/strategy_net_MMDD_HHMMSS/
-```
-
-目录中通常包含：
-
-- train_best_model.pth
-- val_best_model.pth
-- final_model.pth
-- training_history.csv
-- training_summary.yaml
-- config_used.yaml
-- param_space.yaml
-- normalization_config.json
-- TensorBoard 事件文件
-
-
-## 7. 执行寻优评估
-
-### 7.1 基本命令
-
-默认使用 injury test split 进行评估：
+### 8.2 进行评估
 
 ```bash
 python -m ARS_optim.run_eval
 ```
 
-指定输入 CSV：
+或指定自定义输入文件：
 
 ```bash
-python -m ARS_optim.run_eval --input_csv path/to/input.csv
+python -m ARS_optim.run_eval --input_csv your_cases.csv
 ```
 
-启用策略网络直推并显式指定权重：
+### 8.3 绘制结果图
 
 ```bash
-python -m ARS_optim.run_eval --input_csv path/to/input.csv --direct_inference --strategy_ckpt ARS_optim/saved_models/strategy_net_xxxx/val_best_model.pth
+python -m ARS_optim.plot_eval_cases --eval_csv path_to_evaluation_results.csv --case_ids 1 2 3
 ```
 
-自定义输出 CSV 文件名：
+或直接绘制优化效果最好的若干 case：
 
 ```bash
-python -m ARS_optim.run_eval --input_csv path/to/input.csv --output_csv my_eval.csv
+python -m ARS_optim.plot_eval_cases --eval_csv path_to_evaluation_results.csv --topn_joint_risk 10
 ```
 
-### 7.2 评估输入规则
+---
 
-若使用 input_csv：
+## 9. 阅读建议
 
-- 应包含 context 参数列
-- 若缺失某个 context 参数，该行会被跳过，不再静默补 default
-- 若额外提供了 trainable control 列，则这些值作为 baseline 输入
-- 若未提供 trainable control 列，则 baseline 使用 default 值
-- 若 baseline trainable 缺失或非法，仅该行 baseline 回退到 default
-- 若已提供的 context 非法或违反硬约束，仅该行会被跳过
+如果面向项目汇报或业务沟通，建议重点关注以下内容：
 
-若未提供 input_csv：
+- 基线方案与优化方案的损伤指标变化；
+- `Opt1` 与 `Opt2` 的差异；
+- `JointRisk`、`MAIS` 等总体风险指标是否明显下降；
+- Top case 与典型 case 的图形化对比结果。
 
-- 自动使用损伤预测任务的测试集工况点
-- baseline 直接使用测试集已有参数
-- 不再对测试集做逐行物理合法性过滤；仅检查缺失值，若发现缺失则直接报错终止
-- 同时读取真值标签并写入输出结果，便于和 baseline、优化结果做对比
+如果面向工程复核，则建议结合：
 
-### 7.3 评估阶段定义
+- 约束配置；
+- 模型权重版本；
+- 评估配置记录；
+- 输出结果表
 
-- Base
-  - baseline 结果
-- Opt1
-  - 策略网络直推结果
-  - 仅在 direct_inference=true 且提供兼容权重时存在
-- Opt2
-  - 局部精调结果
-  - 仅在 refine_steps 大于 0 时存在
+一起判断本次优化结果是否可采纳。
 
-局部精调是按 case 独立并行的逐点优化，不是分布级优化。
+---
 
-### 7.4 评估输出目录
+## 10. 注意事项
 
-每次评估都会在以下目录下创建新的时间戳子目录：
-
-```text
-ARS_optim/saved_eval/eval_xxx_MMDD_HHMMSS/
-```
-
-目录中通常包含：
-
-- evaluation_results.csv 或用户指定名称的输出 CSV
-- eval_info.yaml
-- summary.yaml
-- config_used.yaml
-- param_space.yaml
-- normalization_config.json
-
-### 7.5 输出 CSV 内容
-
-
-
-输出结果包含：
-
-- metadata 列
-  - 如 case_id
-- 完整 context 参数
-- Base_ 前缀的 baseline trainable control
-- Opt_ 前缀的最终优化后 trainable control
-- Base 与 Opt 两组损伤预测结果
-  - HIC
-  - Dmax
-  - Nij
-  - 三部位风险
-  - 联合损伤风险
-  - AIS_head、AIS_chest、AIS_neck、MAIS (最大AIS)
-- Reduction_ 前缀的绝对降低量
-- 若为测试集模式，还会包含 True_ 前缀的真值列
-  - True_HIC、True_Dmax、True_Nij
-  - True_Phead、True_Pchest、True_Pneck、True_JointRisk
-  - True_AIS_head、True_AIS_chest、True_AIS_neck、True_MAIS
-- 若为测试集模式，还会包含 True_vs_ 前缀的真值对比列
-  - 这些列统一放在所有 Reduction_ 列之后，便于先浏览优化收益，再查看与真值的偏差
-
-### 7.6 eval_info.yaml 内容
-
-eval_info.yaml 中会记录：
-
-- 输入来源路径
-- 使用的策略权重路径
-- 当前配置快照
-- 参数角色划分
-- 输入校验策略
-- 各阶段状态
-- 宏观降损指标汇总
-- 总耗时与平均耗时
-
-### 7.7 按 case_id 生成对比图
-
-可直接基于某次评估产出的结果 CSV 生成逐 case 柱状图：
-
-```bash
-python -m ARS_optim.plot_eval_cases --eval_csv ARS_optim/saved_eval/eval_xxx_MMDD_HHMMSS/evaluation_results.csv --case_ids 50007 50013
-```
-
-可选参数：
-
-- --dpi
-  - 控制输出图片分辨率，默认 180
-
-脚本行为约定：
-
-- 若 case_id 不存在，会给出 warning 并跳过该 case
-- 若指定的 case_id 全部不存在，会直接报错
-- 图片输出到评估 CSV 同目录下的 case_<case_id>/ 子目录
-
-每个 case 默认输出 4 张图：
-
-- 01_control_compare.png
-- 02_injury_scalar_compare.png
-- 03_ais_compare.png
-- 04_risk_compare.png
-
-若读取的是历史测试集评估 CSV，且其中缺少 True_Phead / True_Pchest / True_Pneck / True_JointRisk，绘图脚本会按与 run_eval.py 一致的口径即时补算，仅用于绘图，不会回写原 CSV。
-
-
-## 8. 推荐使用顺序
-
-建议按照以下顺序使用 ARS_optim：
-
-1. 先确认 PulsePredict 和 InjuryPredict 权重路径正确
-2. 检查 ARS_optim/configs/default_config.yaml
-3. 训练策略网络
-4. 用测试集先做一次评估
-5. 再用自定义 input_csv 做实际工况评估
-
-
-## 9. 常见注意事项
-
-1. 命令需在 LX_project 根目录下执行
-
-2. normalization_config.json 必须与当前数据和模型一致
-
-3. 若启用 direct_inference，但未提供兼容当前参数空间的策略权重，会直接报错
-
-4. input_csv 中若 context 参数缺失或非法，会跳过该 case；若 baseline trainable 缺失或非法，仅该行 baseline 回退为 default，并给出 warning
-
-5. param_space.yaml 中的 default 值被视为用户已确认的合法值，不会额外做兼容性兜底
-
-
-## 10. 与其他子项目的关系
-
-ARS_optim 不负责以下工作：
-
-- 原始数据打包与索引生成
-- PulsePredict 模型训练
-- InjuryPredict 模型训练
-
-这些工作请分别参考：
-
-- 根目录 README
-- PulsePredict/README.md
-- InjuryPredict/README.md
+- 本项目默认在 `LX_project` 根目录下通过 `python -m xxx` 运行；
+- 本项目依赖已有的波形预测模型和损伤预测模型权重，不负责重新训练这两个模型；
+- 项目输出的是**模型驱动的优化建议**，适合作为工程决策参考，不应脱离业务和工程审查单独使用。

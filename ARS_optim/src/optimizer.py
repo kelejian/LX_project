@@ -43,9 +43,44 @@ class LocalRefiner:
         self.direct_inference = bool(opt_cfg.get("direct_inference", False))
         self.refine_steps = int(opt_cfg.get("refine_steps", 50))
         self.lr = float(opt_cfg.get("lr", 0.05))
+        scheduler_cfg = opt_cfg.get("scheduler", {}) or {}
+        self.scheduler_type = str(scheduler_cfg.get("type", "none")).lower()
+        self.scheduler_eta_min = float(scheduler_cfg.get("eta_min", max(1.0e-6, self.lr * 0.1)))
+        self.scheduler_step_size = max(1, int(scheduler_cfg.get("step_size", max(1, self.refine_steps // 4))))
+        self.scheduler_gamma = float(scheduler_cfg.get("gamma", 0.5))
+        self.scheduler_t_max_cfg = scheduler_cfg.get("T_max", "max_iters")
         min_bounds, max_bounds = self.param_manager.get_trainable_opt_bounds()
         self._trainable_mins_cpu = min_bounds
         self._trainable_maxs_cpu = max_bounds
+
+    def _build_refine_scheduler(self, optimizer: torch.optim.Optimizer):
+        if self.scheduler_type in {"none", ""}:
+            return None
+        if self.scheduler_type in {"cosine", "cosineannealinglr"}:
+            t_max_cfg = self.scheduler_t_max_cfg
+            if isinstance(t_max_cfg, str):
+                t_max_text = t_max_cfg.strip().lower()
+                if t_max_text == "max_iters":
+                    t_max_value = self.refine_steps
+                else:
+                    try:
+                        t_max_value = int(t_max_cfg)
+                    except ValueError as exc:
+                        raise ValueError("局部精调 scheduler.T_max 只允许写整数或 'max_iters'") from exc
+            else:
+                t_max_value = self.refine_steps if t_max_cfg is None else int(t_max_cfg)
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, t_max_value),
+                eta_min=self.scheduler_eta_min,
+            )
+        if self.scheduler_type in {"step", "steplr"}:
+            return torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=self.scheduler_step_size,
+                gamma=self.scheduler_gamma,
+            )
+        raise ValueError(f"不支持的局部精调学习率调度器: {self.scheduler_type}")
 
     def _to_latent(self, actions_phys: torch.Tensor, mins: torch.Tensor, spans: torch.Tensor) -> torch.Tensor:
         """把物理尺度动作映射到无量纲潜空间。"""
@@ -153,6 +188,7 @@ class LocalRefiner:
         # 因此每个 case、每个控制维度都会拥有各自独立的一阶矩/二阶矩，
         # 本质上等价于“多个 case 各自做 Adam，只是把它们向量化并行执行”。
         optimizer = torch.optim.Adam([latent_var], lr=self.lr)
+        scheduler = self._build_refine_scheduler(optimizer)
         trajectory = []
         start = time.time()
         # 潜空间 [0, 1] 与 yaml 边界一一对应；这里仍保留 10% 的松弛带，允许优化器在“合法边界附近”做少量越界探索，再通过前向投影和软惩罚把解拉回可行域，减少边界处的更新僵硬和振荡。
@@ -191,6 +227,8 @@ class LocalRefiner:
             total_sum = total_batch.sum() # 用 sum 而不是 mean，完全消除batch_size对Adam的影响
             total_sum.backward()
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
 
             with torch.no_grad():
                 latent_var.clamp_(relaxed_lower, relaxed_upper)

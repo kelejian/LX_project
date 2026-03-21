@@ -7,7 +7,7 @@ import csv
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 import torch.optim as optim
@@ -42,9 +42,21 @@ def _build_scheduler(optimizer, train_cfg: dict, max_iters: int):
     scheduler_cfg = train_cfg.get("scheduler", {}) or {}
     scheduler_type = str(scheduler_cfg.get("type", "none")).lower()
     if scheduler_type in {"cosine", "cosineannealinglr"}:
+        t_max_cfg = scheduler_cfg.get("T_max", max_iters)
+        if isinstance(t_max_cfg, str):
+            t_max_text = t_max_cfg.strip().lower()
+            if t_max_text == "max_iters":
+                t_max_value = max_iters
+            else:
+                try:
+                    t_max_value = int(t_max_cfg)
+                except ValueError as exc:
+                    raise ValueError("训练阶段 scheduler.T_max 只允许写整数或 'max_iters'") from exc
+        else:
+            t_max_value = max_iters if t_max_cfg is None else int(t_max_cfg)
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=max(1, int(scheduler_cfg.get("T_max", max_iters))),
+            T_max=max(1, t_max_value),
             eta_min=float(scheduler_cfg.get("eta_min", 1e-5)),
         )
     if scheduler_type in {"step", "steplr"}:
@@ -54,6 +66,48 @@ def _build_scheduler(optimizer, train_cfg: dict, max_iters: int):
             gamma=float(scheduler_cfg.get("gamma", 0.5)),
         )
     return None
+
+
+
+def _collect_strategy_net_diagnostics(
+    strategy_net,
+    surrogate: SurrogateAdapter,
+    sample_context: torch.Tensor,
+    logger,
+) -> dict:
+    """记录网络结构、参数量和 default 初始化检查结果。"""
+    sample_context = sample_context[: min(3, sample_context.shape[0])].detach()
+    total_params = sum(param.numel() for param in strategy_net.parameters())
+    trainable_params = sum(param.numel() for param in strategy_net.parameters() if param.requires_grad)
+    param_stats = {
+        "total": int(total_params),
+        "trainable": int(trainable_params),
+        "non_trainable": int(total_params - trainable_params),
+    }
+
+    strategy_net.eval()
+    with torch.no_grad():
+        pulse_norm = surrogate.generate_pulse(sample_context)
+        projected_actions, _ = strategy_net(sample_context, pulse_norm)
+
+    default_actions = strategy_net.default_actions.detach().cpu()
+    output_cpu = projected_actions.detach().cpu()
+    max_abs_diff = float((output_cpu - default_actions.unsqueeze(0)).abs().max().item())
+    diagnostics = {
+        "parameter_count": param_stats,
+        "arch_info": dict(strategy_net.arch_info),
+        "default_actions": default_actions.tolist(),
+        "init_output_samples": output_cpu.tolist(),
+        "init_output_max_abs_diff_vs_default": max_abs_diff,
+    }
+
+    logger.info("StrategyNet 参数量: total=%d, trainable=%d", param_stats["total"], param_stats["trainable"])
+    logger.info("StrategyNet 结构摘要: %s", strategy_net.arch_info)
+    logger.info("StrategyNet 网络结构:\n%s", strategy_net)
+    logger.info("初始化 default 动作: %s", diagnostics["default_actions"])
+    logger.info("初始化后随机合法输入输出: %s", diagnostics["init_output_samples"])
+    logger.info("初始化输出与 default 的最大绝对误差: %.6e", max_abs_diff)
+    return diagnostics
 
 def _build_training_summary(
     train_cfg: dict,
@@ -67,7 +121,8 @@ def _build_training_summary(
     train_sampler: StateDataSampler,
     val_sampler: StateDataSampler,
     dist_ref_info: Optional[dict],
-    run_norm_snapshot_path: Path,
+    config_snapshots: Dict[str, str],
+    network_info: dict,
     train_best_iter: int,
     train_best_loss: float,
     train_metric_name: str,
@@ -200,7 +255,8 @@ def _build_training_summary(
         },
         # 运行目录里已经直接保存了 config_used.yaml / param_space.yaml / normalization_config.json；
         # 这里不再把同一批外部工件路径重复展开到 summary，避免摘要和快照文件各维护一份信息。
-        "normalization_config_snapshot": run_norm_snapshot_path.name,
+        "config_files": config_snapshots,
+        "network": network_info,
         "train_best": train_best_record,
         "val_best": val_best_record,
         "final_model": final_model_record,
@@ -247,7 +303,7 @@ def _run_gradient_sanity_check(
         raise RuntimeError("梯度流自检失败：sanity batch 的 loss 出现 NaN/Inf")
     loss_mean.backward()
 
-    out_layer = strategy_net.mlp[-1]
+    out_layer = strategy_net.output_head
     if not isinstance(out_layer, torch.nn.Linear):
         raise TypeError("梯度流自检失败：策略网络最后一层不是 Linear")
 
@@ -377,6 +433,7 @@ def main():
         surrogate.fit_distribution_reference(ref_context)
 
     sanity_context = next(train_generator)
+    network_info = _collect_strategy_net_diagnostics(strategy_net, surrogate, sanity_context, logger)
     _run_gradient_sanity_check(strategy_net, surrogate, sanity_context)
     logger.info("梯度流自检通过：策略网络输出层梯度存在且有限")
 
@@ -386,13 +443,36 @@ def main():
     save_root.mkdir(parents=True, exist_ok=True)
     run_dir = save_root / f"strategy_net_{datetime.now().strftime('%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=False)
-    run_norm_snapshot_path = run_dir / "normalization_config.json"
-    shutil.copy2(str(NORMALIZATION_CONFIG_PATH), str(run_norm_snapshot_path))
-    writer = SummaryWriter(log_dir=str(run_dir)) if tensorboard_enabled else None
+    config_dir = run_dir / "configs"
+    checkpoint_dir = run_dir / "checkpoints"
+    record_dir = run_dir / "records"
+    tensorboard_dir = run_dir / "tensorboard"
+    config_dir.mkdir(parents=True, exist_ok=False)
+    checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    record_dir.mkdir(parents=True, exist_ok=False)
+    if tensorboard_enabled:
+        tensorboard_dir.mkdir(parents=True, exist_ok=False)
 
-    train_best_path = run_dir / "train_best_model.pth"
-    val_best_path = run_dir / "val_best_model.pth"
-    final_path = run_dir / "final_model.pth"
+    config_used_path = config_dir / "config_used.yaml"
+    param_snapshot_path = config_dir / "param_space.yaml"
+    run_norm_snapshot_path = config_dir / "normalization_config.json"
+    with open(config_used_path, "w", encoding="utf-8") as file:
+        yaml.safe_dump(config, file, allow_unicode=True, sort_keys=False)
+    shutil.copy2(str(param_space_path), str(param_snapshot_path))
+    shutil.copy2(str(NORMALIZATION_CONFIG_PATH), str(run_norm_snapshot_path))
+    config_snapshots = {
+        "config_used": str(config_used_path),
+        "param_space_used": str(param_snapshot_path),
+        "normalization_config": str(run_norm_snapshot_path),
+    }
+
+    writer = SummaryWriter(log_dir=str(tensorboard_dir)) if tensorboard_enabled else None
+
+    train_best_path = checkpoint_dir / "train_best_model.pth"
+    val_best_path = checkpoint_dir / "val_best_model.pth"
+    final_path = checkpoint_dir / "final_model.pth"
+    history_path = record_dir / "training_history.csv"
+    summary_path = record_dir / "training_summary.yaml"
     history_rows = []
     train_best_loss = float("inf")
     val_best_loss = float("inf")
@@ -433,6 +513,10 @@ def main():
 
     log_interval = int(train_cfg.get("log_interval", 10))
     val_interval = int(train_cfg.get("val_interval", 500))
+    if val_sampler.pool_size == 0:
+        if val_interval > 0:
+            logger.warning("injury_val 切片为空：本次训练将跳过固定验证与 val_best 权重保存。")
+        val_interval = 0
     grad_clip = float(train_cfg.get("gradient_clip_max_norm", 1.0))
     save_best = bool(train_cfg.get("save_best", True))
     save_last = bool(train_cfg.get("save_last", True))
@@ -526,12 +610,12 @@ def main():
         if save_last:
             torch.save(strategy_net.state_dict(), final_path)
 
-        with open(run_dir / "training_history.csv", "w", newline="", encoding="utf-8") as file:
+        with open(history_path, "w", newline="", encoding="utf-8") as file:
             writer_csv = csv.DictWriter(file, fieldnames=list(history_rows[0].keys()) if history_rows else ["iteration"])
             writer_csv.writeheader()
             writer_csv.writerows(history_rows)
 
-        with open(run_dir / "training_summary.yaml", "w", encoding="utf-8") as file:
+        with open(summary_path, "w", encoding="utf-8") as file:
             yaml.safe_dump(
                 _build_training_summary(
                     train_cfg=train_cfg,
@@ -545,7 +629,8 @@ def main():
                     train_sampler=train_sampler,
                     val_sampler=val_sampler,
                     dist_ref_info=dist_ref_info,
-                    run_norm_snapshot_path=run_norm_snapshot_path,
+                    config_snapshots=config_snapshots,
+                    network_info=network_info,
                     train_best_iter=train_best_iter,
                     train_best_loss=train_best_loss,
                     train_metric_name=train_metric_name,
@@ -562,10 +647,6 @@ def main():
                 sort_keys=False,
             )
 
-        with open(run_dir / "config_used.yaml", "w", encoding="utf-8") as file:
-            yaml.safe_dump(config, file, allow_unicode=True, sort_keys=False)
-        shutil.copy2(str(param_space_path), str(run_dir / "param_space.yaml"))
-
         if train_best_iter > 0:
             logger.info(f"训练最优权重: {train_best_path}")
         if val_best_iter > 0:
@@ -580,3 +661,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

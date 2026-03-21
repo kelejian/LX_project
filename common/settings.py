@@ -41,8 +41,9 @@ _DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 ROOT_DIR = Path(os.environ.get("LX_PROJECT_ROOT", _DEFAULT_ROOT))
 
 # 数据目录
-DATA_DIR = Path(os.environ.get("LX_DATA_DIR", ROOT_DIR / "data"))
+DATA_DIR = Path(os.environ.get("LX_DATA_DIR", ROOT_DIR / "data_DS"))
 RAW_DATA_DIR = DATA_DIR / "raw_packed"
+RAW_DATA = RAW_DATA_DIR / "raw_data_packed.npz" # 打包后的原始数据文件路径
 SPLIT_INDICES_DIR = DATA_DIR / "split_indices"
 
 # 配置文件（全局共用）
