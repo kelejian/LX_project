@@ -253,7 +253,7 @@ def _build_training_summary(
             "trainable_control": param_manager.get_trainable_names(),
             "fixed_control": param_manager.get_fixed_control_names(),
         },
-        # 运行目录里已经直接保存了 config_used.yaml / param_space.yaml / normalization_config.json；
+        # 运行目录下的configs_used中已经直接保存了 config.yaml / param_space.yaml / normalization_config.json；
         # 这里不再把同一批外部工件路径重复展开到 summary，避免摘要和快照文件各维护一份信息。
         "config_files": config_snapshots,
         "network": network_info,
@@ -405,6 +405,8 @@ def main():
         split_indices_path=str(SPLIT_INDICES_DIR / "injury_train_indices.csv"),
         jitter_ratio=float(train_cfg.get("jitter_ratio", 0.01)),
         jitter_prob=float(train_cfg.get("jitter_prob", 1.0)),
+        jitter_max_attempts=int(train_cfg.get("jitter_max_attempts", 1)),
+        jitter_min_active_dims=int(train_cfg.get("jitter_min_active_dims", 1)),
     )
     val_sampler = StateDataSampler(
         param_manager=param_manager,
@@ -422,8 +424,7 @@ def main():
     if surrogate.distribution_penalty.enabled:
         dist_cfg = config.get("optimization", {}).get("distribution_penalty", {})
         # 分布惩罚的参考集必须尽量代表整个训练经验池，而不是池中前缀切片。
-        # 这里统一使用“完整训练池”或“基于全局 seed 的一次性随机子样本”，
-        # 让训练和评估两端拟合出的参考分布保持同源、可复现。
+        # 这里统一使用“完整训练池”或“基于全局 seed 的一次性随机子样本”，让训练和评估两端拟合出的参考分布保持同源、可复现。
         ref_context, dist_ref_info = train_sampler.get_distribution_reference(
             max_samples=int(dist_cfg.get("max_ref_samples", 0)),
             feature_space=surrogate.distribution_penalty.feature_space,
@@ -443,7 +444,7 @@ def main():
     save_root.mkdir(parents=True, exist_ok=True)
     run_dir = save_root / f"strategy_net_{datetime.now().strftime('%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=False)
-    config_dir = run_dir / "configs"
+    config_dir = run_dir / "configs_used"
     checkpoint_dir = run_dir / "checkpoints"
     record_dir = run_dir / "records"
     tensorboard_dir = run_dir / "tensorboard"
@@ -453,7 +454,7 @@ def main():
     if tensorboard_enabled:
         tensorboard_dir.mkdir(parents=True, exist_ok=False)
 
-    config_used_path = config_dir / "config_used.yaml"
+    config_used_path = config_dir / "config.yaml"
     param_snapshot_path = config_dir / "param_space.yaml"
     run_norm_snapshot_path = config_dir / "normalization_config.json"
     with open(config_used_path, "w", encoding="utf-8") as file:
@@ -484,8 +485,7 @@ def main():
         """在 injury_val 全量样本上做一次无扰动评估。
 
         训练阶段使用无限采样流，不存在自然 epoch；
-        因此验证不能直接复用训练 batch，而要显式遍历固定的 injury_val 切片，
-        才能让不同迭代点的验证指标具有可比性。
+        因此验证要显式遍历固定的 injury_val 切片，才能让不同迭代点的验证指标具有可比性。
         """
         strategy_net.eval()
         total_loss = 0.0
@@ -542,7 +542,10 @@ def main():
             loss_risk = float(info["loss_risk"].mean().item())
             loss_constraint = float(info["loss_constraint"].mean().item())
             loss_distribution = float(info["loss_distribution"].mean().item())
-            jitter_rejection_rate = float(train_sampler.last_rejection_rate)
+            sampling_stats = train_sampler.get_last_sampling_stats()
+            jitter_attempt_rejection_rate = float(sampling_stats["attempt_rejection_rate"])
+            jitter_final_fallback_rate = float(sampling_stats["final_fallback_rate"])
+            jitter_changed_param_ratio = float(sampling_stats["mean_changed_param_ratio"])
             current_lr = float(optimizer.param_groups[0]["lr"])
 
             ema_train_loss = loss_value if ema_train_loss is None else ema_alpha * ema_train_loss + (1.0 - ema_alpha) * loss_value
@@ -558,7 +561,9 @@ def main():
                 writer.add_scalar("Train/LossRisk", loss_risk, iter_idx)
                 writer.add_scalar("Train/LossConstraint", loss_constraint, iter_idx)
                 writer.add_scalar("Train/LossDistribution", loss_distribution, iter_idx)
-                writer.add_scalar("Train/JitterRejectionRate", jitter_rejection_rate, iter_idx)
+                writer.add_scalar("Train/JitterAttemptRejectionRate", jitter_attempt_rejection_rate, iter_idx)
+                writer.add_scalar("Train/JitterFinalFallbackRate", jitter_final_fallback_rate, iter_idx)
+                writer.add_scalar("Train/JitterChangedParamRatio", jitter_changed_param_ratio, iter_idx)
                 writer.add_scalar("Train/LR", current_lr, iter_idx)
                 if ema_log_to_tb:
                     writer.add_scalar("Train/EMA_Loss", float(ema_train_loss), iter_idx)
@@ -592,7 +597,9 @@ def main():
                     "train_loss_risk": loss_risk,
                     "train_loss_constraint": loss_constraint,
                     "train_loss_distribution": loss_distribution,
-                    "jitter_rejection_rate": jitter_rejection_rate,
+                    "jitter_attempt_rejection_rate": jitter_attempt_rejection_rate,
+                    "jitter_final_fallback_rate": jitter_final_fallback_rate,
+                    "jitter_changed_param_ratio": jitter_changed_param_ratio,
                     "val_loss": val_loss,
                     "val_loss_risk": val_loss_risk,
                     "val_loss_constraint": val_loss_constraint,
@@ -604,7 +611,10 @@ def main():
                 tqdm.write(
                     f"iter={iter_idx + 1} loss={loss_value:.4f} ema={ema_train_loss:.4f} "
                     f"risk={loss_risk:.4f} penalty={loss_constraint:.4f} dist={loss_distribution:.4f} "
-                    f"rej={jitter_rejection_rate:.2%} lr={current_lr:.2e}"
+                    f"att_rej={jitter_attempt_rejection_rate:.2%} "
+                    f"fallback={jitter_final_fallback_rate:.2%} "
+                    f"changed={jitter_changed_param_ratio:.2%} "
+                    f"lr={current_lr:.2e}"
                 )
 
         if save_last:

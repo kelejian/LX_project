@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from common.data_utils.split_io import load_int_vector_csv
-from common.settings import RAW_DATA_DIR, SPLIT_INDICES_DIR
+from common.settings import RAW_DATA, SPLIT_INDICES_DIR
 
 from ARS_optim.src.constraints import ConstraintEngine
 from ARS_optim.src.param_manager import ParamManager
@@ -31,6 +31,8 @@ class StateDataSampler:
         split_indices_path: Optional[str] = None,
         jitter_ratio: float = 0.01,
         jitter_prob: float = 1.0,
+        jitter_max_attempts: int = 1,
+        jitter_min_active_dims: int = 1,
     ):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.param_manager = param_manager
@@ -40,7 +42,17 @@ class StateDataSampler:
         self.seed = int(seed) if seed is not None else None
         self.jitter_ratio = float(jitter_ratio)
         self.jitter_prob = float(jitter_prob)
-        self._last_rejection_rate = 0.0
+        self.jitter_max_attempts = int(jitter_max_attempts)
+        self.jitter_min_active_dims = int(jitter_min_active_dims)
+        if not (0.0 <= self.jitter_prob <= 1.0):
+            raise ValueError("jitter_prob 必须位于 [0, 1] 区间")
+        if self.jitter_max_attempts <= 0:
+            raise ValueError("jitter_max_attempts 必须为正整数")
+        if self.jitter_min_active_dims < 0:
+            raise ValueError("jitter_min_active_dims 不能为负数")
+        self._last_attempt_rejection_rate = 0.0
+        self._last_final_fallback_rate = 0.0
+        self._last_mean_changed_param_ratio = 0.0
 
         self.rng = torch.Generator(device=device)
         if self.seed is not None:
@@ -49,7 +61,7 @@ class StateDataSampler:
         self.context_params = self.param_manager.get_context_params()
         self.context_indices = self.param_manager.get_context_indices()
 
-        pool_path = Path(pool_npz_path) if pool_npz_path else (RAW_DATA_DIR / "raw_data_packed.npz")
+        pool_path = Path(pool_npz_path) if pool_npz_path else (RAW_DATA)
         split_path = Path(split_indices_path) if split_indices_path else (SPLIT_INDICES_DIR / "injury_train_indices.csv")
         if not split_path.exists():
             raise FileNotFoundError(f"经验池切分索引不存在: {split_path}")
@@ -72,6 +84,9 @@ class StateDataSampler:
         self.context_cont_local_indices = [
             idx for idx, param in enumerate(self.context_params) if param.get("type") == "continuous"
         ]
+        self.context_cont_names = [
+            self.context_params[idx]["name"] for idx in self.context_cont_local_indices
+        ]
         if self.context_cont_local_indices:
             # 训练采样阶段属于输入端 context 扰动：
             # 即便某些 context 列来自当前不可调 control（如 LL1/LL2），
@@ -93,13 +108,6 @@ class StateDataSampler:
             self.cont_maxs = None
             self.cont_spans = None
 
-        cont_name_to_pos = {
-            self.context_params[local_idx]["name"]: pos
-            for pos, local_idx in enumerate(self.context_cont_local_indices)
-        }
-        self._overlap_cont_pos = cont_name_to_pos.get("overlap")
-        self._angle_cont_pos = cont_name_to_pos.get("impact_angle")
-
     def _load_feature_matrix_from_pool(self, pool_path: Path) -> np.ndarray:
         if not pool_path.exists():
             raise FileNotFoundError(f"经验池文件不存在: {pool_path}")
@@ -111,59 +119,106 @@ class StateDataSampler:
             raise ValueError(f"经验池特征矩阵形状异常: {features.shape}")
         return features[:, : self.param_manager.get_total_feature_dim()]
 
-    def _apply_bounded_jitter(self, batch_context: torch.Tensor) -> torch.Tensor:
-        if not self.context_cont_local_indices or self.jitter_ratio <= 0:
-            self._last_rejection_rate = 0.0
-            return batch_context
-
-        original_context = batch_context.clone()
-
-        # 这里只对连续 context 列加噪声；离散参数 is_driver_side / OT 不在这个切片里，
-        # 因而天然不会被扰动。这样可避免对离散标签做“先映射成浮点再回整”的伪连续处理。
-        continuous = batch_context[:, self.context_cont_local_indices]
-
-        feature_mask = torch.ones_like(continuous, dtype=torch.float32)
-        if self._overlap_cont_pos is not None and self._angle_cont_pos is not None:
-            # 当 overlap 处于特殊耦合带内时，impact_angle 的合法区间会随 overlap 分段变化。
-            # 若在这一带继续对二者加独立高斯扰动，极易把样本推到非法区域，导致高拒绝率。
-            # 因此这里直接冻结这两列，让采样器只在其余连续 context 维度上做轻扰动。
-            protected_rows = self.constraint_engine.should_freeze_overlap_angle_jitter(batch_context)
-            if protected_rows.any():
-                feature_mask[protected_rows, self._overlap_cont_pos] = 0.0
-                feature_mask[protected_rows, self._angle_cont_pos] = 0.0
-
-        noise = torch.randn(
-            continuous.shape,
-            generator=self.rng,
-            device=self.device,
-            dtype=torch.float32,
-        )
-        noise = noise * (self.cont_spans.unsqueeze(0) * self.jitter_ratio)
+    def _build_attempt_active_mask(self, allowed_mask: torch.Tensor) -> torch.Tensor:
+        active_mask = allowed_mask.clone()
         if self.jitter_prob < 1.0:
-            prob_mask = torch.rand(
-                continuous.shape,
+            sampled_mask = torch.rand(
+                allowed_mask.shape,
                 generator=self.rng,
                 device=self.device,
             ) < self.jitter_prob
-            feature_mask = feature_mask * prob_mask.to(dtype=torch.float32)
+            active_mask = allowed_mask & sampled_mask
 
-        tentative_continuous = continuous + noise * feature_mask
-        batch_context[:, self.context_cont_local_indices] = tentative_continuous
+        if self.jitter_min_active_dims <= 0:
+            return active_mask
 
-        # 掩码后的扰动只生成“试探样本”；这里不做任何后置修补或边界截断。
-        # 只要某行试探样本破坏硬约束，就整行拒绝并回退为原始经验池样本。
-        # 训练采样阶段的输入端合法性只针对当前 context 列本身，
-        # 不再补任何默认 trainable control 去“凑完整特征”后再校验。
-        # 否则一旦未来切换 trainable 属性，采样器的语义就会被默认值污染。
-        valid_mask = self.constraint_engine.validate_context_input(batch_context)
-        self._last_rejection_rate = float((~valid_mask).to(dtype=torch.float32).mean().item())
-        if (~valid_mask).any():
-            batch_context[~valid_mask] = original_context[~valid_mask]
-        return batch_context
+        allowed_counts = allowed_mask.sum(dim=1)
+        target_counts = torch.minimum(
+            allowed_counts,
+            torch.full_like(allowed_counts, self.jitter_min_active_dims),
+        )
+        current_counts = active_mask.sum(dim=1)
+        need_rows = current_counts < target_counts
+        if not need_rows.any():
+            return active_mask
 
-    @property
-    def last_rejection_rate(self) -> float:
-        return self._last_rejection_rate
+        for row_idx in torch.nonzero(need_rows, as_tuple=False).flatten().cpu().tolist():
+            need = int(target_counts[row_idx].item() - current_counts[row_idx].item())
+            if need <= 0:
+                continue
+            candidates = torch.nonzero(
+                allowed_mask[row_idx] & (~active_mask[row_idx]),
+                as_tuple=False,
+            ).flatten()
+            if candidates.numel() == 0:
+                continue
+            if candidates.numel() <= need:
+                active_mask[row_idx, candidates] = True
+                continue
+            chosen = candidates[
+                torch.randperm(candidates.numel(), generator=self.rng, device=candidates.device)[:need]
+            ]
+            active_mask[row_idx, chosen] = True
+        return active_mask
+
+    def _apply_bounded_jitter(self, batch_context: torch.Tensor) -> torch.Tensor:
+        if not self.context_cont_local_indices or self.jitter_ratio <= 0:
+            self._last_attempt_rejection_rate = 0.0
+            self._last_final_fallback_rate = 0.0
+            self._last_mean_changed_param_ratio = 0.0
+            return batch_context
+
+        original_context = batch_context.clone()
+        sampled_context = original_context.clone()
+        accepted_mask = torch.zeros(original_context.shape[0], dtype=torch.bool, device=self.device)
+        total_attempts = 0
+        total_rejections = 0
+
+        # 输入端仍保持“只接受合法扰动，否则回退原样本”的语义；
+        # 区别只是每行允许做有限次独立重试，降低整样本完全重复率。
+        for _ in range(self.jitter_max_attempts):
+            pending_idx = torch.nonzero(~accepted_mask, as_tuple=False).flatten()
+            if pending_idx.numel() == 0:
+                break
+
+            base_pending = original_context[pending_idx]
+            allowed_mask_full = self.constraint_engine.build_context_jitter_mask(base_pending)
+            allowed_mask = allowed_mask_full[:, self.context_cont_local_indices]
+            active_mask = self._build_attempt_active_mask(allowed_mask)
+
+            tentative = base_pending.clone()
+            continuous = tentative[:, self.context_cont_local_indices]
+            noise = torch.randn(
+                continuous.shape,
+                generator=self.rng,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            noise = noise * (self.cont_spans.unsqueeze(0) * self.jitter_ratio)
+            tentative[:, self.context_cont_local_indices] = continuous + noise * active_mask.to(dtype=torch.float32)
+
+            changed_rows = active_mask.any(dim=1)
+            valid_mask = changed_rows & self.constraint_engine.validate_context_input(tentative)
+            total_attempts += int(pending_idx.numel())
+            total_rejections += int((~valid_mask).sum().item())
+
+            if valid_mask.any():
+                accepted_idx = pending_idx[valid_mask]
+                sampled_context[accepted_idx] = tentative[valid_mask]
+                accepted_mask[accepted_idx] = True
+
+        changed_mask = (
+            sampled_context[:, self.context_cont_local_indices]
+            - original_context[:, self.context_cont_local_indices]
+        ).abs() > 1e-12
+        self._last_attempt_rejection_rate = (
+            float(total_rejections) / float(total_attempts) if total_attempts > 0 else 0.0
+        ) # 所有扰动尝试中，不合法尝试的比例（不是“最终整样本是否回退”的比例）; 其大小反映了当前扰动机制碰到约束边界的频率
+        self._last_final_fallback_rate = float((~accepted_mask).to(dtype=torch.float32).mean().item())
+        # 单个bacth中回退为经验池原样本的占比; 若低于前者说明有限次重采样增加了扰动成功率
+        self._last_mean_changed_param_ratio = float(changed_mask.to(dtype=torch.float32).mean().item())
+        # “参数级”的变化比例，在 batch 的所有“连续 context 参数槽位”里，最终和基样本槽位不同的比例。反映最终 batch 和经验池相比有多“新”。如果较高，说明这批训练输入并不是大量原样本拷贝，而是大部分连续参数槽位都发生了变化。
+        return sampled_context
 
     def _generate_batch(self) -> torch.Tensor:
         indices = torch.randint(0, self.pool_size, (self.batch_size,), generator=self.rng, device=self.device)
@@ -192,9 +247,16 @@ class StateDataSampler:
             "batch_size": int(self.batch_size),
             "jitter_ratio": float(self.jitter_ratio),
             "jitter_prob": float(self.jitter_prob),
-            "continuous_context_names": [
-                self.context_params[idx]["name"] for idx in self.context_cont_local_indices
-            ],
+            "jitter_max_attempts": int(self.jitter_max_attempts),
+            "jitter_min_active_dims": int(self.jitter_min_active_dims),
+            "continuous_context_names": list(self.context_cont_names),
+        }
+
+    def get_last_sampling_stats(self) -> dict:
+        return {
+            "attempt_rejection_rate": float(self._last_attempt_rejection_rate),
+            "final_fallback_rate": float(self._last_final_fallback_rate),
+            "mean_changed_param_ratio": float(self._last_mean_changed_param_ratio),
         }
 
     def get_distribution_reference(

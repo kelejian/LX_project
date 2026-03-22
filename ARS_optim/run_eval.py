@@ -28,11 +28,13 @@ from common.settings import FEATURE_ORDER, NORMALIZATION_CONFIG_PATH, RAW_DATA_D
 from common.tools.logger import setup_logger
 from common.tools.seeding import set_random_seed
 
+from InjuryPredict.utils.tools import convert_numpy_types
+
 from ARS_optim.src.constraints import ConstraintEngine
 from ARS_optim.src.data_sampler import StateDataSampler
 from ARS_optim.src.optimizer import LocalRefiner
 from ARS_optim.src.param_manager import ParamManager
-from ARS_optim.src.strategy_net import build_strategy_net_from_config
+from ARS_optim.src.strategy_net import build_strategy_net_from_config, load_strategy_run_config
 from ARS_optim.src.surrogate import SurrogateAdapter, load_surrogate_models
 
 
@@ -57,9 +59,9 @@ TRUE_VS_METRIC_NAMES = ("HIC", "Dmax", "Nij")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ARS Local Refinement Evaluator")
-    parser.add_argument("--input_csv", type=str, default=None, help="输入工况参数 CSV；若不提供则自动使用 injury test split")
+    parser.add_argument("--input_csv", type=str, default=None, help="输入工况参数 CSV 的绝对路径；若不提供则自动使用 injury test split")
     parser.add_argument("--output_csv", type=str, default="evaluation_results.csv", help="输出 CSV 文件名")
-    parser.add_argument("--strategy_ckpt", type=str, default=None, help="策略网络权重路径")
+    parser.add_argument("--strategy_ckpt", type=str, default=None, help="策略网络权重绝对路径")
     parser.add_argument("--direct_inference", action="store_true", help="强制启用策略网络直推")
     return parser.parse_args()
 
@@ -93,10 +95,39 @@ def _resolve_strategy_ckpt(args, base_dir: Path, config: Dict) -> Optional[Path]
     return None
 
 
+def _assert_strategy_runtime_compatibility(
+    current_param_space_path: Path,
+    current_normalization_path: Path,
+    strategy_artifacts: Dict[str, Path],
+) -> None:
+    """确保当前评估运行环境与策略权重保存时的结构性配置一致。
+
+    策略网络不仅依赖 `config.yaml` 里的层参数，还隐式依赖：
+    - `param_space.yaml` 中的 context/trainable 角色划分与输出维度；
+    - `normalization_config.json` 中的离散特征类别定义。
+
+    因此评估阶段若继续使用当前工作区里的不同版本配置，会出现
+    “权重来自 A 目录，但网络结构按 B 配置重建”的隐性错配。
+    这里直接做严格比对，不做静默 fallback。
+    """
+    comparisons = (
+        ("param_space", current_param_space_path, strategy_artifacts["param_space"]),
+        ("normalization_config", current_normalization_path, strategy_artifacts["normalization_config"]),
+    )
+    for label, current_path, saved_path in comparisons:
+        if current_path.read_bytes() != saved_path.read_bytes():
+            raise ValueError(
+                f"当前 {label} 与策略权重目录中的快照不一致。\n"
+                f"current: {current_path}\n"
+                f"saved: {saved_path}\n"
+                "请切换到与该策略权重配套的配置后再评估。"
+            )
+
+
 def _copy_config_snapshots(cfg_path: Path, param_space_path: Path, output_dir: Path) -> Dict[str, str]:
-    config_dir = output_dir / "configs"
+    config_dir = output_dir / "configs_used"
     config_dir.mkdir(parents=True, exist_ok=False)
-    cfg_snapshot = config_dir / "config_used.yaml"
+    cfg_snapshot = config_dir / "config.yaml"
     param_snapshot = config_dir / "param_space.yaml"
     norm_snapshot = config_dir / "normalization_config.json"
     shutil.copy2(str(cfg_path), str(cfg_snapshot))
@@ -441,7 +472,7 @@ def _compute_predictions_batch(
         return torch.cat(parts, dim=0) if parts else torch.full((sample_count,), float("nan"), device=device)
 
     batch_starts = range(0, sample_count, eval_batch_size)
-    for start in tqdm(batch_starts, total=(sample_count + eval_batch_size - 1) // eval_batch_size, desc="Evaluating Cases"):
+    for start in tqdm(batch_starts, total=(sample_count + eval_batch_size - 1) // eval_batch_size, desc="Evaluating batches"):
         end = min(start + eval_batch_size, sample_count)
         context_batch = context_tensor[start:end]
         baseline_batch = baseline_trainable[start:end]
@@ -757,7 +788,7 @@ def _build_evaluation_record(
     stage_outputs: Dict[str, object],
     evaluated_case_count: int,
 ) -> Dict[str, object]:
-    return {
+    record = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "output_dir": str(output_dir),
         "output_csv": str(output_csv_path),
@@ -798,6 +829,9 @@ def _build_evaluation_record(
             "trajectory_steps_logged": len(stage_outputs["trajectory_all"]),
         },
     }
+    # summary_metrics / top_cases / distribution_penalty 里可能混入 np.float32、np.int64 等标量；
+    # 这里统一在导出前递归转成原生 Python 类型，避免 YAML 序列化阶段再因单个字段失败。
+    return convert_numpy_types(record)
 
 def main():
     args = parse_args()
@@ -866,16 +900,30 @@ def main():
             raise ValueError("direct_inference=True 时必须显式提供 strategy_checkpoint 或 --strategy_ckpt")
         if not strategy_ckpt_path.is_file():
             raise FileNotFoundError(f"策略权重不存在: {strategy_ckpt_path}")
+        # 策略网络的层参数不能再从当前工作区配置里重建，
+        # 必须回到该权重所属训练目录的 configs_used/config.yaml，
+        # 否则会出现“权重来自旧实验，结构却按新配置重建”的隐性错配。
+        strategy_config, strategy_artifacts = load_strategy_run_config(strategy_ckpt_path)
+        _assert_strategy_runtime_compatibility(
+            current_param_space_path=param_space_path,
+            current_normalization_path=NORMALIZATION_CONFIG_PATH,
+            strategy_artifacts=strategy_artifacts,
+        )
+        logger.info("策略网络结构配置来自: %s", strategy_artifacts["config"])
         strategy_net = build_strategy_net_from_config(
             param_manager=param_manager,
             constraint_engine=constraint_engine,
             data_processor=data_processor,
-            config=config,
+            config=strategy_config,
         ).to(device)
         try:
             strategy_net.load_state_dict(torch.load(str(strategy_ckpt_path), map_location=device, weights_only=True))
+            logger.info("策略网络权重加载成功: %s", str(strategy_ckpt_path))
         except Exception as exc:
-            raise RuntimeError(f"策略权重与当前参数空间不兼容: {strategy_ckpt_path}") from exc
+            raise RuntimeError(
+                "策略权重与其权重目录中的结构配置不兼容，无法完成加载: "
+                f"{strategy_ckpt_path}"
+            ) from exc
 
     optimizer = LocalRefiner(
         config=config,

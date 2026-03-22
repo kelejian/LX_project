@@ -33,7 +33,7 @@ def load_surrogate_models(config: dict, device: torch.device) -> Tuple[HybridPul
     """
     surrogate_cfg = config.get("surrogate", {})
 
-    pulse_ckpt_path = _resolve_checkpoint_path(Path(PULSE_PREDICT_DIR), surrogate_cfg.get("pulse_checkpoint", ""))
+    pulse_ckpt_path = _resolve_checkpoint_path(Path(PULSE_PREDICT_DIR), surrogate_cfg.get("pulse_ckpt_rel_path", ""))
     if not pulse_ckpt_path.is_file():
         raise FileNotFoundError(f"pulse model checkpoint not found: {pulse_ckpt_path}")
     pulse_config_path = pulse_ckpt_path.parent / "config.json"
@@ -46,21 +46,23 @@ def load_surrogate_models(config: dict, device: torch.device) -> Tuple[HybridPul
         raise ValueError(f"Pulse arch type 非 HybridPulseCNN: {pulse_arch.get('type')}")
     pulse_model = HybridPulseCNN(**pulse_arch.get("args", {})).to(device)
     pulse_ckpt = torch.load(str(pulse_ckpt_path), map_location=device, weights_only=False)
+    print("[surrogate]: Loaded PulsePredict checkpoint from:", pulse_ckpt_path)
     pulse_model.load_state_dict(pulse_ckpt["state_dict"])
 
-    injury_ckpt_path = _resolve_checkpoint_path(Path(INJURY_PREDICT_DIR), surrogate_cfg.get("checkpoint_rel_path", ""))
+    injury_ckpt_path = _resolve_checkpoint_path(Path(INJURY_PREDICT_DIR), surrogate_cfg.get("injury_ckpt_rel_path", ""))
     if not injury_ckpt_path.is_file():
         raise FileNotFoundError(f"injury model checkpoint not found: {injury_ckpt_path}")
-    training_record_path = injury_ckpt_path.parent / "TrainingRecord.json"
-    if not training_record_path.is_file():
-        raise FileNotFoundError(f"Injury checkpoint 同目录缺少 TrainingRecord.json: {training_record_path}")
-    with open(training_record_path, "r", encoding="utf-8") as file:
+    injury_training_record_path = injury_ckpt_path.parent / "TrainingRecord.json"
+    if not injury_training_record_path.is_file():
+        raise FileNotFoundError(f"Injury checkpoint 同目录缺少 TrainingRecord.json: {injury_training_record_path}")
+    with open(injury_training_record_path, "r", encoding="utf-8") as file:
         training_record = json.load(file)
     model_args = training_record.get("hyperparameters", {}).get("model")
     if model_args is None:
-        raise ValueError(f"TrainingRecord.json 缺少 hyperparameters.model: {training_record_path}")
+        raise ValueError(f"TrainingRecord.json 缺少 hyperparameters.model: {injury_training_record_path}")
     injury_model = InjuryPredictModel(**model_args).to(device)
     injury_model.load_state_dict(torch.load(str(injury_ckpt_path), map_location=device, weights_only=False))
+    print("[surrogate]: Loaded InjuryPredict checkpoint from:", injury_ckpt_path)
     return pulse_model, injury_model
 
 

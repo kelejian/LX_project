@@ -17,7 +17,7 @@ import pandas as pd
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-from common.settings import FEATURE_ORDER, INJURY_PROCESSED_DIR, RAW_DATA_DIR
+from common.settings import FEATURE_ORDER, INJURY_PROCESSED_DIR, RAW_DATA
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from common.tools.seeding import set_random_seed
 
@@ -35,15 +35,7 @@ RUN_DIR = Path(RUNS_DIR) / "InjuryPredictModel_KFold_03131040"
 FOLD = Path("Fold_1") # 可以指定K折中的某一折，例如 Path("Fold_1")，如果没有K折划分则保持 Path("")
 WEIGHT_FILE = FOLD / Path("best_val_loss.pth")
 
-# 1.3) 原始打包数据文件路径
-# 作用: 从项目内 raw_packed.npz 恢复每条样本的原始标量特征值与 pulse_source_case_id。
-RAW_PACKED_FILE = (RAW_DATA_DIR / "raw_data_packed.npz").as_posix()
-
-# 1.4) 存放 .pt 数据集的目录
-DATA_DIR = INJURY_PROCESSED_DIR.as_posix()
-
 # --- 结束配置 ---
-
 
 def load_original_features(raw_packed_path: str) -> pd.DataFrame:
     """从 raw_packed.npz 恢复原始标量特征与 case 映射。"""
@@ -372,7 +364,7 @@ if __name__ == "__main__":
     set_random_seed()
     
     # 1. 从项目内 raw_packed 恢复原始13个标量特征
-    original_features_df = load_original_features(RAW_PACKED_FILE)
+    original_features_df = load_original_features((RAW_DATA).as_posix()) # 从项目内 原始打包数据(.npz文件) 恢复每条样本的原始标量特征值与 pulse_source_case_id。
     
     # 2. 加载模型、完整数据集和 case_id 映射
     model, full_dataset, device, case_id_map = load_model_and_data(RUN_DIR, WEIGHT_FILE)

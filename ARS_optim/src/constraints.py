@@ -264,6 +264,50 @@ class ConstraintEngine:
         overlap = context_params[:, self._context_overlap_local_idx]
         return self._get_overlap_angle_special_mask(overlap, lower_tol=0.0)
 
+    def build_context_jitter_mask(self, context_params: torch.Tensor) -> torch.Tensor:
+        """构造 context 输入端允许被扰动的按列掩码。
+
+        这里集中编码训练采样阶段的“可扰动自由度”语义：
+        - 连续 context 列默认允许扰动；
+        - overlap-angle 特殊带内冻结这两个变量；
+        - 若某个 (side, OT) 对应的 seat_constraints 在某一轴上退化成零宽区间，
+          则该轴在输入端没有真实自由度，不应再被高斯噪声强行扰动。
+
+        返回值与 context_params 同形状；离散列天然为 False。
+        """
+        x = self._ensure_2d(context_params, len(self.context_indices), "context_params")
+        mask = torch.zeros_like(x, dtype=torch.bool)
+
+        for local_idx, param in enumerate(self.context_params):
+            if param.get("type") == "continuous":
+                mask[:, local_idx] = True
+
+        protected_rows = self.should_freeze_overlap_angle_jitter(x)
+        if protected_rows.any():
+            mask[protected_rows, self._context_overlap_local_idx] = False
+            mask[protected_rows, self._context_angle_local_idx] = False
+
+        if not self._all_present(
+            self._context_side_local_idx,
+            self._context_ot_local_idx,
+            self._context_sp_local_idx,
+            self._context_sh_local_idx,
+        ):
+            return mask
+
+        side, ot = self._get_context_side_ot_codes(x)
+        for (rule_side, rule_ot), info in self.seat_cache.items():
+            row_mask = (side == rule_side) & (ot == rule_ot)
+            if not row_mask.any():
+                continue
+            sp_min, sp_max, sh_min, sh_max = info["bbox"]
+            if abs(sh_max - sh_min) <= self._tol:
+                mask[row_mask, self._context_sh_local_idx] = False
+            if abs(sp_max - sp_min) <= self._tol:
+                mask[row_mask, self._context_sp_local_idx] = False
+
+        return mask
+
     def _replace_column(self, x: torch.Tensor, column_idx: int, new_column: torch.Tensor) -> torch.Tensor:
         x_new = x.clone()
         x_new[:, column_idx] = new_column

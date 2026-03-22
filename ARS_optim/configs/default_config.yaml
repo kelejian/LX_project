@@ -10,10 +10,10 @@ seed: 123
 device: "cuda"
 
 surrogate:
-  # PulsePredict 最优权重，相对 PulsePredict 根目录解析。
-  pulse_checkpoint: "saved/models/HybridPulseCNN/0303_213959/model_best.pth"
-  # InjuryPredict 最优权重，相对 InjuryPredict 根目录解析。
-  checkpoint_rel_path: "runs/InjuryPredictModel_03032051/best_val_loss.pth"
+  # PulsePredict 最优权重，相对 PULSE_PREDICT_DIR 根目录解析。
+  pulse_ckpt_rel_path: "saved/models/HybridPulseCNN/0303_213959/model_best.pth"
+  # InjuryPredict 最优权重，相对 INJURY_PREDICT_DIR 根目录解析。
+  injury_ckpt_rel_path: "runs/PS_InjuryPredictModel_03220130/best_val_loss.pth"
 
 strategy_net:
   # 波形编码器输入通道数。当前代理链路输出为二维碰撞加速度波形。
@@ -37,8 +37,8 @@ strategy_net:
   train:
     # 自监督训练采用无限数据流，因此不使用 epoch，而用最大迭代步数停止。
     batch_size: 1024
-    max_iterations: 20000
-    lr: 2.0e-4
+    max_iterations: 10000
+    lr: 3.0e-4
     weight_decay: 1.0e-4
     log_interval: 10
     save_best: true
@@ -50,19 +50,21 @@ strategy_net:
       type: "cosine"
       # 当 type=cosine 时，T_max 可写整数，也可写 "max_iters"。
       T_max: "max_iters" # "max_iters" 表示与本段 max_iterations 保持一致，避免手动重复维护两份迭代上限。
-      eta_min: 1.0e-5
+      eta_min: 0.0
       # 当 type=step 时，按 schedule_step_size 步长衰减 lr，gamma 是衰减率。
       step_size: 400
       gamma: 0.5
 
-    val_interval: 500 # 每隔多少个 iteration 在 injury_val 固定切片上做一次完整验证。
+    val_interval: 200 # 每隔多少个 iteration 在 injury_val 固定切片上做一次完整验证。
     val_batch_size: 1024 # 验证阶段批大小，不影响实际评估语义。
     gradient_clip_max_norm: 2.0 # 梯度裁剪最大范数，抑制训练初期不稳定的梯度爆炸。
 
     # 训练流来自 injury_train 经验池 + 合法扰动。
     # 扰动后的样本若破坏 base 范围或耦合约束，会整行回退原样本。
     jitter_ratio: 0.01
-    jitter_prob: 1.0
+    jitter_prob: 1.0 # 在“允许扰动”的连续 context 维度里，每一维被激活扰动的概率。
+    jitter_max_attempts: 3 # 每个基样本最多做几次独立扰动尝试，降低整样本完全回退率。
+    jitter_min_active_dims: 1 # 每次尝试至少激活多少个允许扰动的连续 context 维度，避免试探样本与基样本完全相同。
 
     # TensorBoard 文件会单独写到本次训练目录下的 tensorboard/ 子目录。
     tensorboard: true
@@ -81,9 +83,9 @@ optimization:
   direct_inference: true
 
   # 局部精调步数。=0 时不生成 Opt2。
-  refine_steps: 2000
+  refine_steps: 100
   # Adam 在无量纲潜空间 z 上的初始学习率。
-  lr: 0.005
+  lr: 1e-4
 
   scheduler:
     # 局部精调全程都使用这里定义的学习率调度器，避免后期震荡。
@@ -98,11 +100,11 @@ optimization:
     gamma: 0.5
 
   objectives:
-    weight_hic: 2.0
+    weight_hic: 3.0
     weight_dmax: 1.0
     weight_nij: 1.0
     # 物理约束软惩罚权重，作用于投影前的原始游离解。
-    weight_penalty: 10.0
+    weight_penalty: 0.2
 
   distribution_penalty:
     # 合法域内的分布偏离惩罚，抑制解落入训练经验池未覆盖的空洞区域。

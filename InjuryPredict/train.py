@@ -166,7 +166,7 @@ if __name__ == "__main__":
     if Patience > Epochs: Patience = Epochs
 
     # 加载数据集对象
-
+    print(f".pt 数据文件路径: {INJURY_PROCESSED_DIR}/*.pt")
     train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
     val_pt = INJURY_PROCESSED_DIR / "val_dataset.pt"
     if not (train_pt.exists() and val_pt.exists()):
@@ -174,7 +174,9 @@ if __name__ == "__main__":
             f"找不到训练数据 ({INJURY_PROCESSED_DIR}/*.pt)。请先运行: python -m InjuryPredict.Injurydata_prepare"
         )
     train_dataset = load_processed_subset(train_pt)
+    print(f"训练集大小: {len(train_dataset)}")
     val_dataset = load_processed_subset(val_pt)
+    print(f"验证集大小: {len(val_dataset)}")
     train_loader = DataLoader(train_dataset, batch_size=Batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=Batch_size, shuffle=False, num_workers=0) 
 

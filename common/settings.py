@@ -1,6 +1,4 @@
 from pathlib import Path
-import os
-
 ''' 设置数据集特征相关的常量, 规范数据接口 '''
 FEATURE_ORDER = [
     "impact_velocity", "impact_angle", "overlap",
@@ -33,15 +31,11 @@ WAVEFORM_CHANNELS_XYZ = 3  # XYZ 三轴
 
 # ================================================================
 ''' 设置项目中的关键路径 '''
-# Project Root (LX_project/)
-# 保证此文件位于 LX_project/common/settings.py
-_DEFAULT_ROOT = Path(__file__).resolve().parent.parent
-
-# 允许使用环境变量覆盖（便于多机/多目录部署）
-ROOT_DIR = Path(os.environ.get("LX_PROJECT_ROOT", _DEFAULT_ROOT))
+# 默认settings.py所在路径为项目根目录下的 common/，因此 ROOT_DIR 定义为 settings.py 的父目录的父目录，即项目根目录。
+ROOT_DIR = Path(__file__).resolve().parent.parent 
 
 # 数据目录
-DATA_DIR = Path(os.environ.get("LX_DATA_DIR", ROOT_DIR / "data_DS"))
+DATA_DIR = ROOT_DIR / "data_PS" # 数据目录路径，供全局使用；子项目内也可通过 common.settings.DATA_DIR 访问
 RAW_DATA_DIR = DATA_DIR / "raw_packed"
 RAW_DATA = RAW_DATA_DIR / "raw_data_packed.npz" # 打包后的原始数据文件路径
 SPLIT_INDICES_DIR = DATA_DIR / "split_indices"
@@ -59,11 +53,12 @@ INJURY_PREDICT_DIR = ROOT_DIR / "InjuryPredict"
 ARS_OPTIM_DIR = ROOT_DIR / "ARS_optim"
 
 def get_paths():
-    """获取路径字典（不产生副作用）。"""
+    """获取路径字典。"""
     return {
         "root": ROOT_DIR,
         "data": DATA_DIR,
-        "raw_packed": RAW_DATA_DIR,
+        "raw_packed_dir": RAW_DATA_DIR,
+        "raw_packed_data": RAW_DATA,
         "split_indices": SPLIT_INDICES_DIR,
         "processed": PROCESSED_DATA_DIR,
         "injury_processed": INJURY_PROCESSED_DIR,

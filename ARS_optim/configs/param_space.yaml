@@ -69,7 +69,7 @@ parameters:
     base_max: 100.0
     opt_min: 10.0
     opt_max: 100.0
-    trainable: True # trainable=True 时参与摊销优化与局部精调
+    trainable: True
     default: 20.0
 
   - name: "LLATTF"

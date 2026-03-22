@@ -22,7 +22,6 @@ warnings.filterwarnings('ignore')
 import argparse
 import json
 import re
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -34,25 +33,19 @@ import numpy as np
 import pandas as pd
 import torch
 
-os.environ["FOR_DISABLE_CONSOLE_CTRL_HANDLER"] = "T"
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from common.data_utils.processor import UnifiedDataProcessor
 from common.metrics import AIS_cal_chest, AIS_cal_head, AIS_cal_neck
-from common.settings import DATA_DIR, FEATURE_ORDER, NORMALIZATION_CONFIG_PATH, WAVEFORM_LENGTH
+from common.settings import DATA_DIR, PULSE_PREDICT_DIR, INJURY_PREDICT_DIR, FEATURE_ORDER, NORMALIZATION_CONFIG_PATH, WAVEFORM_LENGTH
 from InjuryPredict.utils.models import InjuryPredictModel
 from PulsePredict.model.model import HybridPulseCNN
 
 
 DEFAULT_OUTPUT_ROOT = DATA_DIR / "inference_outputs"
-DEFAULT_PULSE_RUN_DIR = PROJECT_ROOT / "PulsePredict" / "saved" / "models" / "HybridPulseCNN" / "0303_213959"
-DEFAULT_INJURY_RUN_DIR = PROJECT_ROOT / "InjuryPredict" / "runs" / "InjuryPredictModel_03032051"
+DEFAULT_PULSE_RUN_DIR = PULSE_PREDICT_DIR / "saved" / "models" / "HybridPulseCNN" / "0303_213959"
+DEFAULT_INJURY_RUN_DIR = INJURY_PREDICT_DIR / "runs" / "DS_InjuryPredictModel_03212058"
 PULSE_FEATURE_NAMES = ["impact_velocity", "impact_angle", "overlap"]
 
-INPUT_CSV_FILE = Path(r"E:\\WPS Office\\1628575652\\WPS企业云盘\\清华大学\\我的企业文档\\课题组相关\\理想项目\\TestInput_.csv")  # 可在此处修改输入CSV路径，或通过命令行参数覆盖
+INPUT_CSV_FILE = Path(r"E:\\WPS Office\\1628575652\\WPS企业云盘\\清华大学\\我的企业文档\\课题组相关\\理想项目\\TestInput.csv")  # 可在此处修改输入CSV路径，或通过命令行参数覆盖
 
 def parse_args() -> argparse.Namespace:
     # 解析命令行参数，返回一个命名空间对象
@@ -104,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
-        default="auto",
+        default="cuda",
         help="Inference device.",
     )
     parser.add_argument(

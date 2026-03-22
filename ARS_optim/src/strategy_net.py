@@ -1,4 +1,7 @@
-from typing import List, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import yaml
 
 import torch
 import torch.nn as nn
@@ -36,6 +39,43 @@ def build_strategy_net_from_config(
         dropout_mlp=float(strat_cfg.get("dropout_mlp", 0.1)),
         dropout_tcn=float(strat_cfg.get("dropout_tcn", 0.0)),
     )
+
+
+def resolve_strategy_run_artifacts(strategy_ckpt_path: Path) -> Dict[str, Path]:
+    """根据策略权重路径定位同一次训练保存的配置快照。"""
+    strategy_ckpt_path = Path(strategy_ckpt_path).resolve()
+    if not strategy_ckpt_path.is_file():
+        raise FileNotFoundError(f"策略权重不存在: {strategy_ckpt_path}")
+
+    run_dir = strategy_ckpt_path.parent.parent
+    configs_dir = run_dir / "configs_used"
+    config_path = configs_dir / "config.yaml"
+    param_space_path = configs_dir / "param_space.yaml"
+    normalization_path = configs_dir / "normalization_config.json"
+
+    for path, label in (
+        (config_path, "config.yaml"),
+        (param_space_path, "param_space.yaml"),
+        (normalization_path, "normalization_config.json"),
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(f"策略权重目录缺少 {label}: {path}")
+
+    return {
+        "run_dir": run_dir,
+        "configs_dir": configs_dir,
+        "config": config_path,
+        "param_space": param_space_path,
+        "normalization_config": normalization_path,
+    }
+
+
+def load_strategy_run_config(strategy_ckpt_path: Path) -> Tuple[Dict[str, Any], Dict[str, Path]]:
+    """读取策略权重所属运行目录中的配置快照。"""
+    artifacts = resolve_strategy_run_artifacts(strategy_ckpt_path)
+    with open(artifacts["config"], "r", encoding="utf-8") as file:
+        saved_config = yaml.safe_load(file)
+    return saved_config, artifacts
 
 
 class PulseTCNEncoder(nn.Module):
@@ -131,6 +171,7 @@ class StrategyNet(nn.Module):
 
         self.context_names = self.param_manager.get_context_names()
         self.trainable_params = self.param_manager.get_trainable_params()
+        self.trainable_params_names = self.param_manager.get_trainable_names()
         self.context_dim = self.param_manager.get_context_dim()
         self.output_dim = self.param_manager.get_trainable_dim()
         if self.output_dim == 0:
@@ -206,6 +247,7 @@ class StrategyNet(nn.Module):
             "mlp_encoder_output_dim": int(mlp_encoder_output_dim),
             "mlp_decoder_output_dim": int(mlp_decoder_output_dim),
             "output_dim": self.output_dim,
+            "output_trainable_params": list(self.trainable_params_names),
         }
 
         self._initialize_weights()

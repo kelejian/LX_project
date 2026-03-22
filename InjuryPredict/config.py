@@ -7,13 +7,13 @@ RUNS_DIR = "./InjuryPredict/runs"  # 模型训练结果的保存目录
 
 # 1. 优化与训练相关
 training_params = {
-    "Epochs": 360,
+    "Epochs": 400,
     "Batch_size": 64,
     "Learning_rate": 0.005,
     "Learning_rate_min": 0,
     "weight_decay": 0.1,
-    "early_stop_start_epochs": 250, # 早停开始轮数
-    "Patience": 75, # 早停轮数
+    "early_stop_start_epochs": 300, # 早停开始轮数
+    "Patience": 60, # 早停轮数
 }
 
 # 2. 损失函数相关

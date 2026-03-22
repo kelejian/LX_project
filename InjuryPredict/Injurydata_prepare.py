@@ -26,12 +26,35 @@ from torch.utils.data import Dataset, Subset
 import matplotlib.pyplot as plt
 
 from common.settings import (
-    RAW_DATA_DIR, SPLIT_INDICES_DIR, NORMALIZATION_CONFIG_PATH,
+    RAW_DATA, SPLIT_INDICES_DIR, NORMALIZATION_CONFIG_PATH,
     INJURY_PROCESSED_DIR, ensure_dirs
 )
 from common.data_utils.processor import UnifiedDataProcessor
 from common.data_utils.split_io import load_int_vector_csv
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
+
+
+# --------------------- CLI ---------------------
+def main(argv=None):
+    p = argparse.ArgumentParser(description="生成 InjuryPredict 所需的 .pt 数据集并输出统计图（使用 common.UnifiedDataProcessor）。\n注意：此脚本严格依赖由根目录的 prepare_data.py 预先生成的 raw_packed、split_indices 与 normalization_config.json；若缺失将直接报错。")
+    p.add_argument("--raw-npz", default=(RAW_DATA), type=Path,
+                   help="由 prepare_data.py 生成的原始打包文件（默认来自 common settings）")
+    p.add_argument("--norm-config", default=NORMALIZATION_CONFIG_PATH, type=Path, help="归一化配置文件路径（默认来自 common settings）")
+    p.add_argument("--split-dir", default=SPLIT_INDICES_DIR, type=Path, help="split indices 目录（默认来自 common settings）")
+    p.add_argument("--out-dir", default=INJURY_PROCESSED_DIR, type=Path, help="输出目录（默认来自 common settings）")
+    p.add_argument("--overwrite", action="store_true", help="覆盖已存在的train/val/test.pt 输出文件; 不设置则默认保护现有文件不被覆盖")
+
+    args = p.parse_args(argv)
+
+    paths = build_and_save_splits(
+        raw_packed=Path(args.raw_npz),
+        norm_config=Path(args.norm_config),
+        split_dir=Path(args.split_dir),
+        out_dir=Path(args.out_dir),
+        overwrite=args.overwrite,
+    )
+    return paths
+
 
 # --------------------- 辅助 Dataset（轻量） ---------------------
 class InjuryPackedDataset(Dataset):
@@ -342,29 +365,6 @@ def convert_numpy_for_json(obj):
     if isinstance(obj, dict):
         return {int(k): int(v) for k, v in obj.items()}
     return obj
-
-
-# --------------------- CLI ---------------------
-def main(argv=None):
-    p = argparse.ArgumentParser(description="生成 InjuryPredict 所需的 .pt 数据集并输出统计图（使用 common.UnifiedDataProcessor）。\n注意：此脚本严格依赖由根目录的 prepare_data.py 预先生成的 raw_packed、split_indices 与 normalization_config.json；若缺失将直接报错。")
-    p.add_argument("--raw-npz", default=(RAW_DATA_DIR / "raw_data_packed.npz"), type=Path,
-                   help="由 prepare_data.py 生成的原始打包文件（默认来自 common settings）")
-    p.add_argument("--norm-config", default=NORMALIZATION_CONFIG_PATH, type=Path, help="归一化配置文件路径（默认来自 common settings）")
-    p.add_argument("--split-dir", default=SPLIT_INDICES_DIR, type=Path, help="split indices 目录（默认来自 common settings）")
-    p.add_argument("--out-dir", default=INJURY_PROCESSED_DIR, type=Path, help="输出目录（默认来自 common settings）")
-    p.add_argument("--overwrite", action="store_true", help="覆盖已存在的train/val/test.pt 输出文件; 不设置则默认保护现有文件不被覆盖")
-
-    args = p.parse_args(argv)
-
-    paths = build_and_save_splits(
-        raw_packed=Path(args.raw_npz),
-        norm_config=Path(args.norm_config),
-        split_dir=Path(args.split_dir),
-        out_dir=Path(args.out_dir),
-        overwrite=args.overwrite,
-    )
-    return paths
-
 
 if __name__ == '__main__':
     main()

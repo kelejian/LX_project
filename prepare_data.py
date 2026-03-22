@@ -11,7 +11,7 @@ import pandas as pd
 
 from common.tools.seeding import GLOBAL_SEED
 from common.settings import REQUIRED_COLUMNS_FOR_PACKING, FEATURE_ORDER
-from common.settings import RAW_DATA_DIR, RAW_DATA, SPLIT_INDICES_DIR, NORMALIZATION_CONFIG_PATH, ensure_dirs
+from common.settings import RAW_DATA, RAW_DATA, SPLIT_INDICES_DIR, NORMALIZATION_CONFIG_PATH, ensure_dirs
 from common.settings import WAVEFORM_LENGTH, WAVEFORM_CHANNELS_XY, WAVEFORM_CHANNELS_XYZ
 from common.data_utils.splitter import stratified_split_case_ids, case_ids_to_indices
 from common.data_utils.processor import UnifiedDataProcessor
@@ -549,22 +549,23 @@ def generate_splits(
 def main():
     parser = argparse.ArgumentParser(description="准备数据：raw_packed打包 + injury/pulse两套索引划分")
     parser.add_argument("--distribution", type=str, 
-                        default=r'E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0312.csv',  
+                        default=r'E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0321.csv',  
                         help="distribution .csv/.npz 路径")
     parser.add_argument("--pulse-dir", type=str, 
                         default=r'G:\VCS_acc_data\acc_data_before1111_6134', 
                         help="波形CSV目录（包含x*.csv/y*.csv/z*.csv）")
+    #--------------------------------------------------------------------------------------
+    parser.add_argument("--side", type=str, default="both", help="选择打包哪一侧样本: DS(主驾) | PS(副驾) | both(主副驾)")
+    parser.add_argument("--train-ratio", type=float, default=0.8)
+    parser.add_argument("--val-ratio", type=float, default=0.1)
+    parser.add_argument("--test-ratio", type=float, default=0.1)
     #--------------------------------------------------------------------------------------
     parser.add_argument("--out-raw", type=str, 
                         default=str(RAW_DATA), 
                         help="输出raw_packed npz路径")
     parser.add_argument("--out-splits", type=str, default=str(SPLIT_INDICES_DIR), help="输出split_indices目录")
     parser.add_argument("--seed", type=int, default=GLOBAL_SEED, help="随机种子; 默认值为common/utils/seeding.py中的GLOBAL_SEED")
-    parser.add_argument("--train-ratio", type=float, default=0.8)
-    parser.add_argument("--val-ratio", type=float, default=0.1)
-    parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--non-strict", action="store_true", help="非严格模式：遇到缺失波形/异常case则跳过; 若无此标志则严格模式报错退出")
-    parser.add_argument("--side", type=str, default="both", help="选择打包哪一侧样本: DS(主驾) | PS(副驾) | both(主副驾)")
 
     args = parser.parse_args()
 
