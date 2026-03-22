@@ -13,7 +13,7 @@ surrogate:
   # PulsePredict 最优权重，相对 PULSE_PREDICT_DIR 根目录解析。
   pulse_ckpt_rel_path: "saved/models/HybridPulseCNN/0303_213959/model_best.pth"
   # InjuryPredict 最优权重，相对 INJURY_PREDICT_DIR 根目录解析。
-  injury_ckpt_rel_path: "runs/PS_InjuryPredictModel_03220130/best_val_loss.pth"
+  injury_ckpt_rel_path: "runs/DS_InjuryPredictModel_03212058/best_val_loss.pth"
 
 strategy_net:
   # 波形编码器输入通道数。当前代理链路输出为二维碰撞加速度波形。
@@ -104,7 +104,7 @@ optimization:
     weight_dmax: 1.0
     weight_nij: 1.0
     # 物理约束软惩罚权重，作用于投影前的原始游离解。
-    weight_penalty: 0.2
+    weight_penalty: 2.0
 
   distribution_penalty:
     # 合法域内的分布偏离惩罚，抑制解落入训练经验池未覆盖的空洞区域。

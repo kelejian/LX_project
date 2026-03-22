@@ -35,7 +35,7 @@ WAVEFORM_CHANNELS_XYZ = 3  # XYZ 三轴
 ROOT_DIR = Path(__file__).resolve().parent.parent 
 
 # 数据目录
-DATA_DIR = ROOT_DIR / "data_PS" # 数据目录路径，供全局使用；子项目内也可通过 common.settings.DATA_DIR 访问
+DATA_DIR = ROOT_DIR / "data_DS" # 数据目录路径，供全局使用；子项目内也可通过 common.settings.DATA_DIR 访问
 RAW_DATA_DIR = DATA_DIR / "raw_packed"
 RAW_DATA = RAW_DATA_DIR / "raw_data_packed.npz" # 打包后的原始数据文件路径
 SPLIT_INDICES_DIR = DATA_DIR / "split_indices"

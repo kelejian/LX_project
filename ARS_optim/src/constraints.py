@@ -42,6 +42,10 @@ class ConstraintEngine:
             for param in all_params
             if param.get("type") == "continuous"
         }
+        self.base_continuous_scales = {
+            idx: max(max_value - min_value, 1e-6)
+            for idx, (min_value, max_value) in self.base_continuous_bounds.items()
+        }
         self.output_continuous_bounds = {
             param["index"]: (
                 float(param["opt_min"]) if param.get("role") == "control" and bool(param.get("trainable", False)) else float(param["base_min"]),
@@ -58,6 +62,7 @@ class ConstraintEngine:
         trainable_bounds = param_manager.get_trainable_opt_bounds()
         self._trainable_mins_cpu = trainable_bounds[0]
         self._trainable_maxs_cpu = trainable_bounds[1]
+        self._trainable_spans_cpu = torch.clamp(self._trainable_maxs_cpu - self._trainable_mins_cpu, min=1e-6)
 
         coupling = self.rules.get("coupling", {})
         extra_output_constraints = self.rules.get("extra_output_constraints", {})
@@ -154,22 +159,6 @@ class ConstraintEngine:
                 polygon_ccw = polygon[::-1].copy()
 
             polygon_tensor = torch.tensor(polygon_ccw, dtype=torch.float32)
-            normals_tensor = None
-            if not is_degenerate:
-                edge_start = polygon_tensor
-                edge_end = torch.roll(polygon_tensor, shifts=-1, dims=0)
-                edges = edge_end - edge_start
-                # 先构造候选法线，再使用多边形质心统一校正方向，
-                # 保证内部点在所有边上的有符号距离都不为正。
-                normals_tensor = torch.stack([edges[:, 1], -edges[:, 0]], dim=1)
-                normals_tensor = normals_tensor / torch.clamp(
-                    torch.linalg.norm(normals_tensor, dim=1, keepdim=True),
-                    min=1e-12,
-                )
-                centroid = polygon_tensor.mean(dim=0, keepdim=True)
-                centroid_signed = torch.sum((centroid - edge_start) * normals_tensor, dim=1, keepdim=True)
-                flip_mask = centroid_signed > 0
-                normals_tensor = torch.where(flip_mask, -normals_tensor, normals_tensor)
 
             self.seat_cache[(side, ot)] = {
                 "poly": polygon_ccw,
@@ -177,7 +166,6 @@ class ConstraintEngine:
                 "bbox": (float(sp_min), float(sp_max), float(sh_min), float(sh_max)),
                 "is_degenerate": is_degenerate,
                 "polygon_tensor": polygon_tensor,
-                "normals_tensor": normals_tensor,
             }
 
         self.ra_range_cache: Dict[Tuple[int, int], Tuple[float, float]] = {}
@@ -418,11 +406,10 @@ class ConstraintEngine:
         points: torch.Tensor,
         polygon_tensor: torch.Tensor,
     ) -> torch.Tensor:
-        """把一批二维点投影到凸多边形边界上的最近位置。
+        """把一批二维点投影到任意简单多边形边界上的最近位置。
 
-        strict=False 路径也必须保证送入 surrogate 的候选解合法，因此这里不再退化为
-        仅做 bbox 裁剪，而是直接在 torch 里计算“点到所有边线段的最近点”并取最小值。
-        这样既能维持计算图，又能避免 bbox 内但多边形外的点漏过前向安全防护。
+        这里直接比较点到所有边线段的最近距离；该做法不依赖凸性，
+        因而能同时覆盖主驾 OT=1 这类凹多边形座椅可行域。
         """
         if points.ndim != 2 or points.shape[1] != 2:
             raise ValueError(f"points 形状应为 [N, 2]，实际为 {tuple(points.shape)}")
@@ -528,13 +515,8 @@ class ConstraintEngine:
 
             if sp_trainable and sh_trainable:
                 points = torch.stack([x_new[indices, self._sp_idx], x_new[indices, self._sh_idx]], dim=1)
-                penalty = self._polygon_halfplane_penalty(
-                    sp=points[:, 0],
-                    sh=points[:, 1],
-                    polygon_tensor=info["polygon_tensor"],
-                    normals_tensor=info["normals_tensor"],
-                )
-                outside_mask = penalty > self._tol
+                valid_local = self._validate_seat_points_numpy(points.detach().cpu().numpy(), info)
+                outside_mask = ~torch.as_tensor(valid_local, dtype=torch.bool, device=x_new.device)
                 if outside_mask.any():
                     projected = self._project_points_to_polygon_boundary_torch(
                         points[outside_mask],
@@ -632,25 +614,35 @@ class ConstraintEngine:
         valid[outside_local] = dist <= tol
         return valid
 
-    def _polygon_halfplane_penalty(
+    def _seat_polygon_distance_penalty(
         self,
         sp: torch.Tensor,
         sh: torch.Tensor,
-        polygon_tensor: torch.Tensor,
-        normals_tensor: torch.Tensor,
+        info: Dict[str, object],
     ) -> torch.Tensor:
-        """基于凸多边形半平面约束计算可微软惩罚。
+        """对任意简单多边形座椅可行域计算边界距离软惩罚。
 
-        对每条边，使用单位外法线计算点到该边支撑直线的有符号距离；
-        多边形内部及边界上距离均不为正，外部点在至少一条边上距离为正。
-        将所有正距离做 ReLU 后求和，既能区分 bbox 内但多边形外的区域，
-        又能保持全程 torch 张量计算，供训练阶段反向传播使用。
+        先复用 numpy 几何判定区分“域内/域外”样本；
+        对域外点，再用 torch 版最近边投影计算到边界的距离。
+        这样既兼容凹多边形，又能在域外保持可用梯度。
         """
         points = torch.stack([sp, sh], dim=1)
-        polygon = polygon_tensor.to(device=points.device, dtype=points.dtype)
-        normals = normals_tensor.to(device=points.device, dtype=points.dtype)
-        signed_distance = torch.einsum("bvd,vd->bv", points.unsqueeze(1) - polygon.unsqueeze(0), normals)
-        return torch.relu(signed_distance).sum(dim=1)
+        valid_local = self._validate_seat_points_numpy(points.detach().cpu().numpy(), info)
+        outside_mask = ~torch.as_tensor(valid_local, dtype=torch.bool, device=points.device)
+        penalty = torch.zeros(points.shape[0], device=points.device, dtype=points.dtype)
+        if not outside_mask.any():
+            return penalty
+
+        projected = self._project_points_to_polygon_boundary_torch(
+            points[outside_mask],
+            info["polygon_tensor"],
+        )
+        delta = (points[outside_mask] - projected).abs()
+        penalty[outside_mask] = (
+            delta[:, 0] / self.base_continuous_scales[self._sp_idx]
+            + delta[:, 1] / self.base_continuous_scales[self._sh_idx]
+        )
+        return penalty
 
     def _validate_full_features(
         self,
@@ -866,17 +858,30 @@ class ConstraintEngine:
         x = self._ensure_2d(full_features, self.total_dim, "full_features")
         penalty = torch.zeros(x.shape[0], device=x.device, dtype=x.dtype)
 
-        penalty += torch.relu((x[:, self._btf_idx] + self.aft_btf_extra_delta_min) - x[:, self._aft_idx])
-        penalty += torch.relu(x[:, self._aft_idx] - (x[:, self._btf_idx] + self.aft_btf_delta_max))
-        penalty += torch.relu((x[:, self._btf_idx] + self.llattf_btf_delta_min) - x[:, self._llattf_idx])
-        penalty += torch.relu(x[:, self._ll2_idx] - (x[:, self._ll1_idx] + self.ll2_ll1_delta_max))
+        penalty += (
+            torch.relu((x[:, self._btf_idx] + self.aft_btf_extra_delta_min) - x[:, self._aft_idx])
+            / self.base_continuous_scales[self._aft_idx]
+        )
+        penalty += (
+            torch.relu(x[:, self._aft_idx] - (x[:, self._btf_idx] + self.aft_btf_delta_max))
+            / self.base_continuous_scales[self._aft_idx]
+        )
+        penalty += (
+            torch.relu((x[:, self._btf_idx] + self.llattf_btf_delta_min) - x[:, self._llattf_idx])
+            / self.base_continuous_scales[self._llattf_idx]
+        )
+        penalty += (
+            torch.relu(x[:, self._ll2_idx] - (x[:, self._ll1_idx] + self.ll2_ll1_delta_max))
+            / self.base_continuous_scales[self._ll2_idx]
+        )
 
         if include_opt_bounds and self.trainable_indices:
             mins = self._trainable_mins_cpu.to(device=x.device, dtype=x.dtype)
             maxs = self._trainable_maxs_cpu.to(device=x.device, dtype=x.dtype)
+            spans = self._trainable_spans_cpu.to(device=x.device, dtype=x.dtype)
             trainable = x[:, self.trainable_indices]
-            penalty += torch.relu(mins.unsqueeze(0) - trainable).sum(dim=1)
-            penalty += torch.relu(trainable - maxs.unsqueeze(0)).sum(dim=1)
+            penalty += (torch.relu(mins.unsqueeze(0) - trainable) / spans.unsqueeze(0)).sum(dim=1)
+            penalty += (torch.relu(trainable - maxs.unsqueeze(0)) / spans.unsqueeze(0)).sum(dim=1)
 
         side = None
         ot = None
@@ -887,7 +892,9 @@ class ConstraintEngine:
                 if not mask.any():
                     continue
                 ra = x[mask, self._ra_idx]
-                penalty[mask] += torch.relu(ra_min - ra) + torch.relu(ra - ra_max)
+                penalty[mask] += (
+                    torch.relu(ra_min - ra) + torch.relu(ra - ra_max)
+                ) / self.base_continuous_scales[self._ra_idx]
 
         if self.seat_cache:
             if side is None or ot is None:
@@ -901,17 +908,12 @@ class ConstraintEngine:
                 sh = x[mask, self._sh_idx]
                 if info["is_degenerate"]:
                     penalty[mask] += (
-                        torch.relu(sp_min - sp)
-                        + torch.relu(sp - sp_max)
-                        + torch.relu(sh_min - sh)
-                        + torch.relu(sh - sh_max)
+                        torch.relu(sp_min - sp) / self.base_continuous_scales[self._sp_idx]
+                        + torch.relu(sp - sp_max) / self.base_continuous_scales[self._sp_idx]
+                        + torch.relu(sh_min - sh) / self.base_continuous_scales[self._sh_idx]
+                        + torch.relu(sh - sh_max) / self.base_continuous_scales[self._sh_idx]
                     )
                 else:
-                    penalty[mask] += self._polygon_halfplane_penalty(
-                        sp=sp,
-                        sh=sh,
-                        polygon_tensor=info["polygon_tensor"],
-                        normals_tensor=info["normals_tensor"],
-                    )
+                    penalty[mask] += self._seat_polygon_distance_penalty(sp=sp, sh=sh, info=info)
 
         return penalty.to(dtype=torch.float32)
