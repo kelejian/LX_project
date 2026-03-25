@@ -28,7 +28,7 @@ from InjuryPredict.utils.tools import (
 
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from common.tools.seeding import set_random_seed
-from common.settings import INJURY_PROCESSED_DIR
+from common.settings import get_injury_processed_dataset_path
 
 def test(model, loader):
     """
@@ -123,12 +123,18 @@ if __name__ == "__main__":
 
     model_params = training_record["hyperparameters"]["model"]
 
-    train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
-    val_pt = INJURY_PROCESSED_DIR / "val_dataset.pt"
+    train_pt = get_injury_processed_dataset_path("train")
+    val_pt = get_injury_processed_dataset_path("val")
+    test_pt = get_injury_processed_dataset_path("test")
     train_dataset = load_processed_subset(train_pt)
-    test_dataset1 = load_processed_subset(val_pt)
-    test_dataset2 = load_processed_subset(INJURY_PROCESSED_DIR / "test_dataset.pt")
-    test_dataset = ConcatDataset([test_dataset1, test_dataset2])
+    eval_subsets = []
+    for subset_path in (val_pt, test_pt):
+        subset = load_processed_subset(subset_path)
+        if len(subset) > 0:
+            eval_subsets.append(subset) # 只添加非空的验证集和测试集到评估列表中, 如果其中一个为空则只评估另一个，两个都不空则合并评估。
+    if not eval_subsets:
+        raise ValueError("val/test 数据集同时为空，eval_model 无可评估样本。")
+    test_dataset = eval_subsets[0] if len(eval_subsets) == 1 else ConcatDataset(eval_subsets)
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False, num_workers=0)
 
     print(f"加载 InjuryPredictModel 架构 (来自 {args.run_dir})")

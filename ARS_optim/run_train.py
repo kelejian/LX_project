@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from common.data_utils.processor import UnifiedDataProcessor
-from common.settings import NORMALIZATION_CONFIG_PATH, SPLIT_INDICES_DIR
+from common.settings import NORMALIZATION_CONFIG_PATH, get_split_indices_path
 from common.tools.logger import setup_logger
 from common.tools.seeding import set_random_seed
 
@@ -402,7 +402,7 @@ def main():
         batch_size=train_cfg["batch_size"],
         device=device,
         seed=seed,
-        split_indices_path=str(SPLIT_INDICES_DIR / "injury_train_indices.csv"),
+        split_indices_path=str(get_split_indices_path("injury", "train")),
         jitter_ratio=float(train_cfg.get("jitter_ratio", 0.01)),
         jitter_prob=float(train_cfg.get("jitter_prob", 1.0)),
         jitter_max_attempts=int(train_cfg.get("jitter_max_attempts", 1)),
@@ -414,7 +414,7 @@ def main():
         batch_size=val_batch_size,
         device=device,
         seed=seed,
-        split_indices_path=str(SPLIT_INDICES_DIR / "injury_val_indices.csv"),
+        split_indices_path=str(get_split_indices_path("injury", "val")),
         jitter_ratio=0.0,
         jitter_prob=0.0,
     )

@@ -17,7 +17,7 @@ from PulsePredict.model.metric import ISORating
 from PulsePredict.parse_config import ConfigParser # 仅用于日志记录器
 from PulsePredict.utils.util import plot_waveform_comparison
 from common.data_utils.processor import UnifiedDataProcessor
-from common.settings import FEATURE_ORDER
+from common.settings import FEATURE_ORDER, NORMALIZATION_CONFIG_PATH, RAW_DATA
 
 #==========================================================================================
 # 1. 配置文件
@@ -30,7 +30,7 @@ plt.rcParams['axes.unicode_minus'] = False    # 负号正常显示
 # --------------------------------------------------------------------------------------
 # 指定要加载的模型检查点 (.pth) 文件路径
 CHECKPOINT_PATH = (
-    r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_project\PulsePredict\saved\models\HybridPulseCNN\0303_213959\model_best.pth"
+    r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_project\PulsePredict\saved\models\HybridPulseCNN\0324_214803\model_best.pth"
 )
 
 # 1.2. 绘图轴配置
@@ -357,8 +357,8 @@ def main():
     logger.info(f"模型 '{model_arch_type}' 加载成功并设置到 {device}。")
 
     # --- 3. 归一化器（使用统一的 UnifiedDataProcessor） ---
-    # 使用 prepare_data.py 生成的 data/normalization_config.json。此处直接从配置中构建 UnifiedDataProcessor。
-    proc_cfg_path = Path(config['data_loader_train']['args'].get('processor_config', 'data/normalization_config.json'))
+    # 归一化配置默认走 common.settings，避免 data 目录名变化时这里单独失配。
+    proc_cfg_path = Path(config['data_loader_train']['args'].get('processor_config') or NORMALIZATION_CONFIG_PATH)
     processor = UnifiedDataProcessor(config_path=proc_cfg_path)
     if not processor.load_config():
         raise RuntimeError(f"[interfere_data] 无法加载归一化配置: {proc_cfg_path}")
@@ -371,7 +371,7 @@ def main():
     
     # <--- 循环加载多个文件并合并 --->
     # 加载单一 canonical .npz 文件（路径从 config 中读取）。
-    npz_path = Path(config['data_loader_train']['args'].get('packaged_data_path', 'data/raw_packed/raw_data_packed.npz'))
+    npz_path = Path(config['data_loader_train']['args'].get('packaged_data_path') or RAW_DATA)
     if not npz_path.exists():
         logger.error(f"[interfere_data] 数据文件不存在: {npz_path} — 请先运行 `python prepare_data.py` 来生成原始尺度的打包数据文件 (.npz)")
         return

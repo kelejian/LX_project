@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 ''' 设置数据集特征相关的常量, 规范数据接口 '''
 FEATURE_ORDER = [
     "impact_velocity", "impact_angle", "overlap",
@@ -51,6 +52,36 @@ INJURY_PROCESSED_DIR = PROCESSED_DATA_DIR / "injury" # 专门为 InjuryPredict �
 PULSE_PREDICT_DIR = ROOT_DIR / "PulsePredict"
 INJURY_PREDICT_DIR = ROOT_DIR / "InjuryPredict"
 ARS_OPTIM_DIR = ROOT_DIR / "ARS_optim"
+
+SPLIT_PARTITIONS = ("train", "val", "test")
+
+
+def _validate_split_name(split_name: str) -> str:
+    split_name = str(split_name)
+    if split_name not in SPLIT_PARTITIONS:
+        raise ValueError(f"invalid split name: {split_name}, expected one of {SPLIT_PARTITIONS}")
+    return split_name
+
+
+def get_split_indices_path(prefix: str, split_name: str, split_dir: Optional[Path] = None) -> Path:
+    """集中管理 split 索引文件命名，避免各脚本散落硬编码。"""
+    split_name = _validate_split_name(split_name)
+    base_dir = SPLIT_INDICES_DIR if split_dir is None else Path(split_dir)
+    return base_dir / f"{prefix}_{split_name}_indices.csv"
+
+
+def get_split_case_ids_path(prefix: str, split_name: str, split_dir: Optional[Path] = None) -> Path:
+    """集中管理 split case_id 文件命名。"""
+    split_name = _validate_split_name(split_name)
+    base_dir = SPLIT_INDICES_DIR if split_dir is None else Path(split_dir)
+    return base_dir / f"{prefix}_{split_name}_case_ids.csv"
+
+
+def get_injury_processed_dataset_path(split_name: str, processed_dir: Optional[Path] = None) -> Path:
+    """统一 InjuryPredict 处理后数据集文件命名。"""
+    split_name = _validate_split_name(split_name)
+    base_dir = INJURY_PROCESSED_DIR if processed_dir is None else Path(processed_dir)
+    return base_dir / f"{split_name}_dataset.pt"
 
 def get_paths():
     """获取路径字典。"""

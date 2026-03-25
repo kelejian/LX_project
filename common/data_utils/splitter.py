@@ -59,6 +59,13 @@ def stratified_split(
             split_summary: 包含划分统计信息的字典。
     """
     
+    train_ratio = float(train_ratio)
+    val_ratio = float(val_ratio)
+    test_ratio = float(test_ratio)
+    if train_ratio <= 0.0:
+        raise ValueError("train_ratio 必须大于 0，训练划分不能为空。")
+    if val_ratio < 0.0 or test_ratio < 0.0:
+        raise ValueError("val_ratio 和 test_ratio 不能为负数。")
     assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "比例总和必须为 1"
     
     # 将 case_id 映射到索引
@@ -125,10 +132,13 @@ def stratified_split(
         processed_remaining_labels = remaining_labels[~mask]
         
     # 标准划分逻辑
-    temp_size = val_ratio + test_ratio
+    temp_size = val_ratio + test_ratio # 验证集和测试集的总比例，用于第一次划分
     
     # 第一次划分: 训练集 vs (验证集+测试集)
-    if len(processed_remaining_indices) < 2:
+    if temp_size <= 0.0:
+        train_auto = processed_remaining_indices
+        temp_indices = np.array([], dtype=int)
+    elif len(processed_remaining_indices) < 2:
         train_auto = processed_remaining_indices
         temp_indices = np.array([], dtype=int)
     elif len(np.unique(processed_remaining_labels)) < 2:
@@ -147,19 +157,26 @@ def stratified_split(
     train_indices_list.extend(train_auto)
     
     # 第二次划分: 验证集 vs 测试集
-    if len(temp_indices) > 0 and test_ratio > 0:
+    if len(temp_indices) == 0:
+        val_auto = np.array([], dtype=int)
+        test_auto = np.array([], dtype=int)
+    elif test_ratio <= 0.0:
+        val_auto = temp_indices
+        test_auto = np.array([], dtype=int)
+    elif val_ratio <= 0.0:
+        val_auto = np.array([], dtype=int)
+        test_auto = temp_indices
+    else:
         relative_test = test_ratio / temp_size
         if len(temp_indices) < 2:
-            val_auto = temp_indices
-            test_auto = np.array([], dtype=int)
+            # 剩余样本数不足时优先保留到测试集，避免 test_ratio>0 却被静默吃掉。
+            val_auto = np.array([], dtype=int)
+            test_auto = temp_indices
         else:
             # 数据量太小通常无法再次分层，仅使用随机划分
             val_auto, test_auto = train_test_split(
                 temp_indices, test_size=relative_test, random_state=seed
             )
-    else:
-        val_auto = temp_indices
-        test_auto = np.array([], dtype=int)
         
     # 合并强制分配和自动分配的索引
     final_train = np.unique(np.concatenate([list(forced_train_set), train_indices_list])).astype(int)

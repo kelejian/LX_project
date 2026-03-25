@@ -13,7 +13,7 @@ from optuna.storages import RDBStorage
 import joblib
 
 from common.tools.seeding import set_random_seed
-from common.settings import INJURY_PROCESSED_DIR
+from common.settings import INJURY_PROCESSED_DIR, get_injury_processed_dataset_path
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 
 from InjuryPredict.utils import models
@@ -141,12 +141,16 @@ def objective(trial):
 
     
     # 加载数据集
-    train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
-    val_pt = INJURY_PROCESSED_DIR / "val_dataset.pt"
+    train_pt = get_injury_processed_dataset_path("train")
+    val_pt = get_injury_processed_dataset_path("val")
     if not (train_pt.exists() and val_pt.exists()):
         raise FileNotFoundError(f"请先运行: python -m InjuryPredict.Injurydata_prepare 以生成 {INJURY_PROCESSED_DIR.as_posix()}/train_dataset.pt")
     train_dataset = load_processed_subset(train_pt)
     val_dataset = load_processed_subset(val_pt)
+    if len(train_dataset) == 0:
+        raise ValueError("train_dataset.pt 为空，train_optuna 无法运行。")
+    if len(val_dataset) == 0:
+        raise ValueError("val_dataset.pt 为空，train_optuna 需要非空验证集。")
     train_loader = DataLoader(train_dataset, batch_size=Batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=Batch_size, shuffle=False, num_workers=0)
 

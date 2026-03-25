@@ -10,9 +10,19 @@ import numpy as np
 import pandas as pd
 
 from common.tools.seeding import GLOBAL_SEED
-from common.settings import REQUIRED_COLUMNS_FOR_PACKING, FEATURE_ORDER
-from common.settings import RAW_DATA, RAW_DATA, SPLIT_INDICES_DIR, NORMALIZATION_CONFIG_PATH, ensure_dirs
-from common.settings import WAVEFORM_LENGTH, WAVEFORM_CHANNELS_XY, WAVEFORM_CHANNELS_XYZ
+from common.settings import (
+    FEATURE_ORDER,
+    NORMALIZATION_CONFIG_PATH,
+    RAW_DATA,
+    REQUIRED_COLUMNS_FOR_PACKING,
+    SPLIT_INDICES_DIR,
+    WAVEFORM_CHANNELS_XY,
+    WAVEFORM_CHANNELS_XYZ,
+    WAVEFORM_LENGTH,
+    ensure_dirs,
+    get_split_case_ids_path,
+    get_split_indices_path,
+)
 from common.data_utils.splitter import stratified_split_case_ids, case_ids_to_indices
 from common.data_utils.processor import UnifiedDataProcessor
 from common.data_utils.split_io import save_int_vector_csv, load_int_vector_csv
@@ -313,17 +323,17 @@ def _save_split(out_dir: Path, prefix: str, case_ids_all: np.ndarray,
     '''
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    save_int_vector_csv(out_dir / f"{prefix}_train_case_ids.csv", train_case_ids)
-    save_int_vector_csv(out_dir / f"{prefix}_val_case_ids.csv", val_case_ids)
-    save_int_vector_csv(out_dir / f"{prefix}_test_case_ids.csv", test_case_ids)
+    save_int_vector_csv(get_split_case_ids_path(prefix, "train", out_dir), train_case_ids)
+    save_int_vector_csv(get_split_case_ids_path(prefix, "val", out_dir), val_case_ids)
+    save_int_vector_csv(get_split_case_ids_path(prefix, "test", out_dir), test_case_ids)
 
     train_idx = case_ids_to_indices(case_ids_all, train_case_ids) # 将训练集 case_ids 转为对应的索引
     val_idx = case_ids_to_indices(case_ids_all, val_case_ids)   # 将验证集 case_ids 转为对应的索引
     test_idx = case_ids_to_indices(case_ids_all, test_case_ids) # 将测试集 case_ids 转为对应的索引
 
-    save_int_vector_csv(out_dir / f"{prefix}_train_indices.csv", train_idx)
-    save_int_vector_csv(out_dir / f"{prefix}_val_indices.csv", val_idx)
-    save_int_vector_csv(out_dir / f"{prefix}_test_indices.csv", test_idx)
+    save_int_vector_csv(get_split_indices_path(prefix, "train", out_dir), train_idx)
+    save_int_vector_csv(get_split_indices_path(prefix, "val", out_dir), val_idx)
+    save_int_vector_csv(get_split_indices_path(prefix, "test", out_dir), test_idx)
 
     with open(out_dir / f"{prefix}_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -345,9 +355,9 @@ def _save_pulse_split_with_first_occurrence_indices(
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    save_int_vector_csv(out_dir / "pulse_train_case_ids.csv", train_source_ids)
-    save_int_vector_csv(out_dir / "pulse_val_case_ids.csv", val_source_ids)
-    save_int_vector_csv(out_dir / "pulse_test_case_ids.csv", test_source_ids)
+    save_int_vector_csv(get_split_case_ids_path("pulse", "train", out_dir), train_source_ids)
+    save_int_vector_csv(get_split_case_ids_path("pulse", "val", out_dir), val_source_ids)
+    save_int_vector_csv(get_split_case_ids_path("pulse", "test", out_dir), test_source_ids)
 
     source_to_first_row: Dict[int, int] = {}
     for row_idx, src in enumerate(pulse_source_case_ids_all.tolist()):
@@ -371,9 +381,9 @@ def _save_pulse_split_with_first_occurrence_indices(
             )
         return np.asarray(mapped, dtype=np.int64)
 
-    save_int_vector_csv(out_dir / "pulse_train_indices.csv", _map_sources_to_first_rows(train_source_ids, "train"))
-    save_int_vector_csv(out_dir / "pulse_val_indices.csv", _map_sources_to_first_rows(val_source_ids, "val"))
-    save_int_vector_csv(out_dir / "pulse_test_indices.csv", _map_sources_to_first_rows(test_source_ids, "test"))
+    save_int_vector_csv(get_split_indices_path("pulse", "train", out_dir), _map_sources_to_first_rows(train_source_ids, "train"))
+    save_int_vector_csv(get_split_indices_path("pulse", "val", out_dir), _map_sources_to_first_rows(val_source_ids, "val"))
+    save_int_vector_csv(get_split_indices_path("pulse", "test", out_dir), _map_sources_to_first_rows(test_source_ids, "test"))
 
     with open(out_dir / "pulse_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -607,10 +617,12 @@ def main():
     
     # 加载打包数据和训练集索引
     raw_data = np.load(out_raw)
-    train_indices_path = out_splits / "injury_train_indices.csv"
+    train_indices_path = get_split_indices_path("injury", "train", out_splits)
     
     if train_indices_path.exists():
         train_indices = load_int_vector_csv(train_indices_path)
+        if train_indices.size == 0:
+            raise ValueError("injury_train_indices.csv 为空，无法基于空训练集拟合 normalization_config。")
         # 构建训练集数据字典（仅用于统计量计算）
         train_data = {
             'x_att_raw': raw_data['x_att_raw'][train_indices], # shape: (N, len(FEATURE_ORDER))

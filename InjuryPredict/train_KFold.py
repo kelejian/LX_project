@@ -25,7 +25,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from common.tools.seeding import GLOBAL_SEED, set_random_seed
-from common.settings import INJURY_PROCESSED_DIR
+from common.settings import INJURY_PROCESSED_DIR, get_injury_processed_dataset_path
 
 from InjuryPredict.utils import models
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
@@ -308,9 +308,9 @@ if __name__ == "__main__":
     # --- 3. 加载由 dataset_prepare.py 生成的数据 ---
     print("正在加载 pt dataset ...")
     try:
-        train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
-        val_pt = INJURY_PROCESSED_DIR / "val_dataset.pt"
-        test_pt = INJURY_PROCESSED_DIR / "test_dataset.pt"
+        train_pt = get_injury_processed_dataset_path("train")
+        val_pt = get_injury_processed_dataset_path("val")
+        test_pt = get_injury_processed_dataset_path("test")
         train_subset_orig = load_processed_subset(train_pt)
         val_subset_orig = load_processed_subset(val_pt)
         test_subset_orig = load_processed_subset(test_pt)

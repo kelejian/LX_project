@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from common.data_utils.split_io import load_int_vector_csv
-from common.settings import RAW_DATA, SPLIT_INDICES_DIR
+from common.settings import RAW_DATA, get_split_indices_path
 
 from ARS_optim.src.constraints import ConstraintEngine
 from ARS_optim.src.param_manager import ParamManager
@@ -62,7 +62,7 @@ class StateDataSampler:
         self.context_indices = self.param_manager.get_context_indices()
 
         pool_path = Path(pool_npz_path) if pool_npz_path else (RAW_DATA)
-        split_path = Path(split_indices_path) if split_indices_path else (SPLIT_INDICES_DIR / "injury_train_indices.csv")
+        split_path = Path(split_indices_path) if split_indices_path else get_split_indices_path("injury", "train")
         if not split_path.exists():
             raise FileNotFoundError(f"经验池切分索引不存在: {split_path}")
         self.pool_path = pool_path

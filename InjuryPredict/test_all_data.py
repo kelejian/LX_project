@@ -17,7 +17,7 @@ import pandas as pd
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-from common.settings import FEATURE_ORDER, INJURY_PROCESSED_DIR, RAW_DATA
+from common.settings import FEATURE_ORDER, INJURY_PROCESSED_DIR, RAW_DATA, get_injury_processed_dataset_path
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from common.tools.seeding import set_random_seed
 
@@ -77,9 +77,9 @@ def load_model_and_data(run_dir, weight_file):
     model_params = training_record["hyperparameters"]["model"]
     
     # 2. 加载数据集 .pt 文件
-    train_pt_path = (INJURY_PROCESSED_DIR / "train_dataset.pt").as_posix()
-    val_pt_path = (INJURY_PROCESSED_DIR / "val_dataset.pt").as_posix() 
-    test_pt_path = (INJURY_PROCESSED_DIR / "test_dataset.pt").as_posix()
+    train_pt_path = get_injury_processed_dataset_path("train").as_posix()
+    val_pt_path = get_injury_processed_dataset_path("val").as_posix()
+    test_pt_path = get_injury_processed_dataset_path("test").as_posix()
     
     if not all(os.path.exists(p) for p in [train_pt_path, val_pt_path, test_pt_path]):
         raise FileNotFoundError(f"未在 {INJURY_PROCESSED_DIR.as_posix()} 中找到 train/val/test_dataset.pt。请先运行: python -m InjuryPredict.Injurydata_prepare 来生成数据集文件。")

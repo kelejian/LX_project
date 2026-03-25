@@ -4,7 +4,7 @@
 所有归一化参数从 JSON 配置文件加载，确保三个子项目统一使用。
 
 设计原则:
-    1. 所有归一化参数从 data/normalization_config.json 加载，不依赖 .joblib
+    1. 所有归一化参数统一从 common.settings.NORMALIZATION_CONFIG_PATH 指向的 JSON 加载，不依赖 .joblib
     2. 所有方法支持 inverse 参数，实现归一化/反归一化双向转换
     3. process_by_name 为通用入口，支持任意特征子集的处理（适配 ARS_optim 项目的可能需求）
 """

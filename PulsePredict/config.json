@@ -19,9 +19,9 @@
     "data_loader_train": {
         "type": "PulseDataLoader",
         "args": {
-            "packaged_data_path": "data/raw_packed/raw_data_packed.npz",
-            "split_indices_dir": "data/split_indices",
-            "processor_config": "data/normalization_config.json",
+            "packaged_data_path": null,
+            "split_indices_dir": null,
+            "processor_config": null,
             "batch_size": 128,
             "num_workers": 0,
             "training": true
@@ -30,9 +30,9 @@
     "data_loader_test": {
         "type": "PulseDataLoader",
         "args": {
-            "packaged_data_path": "data/raw_packed/raw_data_packed.npz",
-            "split_indices_dir": "data/split_indices",
-            "processor_config": "data/normalization_config.json",
+            "packaged_data_path": null,
+            "split_indices_dir": null,
+            "processor_config": null,
             "batch_size": 64,
             "num_workers": 0,
             "training": false

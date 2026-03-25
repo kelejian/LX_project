@@ -14,7 +14,7 @@ from sklearn.metrics import mean_absolute_error, root_mean_squared_error, accura
 
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from common.tools.seeding import set_random_seed, GLOBAL_SEED
-from common.settings import INJURY_PROCESSED_DIR
+from common.settings import INJURY_PROCESSED_DIR, get_injury_processed_dataset_path
 
 from InjuryPredict.utils import models
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
@@ -84,6 +84,9 @@ def run_one_epoch(model, loader, criterion, device, optimizer=None):
             all_true_ais_neck.append(batch_ais_neck.cpu().numpy())
             all_true_mais.append(batch_y_MAIS.cpu().numpy())
             all_ot.append(batch_OT.cpu().numpy())
+
+    if not loss_batch:
+        raise ValueError("DataLoader 为空，无法执行一个完整的 epoch。")
 
     # --- 指标计算部分 ---
     avg_loss = np.mean(loss_batch)
@@ -167,18 +170,27 @@ if __name__ == "__main__":
 
     # 加载数据集对象
     print(f".pt 数据文件路径: {INJURY_PROCESSED_DIR}/*.pt")
-    train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
-    val_pt = INJURY_PROCESSED_DIR / "val_dataset.pt"
-    if not (train_pt.exists() and val_pt.exists()):
+    train_pt = get_injury_processed_dataset_path("train")
+    val_pt = get_injury_processed_dataset_path("val")
+    if not train_pt.exists():
         raise FileNotFoundError(
-            f"找不到训练数据 ({INJURY_PROCESSED_DIR}/*.pt)。请先运行: python -m InjuryPredict.Injurydata_prepare"
+            f"找不到训练数据 ({train_pt})。请先运行: python -m InjuryPredict.Injurydata_prepare"
+        )
+    if not val_pt.exists():
+        raise FileNotFoundError(
+            f"找不到验证数据 ({val_pt})。请先运行: python -m InjuryPredict.Injurydata_prepare"
         )
     train_dataset = load_processed_subset(train_pt)
+    if len(train_dataset) == 0:
+        raise ValueError("train_dataset.pt 为空，InjuryPredict.train 不支持空训练集。")
     print(f"训练集大小: {len(train_dataset)}")
     val_dataset = load_processed_subset(val_pt)
     print(f"验证集大小: {len(val_dataset)}")
     train_loader = DataLoader(train_dataset, batch_size=Batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=Batch_size, shuffle=False, num_workers=0) 
+    val_enabled = len(val_dataset) > 0
+    val_loader = DataLoader(val_dataset, batch_size=Batch_size, shuffle=False, num_workers=0) if val_enabled else None
+    if not val_enabled:
+        print("警告: 验证集为空，本次训练将跳过验证、best_val_* 权重保存和 early stop。")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -215,24 +227,26 @@ if __name__ == "__main__":
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=Epochs, eta_min=Learning_rate_min)
 
     # 初始化指标跟踪器（由 val_metrics_to_track 驱动）
-    metric_trackers = build_metric_trackers(
-        val_metrics_to_track,
-        model_filename_fn = lambda metric_name: f"best_val_{metric_name}.pth"
-    )
-    if not metric_trackers:
-        raise ValueError("val_metrics_to_track 不能为空。")
-    tracked_metric_names = [tracker['display_name'] for tracker in metric_trackers.values()]
-    print(f"将跟踪以下验证指标: {tracked_metric_names}")
-
-    metric_states = {
-        metric_name: {
-            'best_value': tracker_info['initial_value'],
-            'best_epoch': 0,
-            'is_better': tracker_info['is_better'],
-            'model_filename': tracker_info['model_filename'],
+    metric_trackers = {}
+    metric_states = {}
+    if val_enabled:
+        metric_trackers = build_metric_trackers(
+            val_metrics_to_track,
+            model_filename_fn = lambda metric_name: f"best_val_{metric_name}.pth"
+        )
+        if not metric_trackers:
+            raise ValueError("val_metrics_to_track 不能为空。")
+        tracked_metric_names = [tracker['display_name'] for tracker in metric_trackers.values()]
+        print(f"将跟踪以下验证指标: {tracked_metric_names}")
+        metric_states = {
+            metric_name: {
+                'best_value': tracker_info['initial_value'],
+                'best_epoch': 0,
+                'is_better': tracker_info['is_better'],
+                'model_filename': tracker_info['model_filename'],
+            }
+            for metric_name, tracker_info in metric_trackers.items()
         }
-        for metric_name, tracker_info in metric_trackers.items()
-    }
 
     # 保存初始配置到 JSON 文件
     record_path = os.path.join(run_dir, "TrainingRecord.json")
@@ -240,6 +254,7 @@ if __name__ == "__main__":
         'GLOBAL_SEED': GLOBAL_SEED,
         "Trainset_size": len(train_dataset),
         "Valset_size": len(val_dataset),
+        "validation_enabled": val_enabled,
         "INJURY_PROCESSED_DIR": str(INJURY_PROCESSED_DIR),
         "model_params_count": {
             "total_params": total_params,
@@ -250,7 +265,7 @@ if __name__ == "__main__":
                 "Epochs": Epochs, "Batch_size": Batch_size, "Learning_rate": Learning_rate,
                 "Learning_rate_min": Learning_rate_min, "weight_decay": weight_decay,
                 "early_stop_start_epochs": early_stop_start_epochs, "Patience": Patience,
-                "val_metrics_to_track": val_metrics_to_track,
+                "val_metrics_to_track": val_metrics_to_track if val_enabled else [],
             },
             "loss": {
                 "base_loss": base_loss, "weight_factor_classify": weight_factor_classify,
@@ -298,27 +313,31 @@ if __name__ == "__main__":
             # 重置权重记录（验证开始前）
             model.tcn.channel_attention.reset_epoch_records()
 
-        # --- 调用统一的函数进行验证 ---
-        val_metrics = run_one_epoch(model, val_loader, criterion, device, optimizer=None)
-
-        # 记录验证epoch的权重统计
+        val_metrics = None
         val_attention_stats = None
-        if use_channel_attention and hasattr(model.tcn, 'channel_attention'):
-            mean_weights_val, std_weights_val = model.tcn.channel_attention.get_epoch_attention_stats()
-            if mean_weights_val is not None:
-                val_attention_stats = {
-                    'mean': mean_weights_val, 
-                    'std': std_weights_val
-                }
-        
-        missing_metrics = [name for name in metric_trackers.keys() if name not in val_metrics]
-        if missing_metrics:
-            raise KeyError(f"val_metrics_to_track 中存在无效指标: {missing_metrics}")
+        if val_enabled:
+            # 验证集允许为空；为空时这里直接跳过，不再构造伪验证指标。
+            val_metrics = run_one_epoch(model, val_loader, criterion, device, optimizer=None)
+
+            if use_channel_attention and hasattr(model.tcn, 'channel_attention'):
+                mean_weights_val, std_weights_val = model.tcn.channel_attention.get_epoch_attention_stats()
+                if mean_weights_val is not None:
+                    val_attention_stats = {
+                        'mean': mean_weights_val,
+                        'std': std_weights_val
+                    }
+
+            missing_metrics = [name for name in metric_trackers.keys() if name not in val_metrics]
+            if missing_metrics:
+                raise KeyError(f"val_metrics_to_track 中存在无效指标: {missing_metrics}")
 
         print(f"Epoch {epoch+1}/{Epochs} | Train Loss: {train_metrics['loss']:.4g}")
-        print(f"            | Val Loss: {val_metrics['loss']:.4g} | MAIS Acc 6C: {val_metrics['accu_mais']:.4g}% | MAIS Acc 3C: {val_metrics['accu_mais_3c']:.4g}%")
-        print(f"            | Head Acc: {val_metrics['accu_head']:.4g}%, Chest Acc: {val_metrics['accu_chest']:.4g}%, Neck Acc: {val_metrics['accu_neck']:.4g}%")
-        print(f"            | R²: HIC={val_metrics['r2_hic']:.4g}, Dmax={val_metrics['r2_dmax']:.4g}, Nij={val_metrics['r2_nij']:.4g}")
+        if val_enabled:
+            print(f"            | Val Loss: {val_metrics['loss']:.4g} | MAIS Acc 6C: {val_metrics['accu_mais']:.4g}% | MAIS Acc 3C: {val_metrics['accu_mais_3c']:.4g}%")
+            print(f"            | Head Acc: {val_metrics['accu_head']:.4g}%, Chest Acc: {val_metrics['accu_chest']:.4g}%, Neck Acc: {val_metrics['accu_neck']:.4g}%")
+            print(f"            | R2: HIC={val_metrics['r2_hic']:.4g}, Dmax={val_metrics['r2_dmax']:.4g}, Nij={val_metrics['r2_nij']:.4g}")
+        else:
+            print("            | Validation disabled because val_dataset.pt is empty")
         
         scheduler.step()
 
@@ -356,19 +375,20 @@ if __name__ == "__main__":
             x_ratio = (mean_weights[0] / total_weight).item() if total_weight > 0 else 0
             writer.add_scalar("ChannelAttention_Train/X_Direction_Ratio", x_ratio, epoch)
 
-        # TensorBoard 记录 (验证)
-        writer.add_scalar("Loss/Val", val_metrics['loss'], epoch)
-        writer.add_scalar("Accuracy_Val/MAIS", val_metrics['accu_mais'], epoch)
-        writer.add_scalar("Accuracy_Val/MAIS_3C", val_metrics['accu_mais_3c'], epoch)
-        writer.add_scalar("Accuracy_Val/Head", val_metrics['accu_head'], epoch)
-        writer.add_scalar("Accuracy_Val/Chest", val_metrics['accu_chest'], epoch)
-        writer.add_scalar("Accuracy_Val/Neck", val_metrics['accu_neck'], epoch)
-        writer.add_scalar("MAE_Val/HIC", val_metrics['mae_hic'], epoch)
-        writer.add_scalar("MAE_Val/Dmax", val_metrics['mae_dmax'], epoch)
-        writer.add_scalar("MAE_Val/Nij", val_metrics['mae_nij'], epoch)
-        writer.add_scalar("R2_Val/HIC", val_metrics['r2_hic'], epoch)
-        writer.add_scalar("R2_Val/Dmax", val_metrics['r2_dmax'], epoch)
-        writer.add_scalar("R2_Val/Nij", val_metrics['r2_nij'], epoch)
+        if val_enabled:
+            # TensorBoard 记录 (验证)
+            writer.add_scalar("Loss/Val", val_metrics['loss'], epoch)
+            writer.add_scalar("Accuracy_Val/MAIS", val_metrics['accu_mais'], epoch)
+            writer.add_scalar("Accuracy_Val/MAIS_3C", val_metrics['accu_mais_3c'], epoch)
+            writer.add_scalar("Accuracy_Val/Head", val_metrics['accu_head'], epoch)
+            writer.add_scalar("Accuracy_Val/Chest", val_metrics['accu_chest'], epoch)
+            writer.add_scalar("Accuracy_Val/Neck", val_metrics['accu_neck'], epoch)
+            writer.add_scalar("MAE_Val/HIC", val_metrics['mae_hic'], epoch)
+            writer.add_scalar("MAE_Val/Dmax", val_metrics['mae_dmax'], epoch)
+            writer.add_scalar("MAE_Val/Nij", val_metrics['mae_nij'], epoch)
+            writer.add_scalar("R2_Val/HIC", val_metrics['r2_hic'], epoch)
+            writer.add_scalar("R2_Val/Dmax", val_metrics['r2_dmax'], epoch)
+            writer.add_scalar("R2_Val/Nij", val_metrics['r2_nij'], epoch)
 
         # TensorBoard 记录验证时的通道注意力权重
         if val_attention_stats is not None:
@@ -405,16 +425,17 @@ if __name__ == "__main__":
                 print(f"            | Val Weight Variance: {weight_variance:.4g}")
 
 
-        for metric_name, state in metric_states.items():
-            current_value = val_metrics[metric_name]
-            if state['is_better'](current_value, state['best_value']):
-                state['best_value'] = current_value
-                state['best_epoch'] = epoch + 1
-                torch.save(model.state_dict(), os.path.join(run_dir, state['model_filename']))
-                print(f"Best {metric_trackers[metric_name]['display_name']} model saved: {current_value:.4g} at epoch {epoch+1}")
+        if val_enabled:
+            for metric_name, state in metric_states.items():
+                current_value = val_metrics[metric_name]
+                if state['is_better'](current_value, state['best_value']):
+                    state['best_value'] = current_value
+                    state['best_epoch'] = epoch + 1
+                    torch.save(model.state_dict(), os.path.join(run_dir, state['model_filename']))
+                    print(f"Best {metric_trackers[metric_name]['display_name']} model saved: {current_value:.4g} at epoch {epoch+1}")
 
         # 早停逻辑
-        if epoch > early_stop_start_epochs and (epoch + 1) >= Patience:
+        if val_enabled and epoch > early_stop_start_epochs and (epoch + 1) >= Patience:
             all_stagnant = all(
                 (epoch + 1 - state['best_epoch']) >= Patience
                 for state in metric_states.values()
@@ -446,25 +467,28 @@ if __name__ == "__main__":
         for metric_name, state in metric_states.items()
     }
 
+    metrics_source = val_metrics if val_enabled else train_metrics
     last_epoch_metrics = round_float_fields({
-        "loss": float(val_metrics['loss']),
-        "accu_mais": float(val_metrics['accu_mais']),
-        "accu_mais_3c": float(val_metrics['accu_mais_3c']),
-        "accu_head": float(val_metrics['accu_head']),
-        "accu_chest": float(val_metrics['accu_chest']),
-        "accu_neck": float(val_metrics['accu_neck']),
-        "mae_hic": float(val_metrics['mae_hic']),
-        "mae_dmax": float(val_metrics['mae_dmax']),
-        "mae_nij": float(val_metrics['mae_nij']),
-        "r2_hic": float(val_metrics['r2_hic']),
-        "r2_dmax": float(val_metrics['r2_dmax']),
-        "r2_nij": float(val_metrics['r2_nij']),
+        "loss": float(metrics_source['loss']),
+        "accu_mais": float(metrics_source['accu_mais']),
+        "accu_mais_3c": float(metrics_source['accu_mais_3c']),
+        "accu_head": float(metrics_source['accu_head']),
+        "accu_chest": float(metrics_source['accu_chest']),
+        "accu_neck": float(metrics_source['accu_neck']),
+        "mae_hic": float(metrics_source['mae_hic']),
+        "mae_dmax": float(metrics_source['mae_dmax']),
+        "mae_nij": float(metrics_source['mae_nij']),
+        "r2_hic": float(metrics_source['r2_hic']),
+        "r2_dmax": float(metrics_source['r2_dmax']),
+        "r2_nij": float(metrics_source['r2_nij']),
     }, digits=4)
 
     training_results = {
         "final_epoch": epoch + 1,
+        "validation_enabled": val_enabled,
         "best_metrics_by_tracker": best_metrics_by_tracker,
-        "last_epoch_metrics": last_epoch_metrics
+        "last_epoch_metrics": last_epoch_metrics,
+        "last_epoch_metrics_source": "val" if val_enabled else "train",
     }
     
     # 2. 加载现有记录

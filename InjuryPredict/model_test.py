@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
 from common.tools.seeding import set_random_seed
 from InjuryPredict.utils import models
-from common.settings import INJURY_PROCESSED_DIR, load_processed_subset
+from common.settings import get_injury_processed_dataset_path
 # ==========================================================================================
 # inference timing utility (merged from test_inference_time.py)
 def test_inference_time(model, loader):
@@ -656,8 +656,8 @@ def _run_demo_model_tests():
     from utils.weighted_loss import weighted_loss
     from config import model_params, loss_params
     
-    from common.settings import INJURY_PROCESSED_DIR
-    train_pt = INJURY_PROCESSED_DIR / "train_dataset.pt"
+    from common.settings import get_injury_processed_dataset_path
+    train_pt = get_injury_processed_dataset_path("train")
     train_dataset = torch.load(train_pt.as_posix()) 
 
     # --- 从 config 加载超参数 ---
@@ -752,8 +752,8 @@ if __name__ == "__main__":
         model_params = training_record["hyperparameters"]["model"]
 
         # prepare dataset
-        test_dataset1 = load_processed_subset(INJURY_PROCESSED_DIR / "val_dataset.pt")
-        test_dataset2 = load_processed_subset(INJURY_PROCESSED_DIR / "test_dataset.pt")
+        test_dataset1 = load_processed_subset(get_injury_processed_dataset_path("val"))
+        test_dataset2 = load_processed_subset(get_injury_processed_dataset_path("test"))
         test_dataset = ConcatDataset([test_dataset1, test_dataset2])
         test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, num_workers=0)
 

@@ -1,16 +1,16 @@
 """Injurydata_prepare.py
 
-- 读取由根目录 `prepare_data.py` 生成的打包文件（默认：data/raw_packed/raw_data_packed.npz）和划分索引（data/split_indices/）
-- 使用 `common.data_utils.processor.UnifiedDataProcessor` 统一生成/加载归一化配置
+- 读取由根目录 `prepare_data.py` 生成的打包文件与划分索引。
+- 数据路径统一来自 `common.settings`，避免在子项目内重复写死 data 目录名。
 - 生成并保存标准的 PyTorch `.pt` 子集文件：
-    data/processed/injury/train_dataset.pt
-    data/processed/injury/val_dataset.pt
-    data/processed/injury/test_dataset.pt
+    <INJURY_PROCESSED_DIR>/train_dataset.pt
+    <INJURY_PROCESSED_DIR>/val_dataset.pt
+    <INJURY_PROCESSED_DIR>/test_dataset.pt
 - 生成统计摘要 JSON 及散点图（velocity vs HIC/Dmax/Nij）、AIS 分布图（保存在 figs/）
 - 默认不覆盖已存在的输出，除非显式传入 `--overwrite`
 
 用法（示例）：
-    python -m InjuryPredict.Injurydata_prepare --out-dir data/processed/injury
+    python -m InjuryPredict.Injurydata_prepare
 
 """
 from __future__ import annotations
@@ -26,8 +26,13 @@ from torch.utils.data import Dataset, Subset
 import matplotlib.pyplot as plt
 
 from common.settings import (
-    RAW_DATA, SPLIT_INDICES_DIR, NORMALIZATION_CONFIG_PATH,
-    INJURY_PROCESSED_DIR, ensure_dirs
+    INJURY_PROCESSED_DIR,
+    NORMALIZATION_CONFIG_PATH,
+    RAW_DATA,
+    SPLIT_INDICES_DIR,
+    ensure_dirs,
+    get_injury_processed_dataset_path,
+    get_split_indices_path,
 )
 from common.data_utils.processor import UnifiedDataProcessor
 from common.data_utils.split_io import load_int_vector_csv
@@ -150,10 +155,8 @@ def build_and_save_splits(
 ):
     """基于已有的 raw_packed 与 split indices 生成并保存 .pt 与统计图。
 
-    调用前必须已运行根目录的 `prepare_data.py` 来生成
-    - `data/raw_packed/raw_data_packed.npz`
-    - `data/split_indices/*_indices.csv`
-    - `data/normalization_config.json`
+    调用前必须已运行根目录的 `prepare_data.py`，并在 `common.settings`
+    当前指向的数据目录下生成 raw_packed、split_indices 与 normalization_config。
 
     """
     ensure_dirs([out_dir])
@@ -165,10 +168,10 @@ def build_and_save_splits(
     if not raw_packed.exists():
         raise FileNotFoundError(f"raw_packed 文件未找到: {raw_packed} — 请先运行 prepare_data.py")
 
-    # 2) 读取划分索引（优先使用 injury 前缀）
-    train_idx_path = split_dir / "injury_train_indices.csv"
-    val_idx_path = split_dir / "injury_val_indices.csv"
-    test_idx_path = split_dir / "injury_test_indices.csv"
+    # 2) 读取划分索引。这里允许 val/test 为空，但 train 不能为空。
+    train_idx_path = get_split_indices_path("injury", "train", split_dir)
+    val_idx_path = get_split_indices_path("injury", "val", split_dir)
+    test_idx_path = get_split_indices_path("injury", "test", split_dir)
     if not (train_idx_path.exists() and val_idx_path.exists() and test_idx_path.exists()):
         raise FileNotFoundError(
             f"缺少划分索引（injury_*_indices.csv）。请先运行 prepare_data.py 或检查 {split_dir}" 
@@ -177,6 +180,8 @@ def build_and_save_splits(
     train_idx = load_int_vector_csv(train_idx_path)
     val_idx = load_int_vector_csv(val_idx_path)
     test_idx = load_int_vector_csv(test_idx_path)
+    if train_idx.size == 0:
+        raise ValueError("injury_train_indices.csv 为空，无法生成可训练的 InjuryPredict 数据集。")
 
     # 3) 构建 Dataset 实例
     dataset = InjuryPackedDataset(raw_packed)
@@ -201,7 +206,7 @@ def build_and_save_splits(
 
     # 严格校验处理结果的完整性与形状
     if x_acc_processed is None or x_cont is None or x_disc is None:
-        raise RuntimeError("归一化器返回空结果；请确认 data/normalization_config.json 与 raw_packed 数据是否匹配。")
+        raise RuntimeError("归一化器返回空结果；请确认 normalization_config 与 raw_packed 数据是否匹配。")
     if not (hasattr(x_acc_processed, 'ndim') and x_acc_processed.ndim == 3 and x_acc_processed.shape[0] == len(dataset)):
         raise ValueError(f"处理后的波形维度异常: got {getattr(x_acc_processed, 'shape', None)}, expected (N, C, T) with N={len(dataset)}")
     if x_cont.shape[0] != len(dataset) or x_disc.shape[0] != len(dataset):
@@ -221,9 +226,9 @@ def build_and_save_splits(
     test_subset = Subset(dataset, test_idx.tolist())
 
     paths = {
-        "train": out_dir / "train_dataset.pt",
-        "val": out_dir / "val_dataset.pt",
-        "test": out_dir / "test_dataset.pt",
+        "train": get_injury_processed_dataset_path("train", out_dir),
+        "val": get_injury_processed_dataset_path("val", out_dir),
+        "test": get_injury_processed_dataset_path("test", out_dir),
         "summary": out_dir / "split_summary.json",
         "figs": figs_dir,
         "norm_config": norm_config,

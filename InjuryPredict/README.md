@@ -1,66 +1,115 @@
-# InjuryPredict — 乘员损伤预测（使用说明）
+# InjuryPredict 使用说明
 
 ## 1. 简要说明
-基于碰撞波形与标量工况，预测乘员的 HIC（头部）、Dmax（胸部）与 Nij（颈部）指标，以及对应的 AIS/MAIS 等级。此 README 提供主要文件的使用步骤。
+
+`InjuryPredict` 用于基于碰撞波形与标量工况，预测乘员的 `HIC`、`Dmax`、`Nij`，以及对应的 `AIS/MAIS` 等级。此 README 提供主要文件的使用步骤
 
 ## 2. 目录概览
-```
+
+```text
 InjuryPredict/
-├─ runs/                 # 训练输出目录（包含 checkpoints等）
-├─ utils/                # 模型/损失/优化器实现
-├─ configs.py            # 模型/训练/评估参数配置
-├─ Injurydata_prepare.py # 生成 data/processed/injury/*.pt（依赖根目录 prepare_data.py 的运行产物）
+├─ runs/                 # 训练输出目录
+├─ utils/                # 模型、损失、工具函数
+├─ config.py             # 模型/训练/评估配置
+├─ Injurydata_prepare.py # 生成 processed .pt 数据集
 ├─ train.py              # 单次训练入口
 ├─ train_KFold.py        # K-Fold 训练入口
-├─ eval_model.py         # 评估与可视化（图表 + 报告）
+├─ eval_model.py         # 模型评估与图表导出
+└─ test_all_data.py      # 基于完整 train/val/test 数据集的批量测试脚本
 ```
 
-## 3. 环境准备
-在项目根目录运行：
+## 3. 路径约定
+
+本子项目涉及的共享数据路径统一来自 [common/settings.py](../common/settings.py)，尤其是：
+
+- `NORMALIZATION_CONFIG_PATH`
+- `SPLIT_INDICES_DIR`
+- `INJURY_PROCESSED_DIR`
+- `get_injury_processed_dataset_path(...)`
+
+因此 README 中不再把输出路径写死为某个 `data/processed/injury`。如果你调整了共享数据目录名，应优先修改 `common/settings.py`。
+
+## 4. 数据准备
+
+`InjuryPredict` 严格依赖根目录先完成统一打包与 split 生成。
+
+### 4.1 先生成共享打包数据与索引
+
+在项目根目录执行：
 
 ```bash
-pip install -r requirements.txt
+python -m prepare_data
 ```
 
-## 4. 数据准备（必须先做）
-注意：**严格依赖**先运行根目录的 `prepare_data.py` 来生成原始打包与索引文件。
+### 4.2 再生成 `InjuryPredict` 使用的 processed `.pt`
 
-1) 根目录下生成原始打包与索引（如已生成请忽略该步）：
 ```bash
-python prepare_data.py
+python -m InjuryPredict.Injurydata_prepare
 ```
-2) 生成 processed `.pt`（且依赖上一步产生的文件）：
-```bash
-python -m InjuryPredict.Injurydata_prepare --out-dir data/processed/injury
-```
-产出：`data/processed/injury/{train_dataset.pt,val_dataset.pt,test_dataset.pt}` 与 `data/normalization_config.json`。
 
-> 若缺少任何前置产物，脚本会明确报错并退出。
+如需显式指定输出目录，也可以：
+
+```bash
+python -m InjuryPredict.Injurydata_prepare --out-dir <your_processed_dir>
+```
+
+默认输出文件名固定为：
+
+- `train_dataset.pt`
+- `val_dataset.pt`
+- `test_dataset.pt`
+
+默认输出目录由 `common.settings.INJURY_PROCESSED_DIR` 决定。
 
 ## 5. 训练
-- 单次训练：
-```bash
-  python -m InjuryPredict.train
-```
-  输出保存在 `runs/`（包含 checkpoints、TrainingRecord.json、tensorboard logs）。
 
-- K-Fold 训练：
-```bash
-  python -m InjuryPredict.train_KFold
-```
-  注: K-Fold 训练的输出文件已经包含了每折的训练记录、模型权重和详细的评估结果，不需要单独再运行评估脚本。
+### 5.1 单次训练
 
-模型/训练超参统一配置于 `InjuryPredict/config.py`，无需改源码即可调整。
+```bash
+python -m InjuryPredict.train
+```
+
+输出保存在 `InjuryPredict/runs/`，通常包括：
+
+- 模型权重
+- `TrainingRecord.json`
+- tensorboard 日志
+
+训练超参数统一配置于 [InjuryPredict/config.py](./config.py)。
+
+### 5.2 K-Fold 训练
+
+```bash
+python -m InjuryPredict.train_KFold
+```
+
+`train_KFold.py` 的输出已包含各折的训练记录、模型权重和评估结果，一般不需要再额外运行 `eval_model.py`。
 
 ## 6. 评估与导出
-- 生成评估报告与图表：
-```bash
-  python -m InjuryPredict.eval_model
-```
-  （建议仅用于评估 InjuryPredict.train 训练的模型. 在脚本 `__main__` 中设置需要评估的 `run_dir` 与 `weight_file`）
 
-## 7. 可视化（TensorBoard）
 ```bash
-tensorboard --logdir=./runs
+python -m InjuryPredict.eval_model
 ```
+
+说明：
+
+- 该脚本当前默认仍是在 `__main__` 中指定 `run_dir` 与 `weight_file`
+- 评估数据来自 `get_injury_processed_dataset_path("val")` 和 `get_injury_processed_dataset_path("test")`
+
+## 7. TensorBoard
+
+```bash
+tensorboard --logdir=./InjuryPredict/runs
+```
+
 然后在浏览器访问 `http://localhost:6006`。
+
+## 8. 推荐阅读顺序
+
+建议按下面顺序理解本子项目：
+
+1. 先看根目录 [README.md](../README.md)
+2. 再看 [common/settings.py](../common/settings.py) 中的路径约定
+3. 再运行 `python -m prepare_data`
+4. 再运行 `python -m InjuryPredict.Injurydata_prepare`
+5. 最后按需运行训练或评估脚本

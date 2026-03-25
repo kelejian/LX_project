@@ -7,12 +7,21 @@ from torch.utils.data import Dataset
 from PulsePredict.base import BaseDataLoader
 from common.data_utils.processor import UnifiedDataProcessor
 from common.data_utils.split_io import load_int_vector_csv
-from common.settings import FEATURE_ORDER
+from common.settings import (
+    FEATURE_ORDER,
+    NORMALIZATION_CONFIG_PATH,
+    RAW_DATA,
+    SPLIT_INDICES_DIR,
+    get_split_indices_path,
+)
 #==========================================================================================
 # 定制的 Dataset 类
 #==========================================================================================
 class PulseDataset(Dataset):
     def __init__(self, packaged_data_path, processor_config_path):
+        # config.json 中的路径写为 null 会被解析成 Python 的 None。这里会自动使用 common.settings 里的统一路径
+        packaged_data_path = RAW_DATA if packaged_data_path in (None, "") else Path(packaged_data_path)
+        processor_config_path = NORMALIZATION_CONFIG_PATH if processor_config_path in (None, "") else Path(processor_config_path)
         if not os.path.exists(packaged_data_path):
             raise FileNotFoundError(f"Packaged data not found: {packaged_data_path}")
         
@@ -82,8 +91,9 @@ class PulseDataset(Dataset):
 #==========================================================================================
 class PulseDataLoader(BaseDataLoader):
     def __init__(self, packaged_data_path, split_indices_dir, processor_config, batch_size, num_workers=0, training=True):
-
-        self.split_dir = Path(split_indices_dir)
+        self.split_dir = SPLIT_INDICES_DIR if split_indices_dir in (None, "") else Path(split_indices_dir)
+        packaged_data_path = RAW_DATA if packaged_data_path in (None, "") else Path(packaged_data_path)
+        processor_config = NORMALIZATION_CONFIG_PATH if processor_config in (None, "") else Path(processor_config)
         
         # 1. 实例化全量数据集
         self.dataset = PulseDataset(
@@ -98,8 +108,8 @@ class PulseDataLoader(BaseDataLoader):
         
         if training:
             # --- 训练模式 ---
-            t_idx_path = self.split_dir / "pulse_train_indices.csv"
-            v_idx_path = self.split_dir / "pulse_val_indices.csv"
+            t_idx_path = get_split_indices_path("pulse", "train", self.split_dir)
+            v_idx_path = get_split_indices_path("pulse", "val", self.split_dir)
 
             if not t_idx_path.exists():
                 raise FileNotFoundError(f"[PulseDataLoader] Train split missing: {t_idx_path}")
@@ -111,7 +121,7 @@ class PulseDataLoader(BaseDataLoader):
             
         else:
             # --- 测试模式 ---
-            test_idx_path = self.split_dir / "pulse_test_indices.csv"
+            test_idx_path = get_split_indices_path("pulse", "test", self.split_dir)
 
             if not test_idx_path.exists():
                 raise FileNotFoundError(f"[PulseDataLoader] Test split missing: {test_idx_path}")
@@ -120,6 +130,10 @@ class PulseDataLoader(BaseDataLoader):
             
             # 测试模式下强制无验证集
             self.val_indices = None
+
+        if self.train_test_indices is None or len(self.train_test_indices) == 0:
+            split_name = "train" if training else "test"
+            raise ValueError(f"[PulseDataLoader] {split_name} split is empty: {self.split_dir}")
 
         # 3. 初始化基类
         super().__init__(

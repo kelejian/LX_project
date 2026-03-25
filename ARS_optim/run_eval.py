@@ -24,7 +24,7 @@ from common.metrics.injury_risk import (
     Injury_prob_cal_head,
     Injury_prob_cal_neck,
 )
-from common.settings import FEATURE_ORDER, NORMALIZATION_CONFIG_PATH, RAW_DATA_DIR, SPLIT_INDICES_DIR
+from common.settings import FEATURE_ORDER, NORMALIZATION_CONFIG_PATH, RAW_DATA, get_split_indices_path
 from common.tools.logger import setup_logger
 from common.tools.seeding import set_random_seed
 
@@ -59,20 +59,32 @@ TRUE_VS_METRIC_NAMES = ("HIC", "Dmax", "Nij")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ARS Local Refinement Evaluator")
-    parser.add_argument("--input_csv", type=str, default=None, help="输入工况参数 CSV 的绝对路径；若不提供则自动使用 injury test split")
+    parser.add_argument(
+        "--input_csv",
+        type=str,
+        default=None,
+        help="输入工况参数 CSV 的绝对路径；若不提供则优先使用 injury test split，不可用时自动回退到 injury val split",
+    )
     parser.add_argument("--output_csv", type=str, default="evaluation_results.csv", help="输出 CSV 文件名")
     parser.add_argument("--strategy_ckpt", type=str, default=None, help="策略网络权重绝对路径")
     parser.add_argument("--direct_inference", action="store_true", help="强制启用策略网络直推")
     return parser.parse_args()
 
 
-def _build_output_dir(base_dir: Path, input_csv: Optional[str]) -> Path:
+def _build_output_dir(
+    base_dir: Path,
+    input_csv: Optional[str],
+    input_source: Optional[Dict[str, object]] = None,
+) -> Path:
     if input_csv:
         stem = Path(input_csv).stem
         normalized = [char if char.isalnum() or char in {"_", "-"} else "_" for char in stem]
         suffix = "".join(normalized).strip("_") or "evaluation"
     else:
-        suffix = "injury_test_split"
+        split_name = "default"
+        if input_source and input_source.get("type") == "default_split":
+            split_name = str(input_source.get("selected_split", "default"))
+        suffix = f"injury_{split_name}_split"
     output_dir = base_dir / "saved_eval" / f"eval_{suffix}_{datetime.now().strftime('%m%d_%H%M%S')}"
     output_dir.mkdir(parents=True, exist_ok=False)
     return output_dir
@@ -241,8 +253,8 @@ def _prepare_eval_inputs(
     - 只要 baseline 缺列、缺值或整组不合法，就整行回退到 default；
     - 输入端校验只按完整物理定义域执行，不额外要求落在优化子范围内。
 
-    strict_provided_validation=False 只用于内部 test split：
-    - baseline 直接使用测试集已有完整参数；
+    strict_provided_validation=False 只用于内部默认 split 评估：
+    - baseline 直接使用所选 split 已有完整参数；
     - 只检查缺失值，不再按优化子范围做过滤。
     """
     context_params = param_manager.get_context_params()
@@ -264,12 +276,12 @@ def _prepare_eval_inputs(
         if strict_provided_validation:
             logger.warning("input_csv 缺失 context 列，这些列对应的 case 将被逐行跳过: %s", missing_context)
         else:
-            raise ValueError(f"测试集缺失 context 列: {missing_context}")
+            raise ValueError(f"默认 split 评估样本缺失 context 列: {missing_context}")
     if missing_trainable:
         if strict_provided_validation:
             logger.warning("input_csv 缺失部分 trainable control 列；这些 case 的 baseline 将整组回退为 default: %s", missing_trainable)
         else:
-            raise ValueError(f"测试集缺失 trainable control 列: {missing_trainable}")
+            raise ValueError(f"默认 split 评估样本缺失 trainable control 列: {missing_trainable}")
 
     if not strict_provided_validation:
         context_eval_df = context_df_raw.astype(np.float32)
@@ -279,7 +291,7 @@ def _prepare_eval_inputs(
         if missing_context_rows.any() or missing_trainable_rows.any():
             bad_rows = np.flatnonzero(missing_context_rows | missing_trainable_rows)
             raise ValueError(
-                "测试集样本存在缺失值，不符合评估前提。行号: "
+                "默认 split 评估样本存在缺失值，不符合评估前提。行号: "
                 f"{_format_row_list(bad_rows)}"
             )
         valid_mask = np.ones(len(df_input), dtype=bool)
@@ -395,7 +407,74 @@ def _prepare_eval_inputs(
         sorted(set(reverted_baseline_rows)),
     )
 
-def _load_eval_input(args, logger) -> tuple[pd.DataFrame, Dict[str, np.ndarray], Dict[str, str]]:
+def _load_default_split_eval_input(logger) -> tuple[pd.DataFrame, Dict[str, np.ndarray], Dict[str, object]]:
+    """装载未指定 input_csv 时的默认评估输入。
+
+    默认优先使用 injury test split；
+    若 test split 文件不存在或为空，则自动回退到 injury val split。
+    两者都不可用时直接报错，不引入额外隐式 fallback。
+    """
+    pool_path = RAW_DATA
+    if not pool_path.exists():
+        raise FileNotFoundError(f"默认 split 评估模式需要原始打包数据文件: {pool_path}")
+
+    split_status: Dict[str, str] = {}
+    selected_split = None
+    selected_idx_path = None
+    selected_indices = None
+    for split_name in ("test", "val"):
+        idx_path = get_split_indices_path("injury", split_name)
+        if not idx_path.exists():
+            split_status[split_name] = "missing"
+            continue
+        indices = load_int_vector_csv(idx_path)
+        if indices.size == 0:
+            split_status[split_name] = "empty"
+            continue
+        split_status[split_name] = "selected"
+        selected_split = split_name
+        selected_idx_path = idx_path
+        selected_indices = indices
+        break
+
+    if selected_split is None or selected_idx_path is None or selected_indices is None:
+        status_text = ", ".join(f"{name}={split_status.get(name, 'missing')}" for name in ("test", "val"))
+        raise ValueError(
+            "未指定 input_csv 时，默认评估需要可用的 injury_test 或 injury_val split。"
+            f"当前状态: {status_text}"
+        )
+
+    truth_arrays: Dict[str, np.ndarray] = {}
+    with np.load(str(pool_path), allow_pickle=True) as data:
+        x_att_raw = data["x_att_raw"][selected_indices]
+        df_input = pd.DataFrame(x_att_raw, columns=FEATURE_ORDER)
+        case_ids = data["case_ids"][selected_indices] if "case_ids" in data else np.arange(len(selected_indices))
+        df_input.insert(0, "case_id", case_ids)
+        for key in ["y_HIC", "y_Dmax", "y_Nij", "ais_head", "ais_chest", "ais_neck"]:
+            if key in data:
+                truth_arrays[key] = np.asarray(data[key][selected_indices])
+
+    if selected_split == "test":
+        logger.info("未指定 input_csv，自动加载默认评估 split=test: %d 条", len(df_input))
+    else:
+        logger.warning(
+            "未指定 input_csv，injury_test split %s，已自动回退到默认评估 split=val: %d 条",
+            split_status.get("test", "missing"),
+            len(df_input),
+        )
+    input_source = {
+        "type": "default_split",
+        "selected_split": selected_split,
+        "candidate_priority": ["test", "val"],
+        "fallback_from_test": selected_split != "test",
+        "split_status": split_status,
+        "path": str(selected_idx_path.resolve()),
+        "raw_data_npz_path": str(pool_path.resolve()),
+    }
+    return df_input, truth_arrays, input_source
+
+
+def _load_eval_input(args, logger) -> tuple[pd.DataFrame, Dict[str, np.ndarray], Dict[str, object]]:
     """装载评估输入与可选真值列。
 
     该函数只负责确定评估样本和可选真值从哪里读取，
@@ -413,29 +492,7 @@ def _load_eval_input(args, logger) -> tuple[pd.DataFrame, Dict[str, np.ndarray],
                 truth_arrays[key] = df_input[key].to_numpy(dtype=np.float32)
         return df_input, truth_arrays, input_source
 
-    pool_path = RAW_DATA_DIR / "raw_data_packed.npz"
-    test_idx_path = SPLIT_INDICES_DIR / "injury_test_indices.csv"
-    if not pool_path.exists() or not test_idx_path.exists():
-        raise FileNotFoundError("自动测试集模式需要 raw_data_packed.npz 和 injury_test_indices.csv")
-
-    test_indices = load_int_vector_csv(test_idx_path)
-    if test_indices.size == 0:
-        raise ValueError("自动测试集模式对应的 injury_test_indices.csv 为空；请提供 --input_csv 或重新生成划分。")
-    with np.load(str(pool_path), allow_pickle=True) as data:
-        x_att_raw = data["x_att_raw"][test_indices]
-        df_input = pd.DataFrame(x_att_raw, columns=FEATURE_ORDER)
-        case_ids = data["case_ids"][test_indices] if "case_ids" in data else np.arange(len(test_indices))
-        df_input.insert(0, "case_id", case_ids)
-        for key in ["y_HIC", "y_Dmax", "y_Nij", "ais_head", "ais_chest", "ais_neck"]:
-            if key in data:
-                truth_arrays[key] = np.asarray(data[key][test_indices])
-    logger.info(f"未指定 input_csv，自动加载测试集: {len(df_input)} 条")
-    input_source = {
-        "type": "test_split",
-        "path": str(test_idx_path.resolve()),
-        "raw_data_npz_path": str(pool_path.resolve()),
-    }
-    return df_input, truth_arrays, input_source
+    return _load_default_split_eval_input(logger)
 
 
 def _compute_predictions_batch(
@@ -635,15 +692,15 @@ def _build_truth_metric_dataframe(
     truth_arrays: Dict[str, np.ndarray],
     ot_array: np.ndarray,
 ) -> pd.DataFrame:
-    """把测试集真值整理成与各阶段同口径的损伤、风险和 AIS 列。
+    """把默认 split 或外部 CSV 自带的真值整理成统一列结构。
 
     run_eval 的结果表需要同时支持两类用途：
     1. 比较 Base、Opt1、Opt2 各阶段的降损效果；
-    2. 在测试集模式下，把代理预测与仿真真值并排查看。
+    2. 在带真值的评估模式下，把代理预测与仿真真值并排查看。
 
     因此这里把 True_ 列也整理成与各阶段平行的结构。
     这样下游绘图脚本和结果分析代码只需按统一列命名规则取值，
-    不必为测试集真值再额外维护一套特例分支。
+    不必为 test split、val split 或外部 CSV 真值分别维护特例分支。
     """
     truth_df = pd.DataFrame(
         {
@@ -734,7 +791,7 @@ def _build_result_dataframe(
     truth_vs_df = None
 
     if all(key in truth_arrays for key in ["y_HIC", "y_Dmax", "y_Nij"]):
-        # 测试集模式下把真值也整理成与各阶段同口径的列，便于直接并排比较。
+        # 只要输入侧自带真值，就把 True_ 列并排展开，便于与 Base/Opt1/Opt2 直接对比。
         truth_df = _build_truth_metric_dataframe(truth_arrays=truth_arrays, ot_array=ot_array).reset_index(drop=True)
         for stage_name in STAGE_NAMES:
             if stage_name != "Base" and stage_name not in available_opt_stages:
@@ -768,7 +825,7 @@ def _build_evaluation_record(
     output_dir: Path,
     output_csv_path: Path,
     config_snapshots: Dict[str, str],
-    input_source: Dict[str, str],
+    input_source: Dict[str, object],
     strategy_ckpt_path: Optional[Path],
     config: dict,
     param_manager: ParamManager,
@@ -874,7 +931,7 @@ def main():
             batch_size=1024,
             device=device,
             seed=seed,
-            split_indices_path=str(SPLIT_INDICES_DIR / "injury_train_indices.csv"),
+            split_indices_path=str(get_split_indices_path("injury", "train")),
             jitter_ratio=0.0,
             jitter_prob=0.0,
         )
@@ -992,7 +1049,7 @@ def main():
     evaluated_case_count = int(valid_mask.sum())
     top_cases = _build_top_cases_summary(result_df, optimized_stage_name=optimized_stage_name, top_n=5)
     # 在所有前置校验和模型推理都完成后再创建输出目录，避免早退时留下空目录。
-    output_dir = _build_output_dir(base_dir, args.input_csv)
+    output_dir = _build_output_dir(base_dir, args.input_csv, input_source=input_source)
     results_dir = output_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=False)
     output_csv_path = results_dir / Path(args.output_csv).name
