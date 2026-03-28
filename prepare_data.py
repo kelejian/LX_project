@@ -15,13 +15,15 @@ from common.settings import (
     NORMALIZATION_CONFIG_PATH,
     RAW_DATA,
     REQUIRED_COLUMNS_FOR_PACKING,
-    SPLIT_INDICES_DIR,
+    SPLIT_ROOT_DIR,
     WAVEFORM_CHANNELS_XY,
     WAVEFORM_CHANNELS_XYZ,
     WAVEFORM_LENGTH,
     ensure_dirs,
+    get_injury_split_dir,
     get_split_case_ids_path,
     get_split_indices_path,
+    get_pulse_split_dir,
 )
 from common.data_utils.splitter import stratified_split_case_ids, case_ids_to_indices
 from common.data_utils.processor import UnifiedDataProcessor
@@ -170,12 +172,107 @@ def _load_waveforms_batch(
     return x_acc_xyz, x_acc_xy, ok_mask
 
 
+def _normalize_side_series(side_series: pd.Series, scope: str) -> pd.Series:
+    """把 is_driver_side 统一校验并转为 0/1 整数。"""
+    side_numeric = pd.to_numeric(side_series, errors="coerce")
+    invalid_mask = ~side_numeric.isin([0, 1])
+    if invalid_mask.any():
+        invalid_values = side_series.loc[invalid_mask].head(10).tolist()
+        raise ValueError(
+            f"{scope} 中存在非法 is_driver_side 取值，必须为 0/1。"
+            f" 示例值: {invalid_values}"
+        )
+    return side_numeric.astype(np.int64)
+
+
+def _split_case_ids_or_empty(
+    case_ids: np.ndarray,
+    stratify_labels: np.ndarray,
+    *,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+    rule: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    """在允许空集合的前提下执行 case_id 划分。"""
+    case_ids = np.asarray(case_ids, dtype=np.int64)
+    stratify_labels = np.asarray(stratify_labels)
+    if case_ids.ndim != 1:
+        raise ValueError("case_ids 必须为一维数组")
+    if stratify_labels.ndim != 1 or stratify_labels.shape[0] != case_ids.shape[0]:
+        raise ValueError("stratify_labels 必须与 case_ids 一一对应")
+
+    if case_ids.size == 0:
+        return (
+            np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.int64),
+            np.empty((0,), dtype=np.int64),
+            {
+                "rule": rule,
+                "total_final": 0,
+                "train_final": 0,
+                "val_final": 0,
+                "test_final": 0,
+                "total_ori": 0,
+                "forced": {"train": 0, "valid": 0, "test": 0, "exclude": 0},
+                "date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
+
+    train_ids, val_ids, test_ids, summary = stratified_split_case_ids(
+        case_ids=case_ids,
+        stratify_labels=stratify_labels,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+        special_case_assignments=None,
+        seed=seed,
+    )
+    summary = dict(summary)
+    summary.update({
+        "rule": rule,
+        "date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    return (
+        np.asarray(train_ids, dtype=np.int64),
+        np.asarray(val_ids, dtype=np.int64),
+        np.asarray(test_ids, dtype=np.int64),
+        summary,
+    )
+
+
+def _merge_split_triplets(
+    split_a: Dict[str, np.ndarray],
+    split_b: Dict[str, np.ndarray],
+) -> Dict[str, np.ndarray]:
+    """按 train/val/test 维度把两套互斥划分合并。"""
+    split_names = ("train", "val", "test")
+    for split_name_a in split_names:
+        arr_a = np.asarray(split_a[split_name_a], dtype=np.int64)
+        for split_name_b in split_names:
+            arr_b = np.asarray(split_b[split_name_b], dtype=np.int64)
+            overlap = np.intersect1d(arr_a, arr_b, assume_unique=False)
+            if overlap.size == 0:
+                continue
+            raise ValueError(
+                f"合并 split 时检测到跨侧冲突：{split_name_a} vs {split_name_b} 存在重复 ID，共 {overlap.size} 个，"
+                f"示例: {overlap[:10].tolist()}"
+            )
+
+    merged = {}
+    for split_name in split_names:
+        arr_a = np.asarray(split_a[split_name], dtype=np.int64)
+        arr_b = np.asarray(split_b[split_name], dtype=np.int64)
+        merged[split_name] = np.unique(np.concatenate([arr_a, arr_b])).astype(np.int64, copy=False)
+    return merged
+
+
 def package_raw_packed(
     distribution_path: Path,
     pulse_dir: Path,
     output_npz: Path,
     strict: bool = True,
-    side: str = "both"
 ) -> Path:
     """打包原始数据到 raw_packed.npz。
     """
@@ -187,36 +284,17 @@ def package_raw_packed(
 
     print(f"✅️ distribution 文件已读取: {distribution_path}")
 
-    side_normalized = str(side).strip().upper()
-    if side_normalized not in {"PS", "DS", "BOTH"}:
-        raise ValueError(f"side 参数无效: {side}, 必须是 'PS'（副驾）、'DS'（主驾）或 'both'（主/副驾）")
-
-    if "is_driver_side" not in df.columns:
-        raise ValueError("distribution 缺少 is_driver_side 列，无法按主/副驾筛选")
-
-    # 转换为数值，保留 float 格式以容纳 NaN，避免 astype 报错
-    df["is_driver_side"] = pd.to_numeric(df["is_driver_side"], errors="coerce")
-    invalid_side_mask = ~df["is_driver_side"].isin([0, 1])
-    if invalid_side_mask.any():
-        print(f"⚠️ is_driver_side 列存在无效值或空值，这些行将在筛选阶段被忽略。")
-
-    if side_normalized == "PS":
-        df = df.loc[df["is_driver_side"] == 0].copy()
-    elif side_normalized == "DS":
-        df = df.loc[df["is_driver_side"] == 1].copy()
-    elif side_normalized == "BOTH":
-        # 显式仅保留 0 和 1
-        df = df.loc[df["is_driver_side"].isin([0, 1])].copy()
-
-    if df.empty:
-        raise RuntimeError(f"筛选失败：side='{side}' 对应的样本量为 0，请检查数据源。")
-    print(f"✅️ 已按 side='{side}' 筛选，剩余 {df.shape[0]} 个样本，准备打包")
-
     # 只打包 is_pulse_ok==True 的 case
     pulse_ok_mask = df["is_pulse_ok"].fillna(False).astype(bool)
     pulse_df = df.loc[pulse_ok_mask].copy() # 仅包含 is_pulse_ok==True 的样本，后续如果 strict=False 则会在读取波形时进一步过滤掉那些缺失波形的 case
     if pulse_df.shape[0] == 0:
-        raise RuntimeError(f"side={side_normalized} 筛选后没有 is_pulse_ok==True 的样本，无法打包")
+        raise RuntimeError("distribution 中没有 is_pulse_ok==True 的样本，无法打包")
+    if "is_driver_side" not in pulse_df.columns:
+        raise ValueError("distribution 缺少 is_driver_side 列，无法生成主驾/副驾/合并三套划分")
+    pulse_df["is_driver_side"] = _normalize_side_series(
+        pulse_df["is_driver_side"],
+        scope="raw_packed 待打包样本",
+    )
     print(f"✅️ 已筛选出 {pulse_df.shape[0]} 个 is_pulse_ok==True 的样本")
     # ---------------------------
     # 1) 向量化：case_ids / params / 标志位
@@ -397,143 +475,59 @@ def generate_splits(
     val_ratio: float,
     test_ratio: float
 ):
+    """基于 raw_packed 生成 injury/pulse 两个任务的三套划分。
+
+    输出结构：
+      <out_dir>/injury/{driver,passenger,combined}/
+      <out_dir>/pulse/
+
+    其中 injury 的 combined 严格由 driver 与 passenger 对应 split 的并集构成，
+    不会把某一侧的 val/test 样本混入另一侧的 train；
+    pulse 仅保留一套完整数据划分。
     """
-    基于打包数据.npz文件 生成 injury/pulse 两套划分结果。
-    生成的./data 下保存的所有数据集索引(_indices.csv 文件)，严格对应 raw_data_packed.npz 中各个 np.ndarray 的行索引. raw_data_packed.npz 目前只包含 is_pulse_ok==True 的样本。
-    """
+    split_root = Path(out_dir)
     data = np.load(raw_npz_path)
-    case_ids_all = data["case_ids"].astype(np.int64) # (N,), 全量 pulse_ok==True 的 case_ids
+    case_ids_all = data["case_ids"].astype(np.int64)
     if "pulse_source_case_ids" not in data.files:
         raise KeyError("raw_packed.npz 缺少必要键 'pulse_source_case_ids'，请先使用最新 prepare_data.py 重新打包")
-    pulse_source_case_ids_all = data["pulse_source_case_ids"].astype(np.int64) # (N,), 与 case_ids_all 对齐
-    x_att_raw = data["x_att_raw"].astype(np.float32)  # (N, len(FEATURE_ORDER))
-    is_injury_ok = data["is_injury_ok"].astype(bool) # (N,), 打包时取值已统一布尔化，此处取值仅有 True/False
+    pulse_source_case_ids_all = data["pulse_source_case_ids"].astype(np.int64)
+    x_att_raw = data["x_att_raw"].astype(np.float32)
+    is_injury_ok = data["is_injury_ok"].astype(bool)
     mais = data["mais"].astype(np.int64)
 
-    # 1) injury split：仅基于 injury_ok==True 的子集，按 MAIS 分层
-    injury_mask = is_injury_ok
-    injury_case_ids = case_ids_all[injury_mask]
-    injury_labels = mais[injury_mask]
+    side_idx = FEATURE_ORDER.index("is_driver_side")
+    side_values_raw = x_att_raw[:, side_idx]
+    side_values_rounded = np.rint(side_values_raw).astype(np.int64)
+    if not np.allclose(side_values_raw, side_values_rounded.astype(np.float32), atol=1e-6):
+        raise ValueError("raw_packed 中 is_driver_side 列存在非整数值，无法生成主驾/副驾划分")
+    if not np.isin(side_values_rounded, [0, 1]).all():
+        bad_values = np.unique(side_values_rounded[~np.isin(side_values_rounded, [0, 1])]).tolist()
+        raise ValueError(f"raw_packed 中 is_driver_side 只能取 0/1，当前检测到非法值: {bad_values}")
 
-    train_inj, val_inj, test_inj, summary_inj = stratified_split_case_ids(
-        injury_case_ids, # 仅 injury_ok==True 的 case_ids
-        injury_labels,
+    side_masks = {
+        "driver": side_values_rounded == 1,
+        "passenger": side_values_rounded == 0,
+    }
+    side_labels = {
+        "driver": "主驾",
+        "passenger": "副驾",
+        "combined": "主副驾合并",
+    }
+
+    # ------------------------------------------------------------------
+    # 1) Pulse split：仅基于完整 pulse_source_case_id 全集独立划分，不区分主/副驾。
+    # ------------------------------------------------------------------
+    pulse_source_ids = np.unique(pulse_source_case_ids_all).astype(np.int64)
+    pulse_train, pulse_val, pulse_test, pulse_summary = _split_case_ids_or_empty(
+        case_ids=pulse_source_ids,
+        stratify_labels=np.zeros(pulse_source_ids.shape[0], dtype=np.int64),
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         test_ratio=test_ratio,
-        special_case_assignments=None,
-        seed=seed
-    ) # 返回的是划分后的 case_ids 列表
+        seed=seed,
+        rule="pulse_source_case_ids_random_split_independent_from_injury",
+    )
 
-    summary_inj.update({
-        "rule": "injury_ok_only_stratify_by_MAIS",
-        "date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-    })
-
-    # 此处的 case_ids_all 是全量 pulse_ok==True 的 case_ids; train_inj/val_inj/test_inj 为划分后的 case_ids 列表
-    _save_split(out_dir, "injury", case_ids_all, train_inj, val_inj, test_inj, summary_inj)
-
-    # 2) pulse split：按 pulse_source_case_id 进行继承与分配
-    # ------------------------------------------------------------------
-    rng = np.random.default_rng(seed)
-    split_ratio_map = {
-        "train": float(train_ratio),
-        "val": float(val_ratio),
-        "test": float(test_ratio),
-    }
-
-    train_inj_set = set(train_inj.tolist())
-    val_inj_set = set(val_inj.tolist())
-    test_inj_set = set(test_inj.tolist())
-    case_to_split = {}
-    case_to_split.update({cid: "train" for cid in train_inj_set})
-    case_to_split.update({cid: "val" for cid in val_inj_set})
-    case_to_split.update({cid: "test" for cid in test_inj_set})
-    # e.g.,case_to_split == {100:'train', 103:'train', 101:'val', 105:'test', 50106:'val'}
-
-    # 继承 injury split 中的 pulse_source_case_id（去重）
-    injury_case_id_to_source = dict(zip(case_ids_all[injury_mask].tolist(), pulse_source_case_ids_all[injury_mask].tolist()))
-    # e.g., injury_case_id_to_source == {100:100, 101:100, 103:101, 105:105, 50106:106}，其中 key 是 injury_case_id，value 是对应的 pulse_source_case_id
-    source_membership = {}
-    for cid, src in injury_case_id_to_source.items():
-        if cid not in case_to_split:
-            raise ValueError(f"case_id {cid} 在 injury split 中但不在 case_to_split 映射中")
-        src_int = int(src)
-        source_membership.setdefault(src_int, set()).add(case_to_split[cid])
-        # e.g., source_membership == {100:{'train','val'}, 101:{'train'}, 105:{'test'}, 106:{'val'}}，其中 key 是 pulse_source_case_id，value 是一个集合，表示该 pulse_source_case_id 对应的 case_id 在 injury split 中分别属于哪些划分（train/val/test）
-
-    inherited_sources = {"train": set(), "val": set(), "test": set()}
-    for src, memberships in source_membership.items():
-        members = sorted(list(memberships))
-        if len(members) == 1: # 比如 source_membership 中的 101 只出现在 train_inj 中，那么它的 pulse_source_case_id=101 就直接被 train_inj 继承，无需按比例分配
-            inherited_sources[members[0]].add(src)
-            continue
-        # print(f"⚠️ 冲突：pulse_source_case_id={src} 对应的 case_id 在 injury split 中同时出现在 {members} 中，将按 train/val/test_ratio 进行分配")
-        # 同一 pulse_source 出现在多个 injury 划分：按 train/val/test_ratio（在冲突成员内归一化）分配
-        weights = np.array([split_ratio_map[m] for m in members], dtype=np.float64)
-        weight_sum = float(weights.sum())
-        if weight_sum <= 0:
-            raise ValueError(f"划分比例之和必须大于0，当前为 {weight_sum}，请检查 train/val/test_ratio 的设置")
-        else:
-            probs = weights / weight_sum
-        chosen_split = members[int(rng.choice(np.arange(len(members)), p=probs))] # e.g., 对于 source_membership 中的 100，members=['train','val']，则chosen_split 可能是 'train' 或 'val'，概率分别为 train_ratio/(train_ratio+val_ratio) 和 val_ratio/(train_ratio+val_ratio)
-        inherited_sources[chosen_split].add(src)
-    # e.g., inherited_sources == {'train': {100, 101}, 'val': {106}, 'test': {105}}, 其中 key 是划分（train/val/test），value 是一个集合，表示该划分继承了哪些 pulse_source_case_id (而非 case_id！)
-
-    inherited_union = set().union(*inherited_sources.values()) # 将字典的值合并在集合中，e.g. inherited_union == {100,101,105,106}, 均为 pulse_source_case_id
-
-    # pulse-only: pulse_ok==True 且 is_injury_ok!=True 且其 pulse_source 尚未被继承
-    pulse_only_mask = (~is_injury_ok) & (~np.isin(pulse_source_case_ids_all, list(inherited_union)))
-    # pulse_only_sources 是 pulse_only_mask 中对应的 pulse_source_case_id 的唯一值列表（整数类型）
-    pulse_only_sources = np.unique(pulse_source_case_ids_all[pulse_only_mask]).astype(np.int64)
-    shuffled_sources = pulse_only_sources.copy()
-    rng.shuffle(shuffled_sources)
-
-    n_total_src = int(shuffled_sources.shape[0])
-    n_train_src = int(round(n_total_src * train_ratio))
-    n_val_src = int(round(n_total_src * val_ratio))
-    extra_train_sources = set(shuffled_sources[:n_train_src].tolist())
-    extra_val_sources = set(shuffled_sources[n_train_src:n_train_src + n_val_src].tolist())
-    extra_test_sources = set(shuffled_sources[n_train_src + n_val_src:].tolist())
-
-    final_sources = {
-        "train": inherited_sources["train"] | extra_train_sources,
-        "val": inherited_sources["val"] | extra_val_sources,
-        "test": inherited_sources["test"] | extra_test_sources,
-    }
-
-    # 波形预测数据集直接使用 pulse_source_case_ids 作为 case_ids（确保唯一性）
-    pulse_train = np.asarray(sorted(final_sources["train"]), dtype=np.int64)
-    pulse_val = np.asarray(sorted(final_sources["val"]), dtype=np.int64)
-    pulse_test = np.asarray(sorted(final_sources["test"]), dtype=np.int64)
-
-    # 冲突检查：同一case不能同时出现在多个集合
-    if (set(pulse_train.tolist()) & set(pulse_val.tolist())) or \
-       (set(pulse_train.tolist()) & set(pulse_test.tolist())) or \
-       (set(pulse_val.tolist()) & set(pulse_test.tolist())):
-        raise ValueError("pulse split 生成后检测到集合交叉")
-
-    summary_pulse = {
-        "rule": "inherit_injury_pulse_source_ids + resolve_cross_split_conflicts_by_ratio + add_pulse_only_sources_by_ratio",
-        "total_final": int(pulse_train.shape[0] + pulse_val.shape[0] + pulse_test.shape[0]),
-        "train_final": int(pulse_train.shape[0]),
-        "val_final": int(pulse_val.shape[0]),
-        "test_final": int(pulse_test.shape[0]),
-        "inherited_source_counts": {
-            "train": int(len(inherited_sources["train"])),
-            "val": int(len(inherited_sources["val"])),
-            "test": int(len(inherited_sources["test"])),
-        },
-        "pulse_only_source_counts": {
-            "train": int(len(extra_train_sources)),
-            "val": int(len(extra_val_sources)),
-            "test": int(len(extra_test_sources)),
-            "total": int(n_total_src),
-        },
-        "date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-
-    # 严格校验：所有 split 的 source_id 必须都来自 raw_packed 中出现过的 pulse_source_case_id
     universe_set = set(np.unique(pulse_source_case_ids_all).astype(np.int64).tolist())
     for split_name, split_ids in {
         "train": pulse_train,
@@ -543,37 +537,129 @@ def generate_splits(
         unknown = sorted(set(split_ids.tolist()) - universe_set)
         if unknown:
             raise ValueError(
-                f"pulse {split_name} split 中存在不在 pulse_source_case_ids 全集中的ID，共 {len(unknown)} 个，示例: {unknown[:10]}"
+                f"pulse {split_name} split 中存在不在 pulse_source_case_ids 全集中的 source_id，共 {len(unknown)} 个，"
+                f"示例: {unknown[:10]}"
             )
 
+    pulse_summary.update({
+        "task": "pulse",
+        "variant": "all",
+        "variant_label": "完整 pulse 数据",
+        "raw_packed_path": str(Path(raw_npz_path).resolve()),
+        "split_dir": str(get_pulse_split_dir(split_root).resolve()),
+    })
     _save_pulse_split_with_first_occurrence_indices(
-        out_dir=out_dir,
+        out_dir=get_pulse_split_dir(split_root),
         pulse_source_case_ids_all=pulse_source_case_ids_all,
         train_source_ids=pulse_train,
         val_source_ids=pulse_val,
         test_source_ids=pulse_test,
-        summary=summary_pulse,
+        summary=pulse_summary,
     )
 
+    # ------------------------------------------------------------------
+    # 2) Injury split：主驾 / 副驾独立分层，combined = 两侧同名 split 的并集
+    # ------------------------------------------------------------------
+    # 先按照仅主驾和仅副驾去划分，然后按同名 split 做并集得到 combined
+    
+    injury_side_splits: Dict[str, Dict[str, np.ndarray]] = {}
+    for variant in ("driver", "passenger"):
+        variant_mask = is_injury_ok & side_masks[variant]
+        variant_case_ids = case_ids_all[variant_mask]
+        variant_labels = mais[variant_mask]
+        train_ids, val_ids, test_ids, summary = _split_case_ids_or_empty(
+            case_ids=variant_case_ids,
+            stratify_labels=variant_labels,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            seed=seed,
+            rule="injury_ok_only_stratify_by_MAIS_per_side",
+        )
+        summary.update({
+            "task": "injury",
+            "variant": variant,
+            "variant_label": side_labels[variant],
+            "raw_packed_path": str(Path(raw_npz_path).resolve()),
+            "split_dir": str(get_injury_split_dir(variant, split_root).resolve()),
+        })
+        injury_side_splits[variant] = {
+            "train": train_ids,
+            "val": val_ids,
+            "test": test_ids,
+        }
+        _save_split(
+            out_dir=get_injury_split_dir(variant, split_root),
+            prefix="injury",
+            case_ids_all=case_ids_all,
+            train_case_ids=train_ids,
+            val_case_ids=val_ids,
+            test_case_ids=test_ids,
+            summary=summary,
+        )
+
+    injury_combined = _merge_split_triplets(
+        injury_side_splits["driver"],
+        injury_side_splits["passenger"],
+    )
+    summary_injury_combined = {
+        "task": "injury",
+        "variant": "combined",
+        "variant_label": side_labels["combined"],
+        "rule": "combined_split_equals_driver_split_union_passenger_split",
+        "raw_packed_path": str(Path(raw_npz_path).resolve()),
+        "split_dir": str(get_injury_split_dir("combined", split_root).resolve()),
+        "component_split_dirs": {
+            "driver": str(get_injury_split_dir("driver", split_root).resolve()),
+            "passenger": str(get_injury_split_dir("passenger", split_root).resolve()),
+        },
+        "total_final": int(
+            injury_combined["train"].size + injury_combined["val"].size + injury_combined["test"].size
+        ),
+        "train_final": int(injury_combined["train"].size),
+        "val_final": int(injury_combined["val"].size),
+        "test_final": int(injury_combined["test"].size),
+        "driver_component_counts": {
+            split_name: int(injury_side_splits["driver"][split_name].size)
+            for split_name in ("train", "val", "test")
+        },
+        "passenger_component_counts": {
+            split_name: int(injury_side_splits["passenger"][split_name].size)
+            for split_name in ("train", "val", "test")
+        },
+        "date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _save_split(
+        out_dir=get_injury_split_dir("combined", split_root),
+        prefix="injury",
+        case_ids_all=case_ids_all,
+        train_case_ids=injury_combined["train"],
+        val_case_ids=injury_combined["val"],
+        test_case_ids=injury_combined["test"],
+        summary=summary_injury_combined,
+    )
 
 def main():
-    parser = argparse.ArgumentParser(description="准备数据：raw_packed打包 + injury/pulse两套索引划分")
-    parser.add_argument("--distribution", type=str, 
-                        default=r'E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0321.csv',  
-                        help="distribution .csv/.npz 路径")
-    parser.add_argument("--pulse-dir", type=str, 
-                        default=r'G:\VCS_acc_data\acc_data_before1111_6134', 
-                        help="波形CSV目录（包含x*.csv/y*.csv/z*.csv）")
-    #--------------------------------------------------------------------------------------
-    parser.add_argument("--side", type=str, default="both", help="选择打包哪一侧样本: DS(主驾) | PS(副驾) | both(主副驾)")
+    parser = argparse.ArgumentParser(description="准备数据：raw_packed 打包 + injury 三套索引划分（driver/passenger/combined）+ pulse 单套完整划分")
+    parser.add_argument(
+        "--distribution",
+        type=str,
+        default=r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0321.csv",
+        help="distribution 源文件路径，支持 .csv / .npz；绝对路径或相对路径均可",
+    )
+    parser.add_argument(
+        "--pulse-dir",
+        type=str,
+        default=r"G:\VCS_acc_data\acc_data_before1111_6134",
+        help="波形 CSV 目录路径，目录内应包含 x*.csv / y*.csv / z*.csv；绝对路径或相对路径均可",
+    )
+    
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
-    #--------------------------------------------------------------------------------------
-    parser.add_argument("--out-raw", type=str, 
-                        default=str(RAW_DATA), 
-                        help="输出raw_packed npz路径")
-    parser.add_argument("--out-splits", type=str, default=str(SPLIT_INDICES_DIR), help="输出split_indices目录")
+
+    parser.add_argument("--out-raw",type=str,default=str(RAW_DATA),help="raw_packed 输出文件路径；绝对路径或相对路径均可",)
+    parser.add_argument("--out-splits",type=str,default=str(SPLIT_ROOT_DIR),help="split 输出根目录；绝对路径或相对路径均可，目录下会自动创建 injury/{driver,passenger,combined} 与 pulse 子目录")
     parser.add_argument("--seed", type=int, default=GLOBAL_SEED, help="随机种子; 默认值为common/utils/seeding.py中的GLOBAL_SEED")
     parser.add_argument("--non-strict", action="store_true", help="非严格模式：遇到缺失波形/异常case则跳过; 若无此标志则严格模式报错退出")
 
@@ -593,7 +679,6 @@ def main():
         pulse_dir=pulse_dir,
         output_npz=out_raw,
         strict=(not args.non_strict),
-        side=args.side,
     )
     # ========================================================== 
     generate_splits(
@@ -606,7 +691,8 @@ def main():
     )
 
     print(f"\n✅️ raw_packed (原始数值尺度, 未归一化) 已生成: {out_raw}")
-    print(f"✅️ split_indices 已生成: {out_splits}")
+    print(f"✅️ injury combined split 已生成: {get_injury_split_dir('combined', out_splits)}")
+    print(f"✅️ pulse split 已生成: {get_pulse_split_dir(out_splits)}")
 
     # ================================================================
     # 归一化配置生成逻辑
@@ -617,7 +703,7 @@ def main():
     
     # 加载打包数据和训练集索引
     raw_data = np.load(out_raw)
-    train_indices_path = get_split_indices_path("injury", "train", out_splits)
+    train_indices_path = get_split_indices_path("injury", "train", get_injury_split_dir("combined", out_splits))
     
     if train_indices_path.exists():
         train_indices = load_int_vector_csv(train_indices_path)
@@ -635,7 +721,7 @@ def main():
             dataset_dict=train_data,
             top_k_waveform=50,
             dataset_id=str(out_raw.name),
-            fit_split=str(train_indices_path.name)
+            fit_split=str(train_indices_path.resolve())
         )
         if generated:
             print(f"✅️ 请检查并根据需要可手动编辑配置文件中的数值！")

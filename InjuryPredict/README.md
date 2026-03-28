@@ -23,11 +23,9 @@ InjuryPredict/
 本子项目涉及的共享数据路径统一来自 [common/settings.py](../common/settings.py)，尤其是：
 
 - `NORMALIZATION_CONFIG_PATH`
-- `SPLIT_INDICES_DIR`
+- `INJURY_SPLIT_DIR`
 - `INJURY_PROCESSED_DIR`
 - `get_injury_processed_dataset_path(...)`
-
-因此 README 中不再把输出路径写死为某个 `data/processed/injury`。如果你调整了共享数据目录名，应优先修改 `common/settings.py`。
 
 ## 4. 数据准备
 
@@ -45,6 +43,15 @@ python -m prepare_data
 
 ```bash
 python -m InjuryPredict.Injurydata_prepare
+```
+
+默认会读取 `common.settings.INJURY_SPLIT_DIR`，并把 `.pt` 文件写入 `common.settings.INJURY_PROCESSED_DIR`，两者都对应 `combined` 视角。
+
+如需为主驾或副驾单独生成 processed `.pt`，可显式指定：
+
+```bash
+python -m InjuryPredict.Injurydata_prepare --split-variant driver
+python -m InjuryPredict.Injurydata_prepare --split-variant passenger
 ```
 
 如需显式指定输出目录，也可以：

@@ -26,11 +26,11 @@ from torch.utils.data import Dataset, Subset
 import matplotlib.pyplot as plt
 
 from common.settings import (
-    INJURY_PROCESSED_DIR,
     NORMALIZATION_CONFIG_PATH,
     RAW_DATA,
-    SPLIT_INDICES_DIR,
     ensure_dirs,
+    get_injury_processed_dir,
+    get_injury_split_dir,
     get_injury_processed_dataset_path,
     get_split_indices_path,
 )
@@ -41,21 +41,55 @@ from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 
 # --------------------- CLI ---------------------
 def main(argv=None):
-    p = argparse.ArgumentParser(description="生成 InjuryPredict 所需的 .pt 数据集并输出统计图（使用 common.UnifiedDataProcessor）。\n注意：此脚本严格依赖由根目录的 prepare_data.py 预先生成的 raw_packed、split_indices 与 normalization_config.json；若缺失将直接报错。")
-    p.add_argument("--raw-npz", default=(RAW_DATA), type=Path,
-                   help="由 prepare_data.py 生成的原始打包文件（默认来自 common settings）")
-    p.add_argument("--norm-config", default=NORMALIZATION_CONFIG_PATH, type=Path, help="归一化配置文件路径（默认来自 common settings）")
-    p.add_argument("--split-dir", default=SPLIT_INDICES_DIR, type=Path, help="split indices 目录（默认来自 common settings）")
-    p.add_argument("--out-dir", default=INJURY_PROCESSED_DIR, type=Path, help="输出目录（默认来自 common settings）")
+    p = argparse.ArgumentParser(
+        description=(
+            "生成 InjuryPredict 所需的 processed .pt 数据子集，并输出统计图。"
+            "本脚本严格依赖根目录 prepare_data.py 预先生成的 "
+            "raw_packed、split_indices 与 normalization_config.json；若缺失将直接报错。"
+        )
+    )
+    p.add_argument(
+        "--split-variant",
+        choices=["combined", "driver", "passenger"],
+        default="combined",
+        help="选择使用哪一套 injury 划分结果；默认使用 combined。",
+    )
+    # 以下路径参数均支持绝对路径或相对路径。
+    p.add_argument(
+        "--raw-npz",
+        default=RAW_DATA,
+        type=Path,
+        help="prepare_data.py 生成的 raw_packed 文件路径；绝对路径或相对路径均可，默认使用 common.settings.RAW_DATA",
+    )
+    p.add_argument(
+        "--norm-config",
+        default=NORMALIZATION_CONFIG_PATH,
+        type=Path,
+        help="归一化配置文件路径；绝对路径或相对路径均可，默认使用 common.settings.NORMALIZATION_CONFIG_PATH",
+    )
+    p.add_argument(
+        "--split-dir",
+        default=None,
+        type=Path,
+        help="split indices 目录路径；绝对路径或相对路径均可，不提供时按 split-variant 使用 common.settings 中的默认目录",
+    )
+    p.add_argument(
+        "--out-dir",
+        default=None,
+        type=Path,
+        help="输出目录路径；绝对路径或相对路径均可，不提供时按 split-variant 使用 common.settings 中的默认目录",
+    )
     p.add_argument("--overwrite", action="store_true", help="覆盖已存在的train/val/test.pt 输出文件; 不设置则默认保护现有文件不被覆盖")
 
     args = p.parse_args(argv)
+    split_dir = Path(args.split_dir) if args.split_dir is not None else get_injury_split_dir(args.split_variant)
+    out_dir = Path(args.out_dir) if args.out_dir is not None else get_injury_processed_dir(args.split_variant)
 
     paths = build_and_save_splits(
         raw_packed=Path(args.raw_npz),
         norm_config=Path(args.norm_config),
-        split_dir=Path(args.split_dir),
-        out_dir=Path(args.out_dir),
+        split_dir=split_dir,
+        out_dir=out_dir,
         overwrite=args.overwrite,
     )
     return paths
@@ -246,6 +280,31 @@ def build_and_save_splits(
     
     # 7) 计算并保存统计信息 + 绘图
     summary = _compute_and_save_statistics(dataset, train_idx, val_idx, test_idx, paths["figs"])
+    default_entry_reads_this_dir = out_dir.resolve() == get_injury_processed_dir("combined").resolve()
+    summary.update(
+        {
+            "raw_packed_path": str(raw_packed.resolve()),
+            "normalization_config_path": str(norm_config.resolve()),
+            "split_variant": split_dir.name,
+            "split_source_dir": str(split_dir.resolve()),
+            "split_index_files": {
+                "train": str(train_idx_path.resolve()),
+                "val": str(val_idx_path.resolve()),
+                "test": str(test_idx_path.resolve()),
+            },
+            "pt_output_dir": str(out_dir.resolve()),
+            "pt_output_files": {
+                "train": str(paths["train"].resolve()),
+                "val": str(paths["val"].resolve()),
+                "test": str(paths["test"].resolve()),
+            },
+            "default_entrypoint_note": (
+                "当前 InjuryPredict 训练/评估入口默认通过 "
+                "common.settings.INJURY_PROCESSED_DIR 读取 processed .pt 子集。"
+            ),
+            "is_default_entrypoint_processed_dir": bool(default_entry_reads_this_dir),
+        }
+    )
     with open(paths["summary"], "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(f"统计与图像保存在: {paths['figs']} (摘要文件: {paths['summary']})")

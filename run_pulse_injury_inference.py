@@ -41,11 +41,11 @@ from PulsePredict.model.model import HybridPulseCNN
 
 
 DEFAULT_OUTPUT_ROOT = DATA_DIR / "inference_outputs"
-DEFAULT_PULSE_RUN_DIR = PULSE_PREDICT_DIR / "saved" / "models" / "HybridPulseCNN" / "0303_213959"
+DEFAULT_PULSE_RUN_DIR = PULSE_PREDICT_DIR / "saved" / "models" / "HybridPulseCNN" / "0324_214803"
 DEFAULT_INJURY_RUN_DIR = INJURY_PREDICT_DIR / "runs" / "DS_InjuryPredictModel_03212058"
 PULSE_FEATURE_NAMES = ["impact_velocity", "impact_angle", "overlap"]
 
-INPUT_CSV_FILE = Path(r"E:\\WPS Office\\1628575652\\WPS企业云盘\\清华大学\\我的企业文档\\课题组相关\\理想项目\\TestInput.csv")  # 可在此处修改输入CSV路径，或通过命令行参数覆盖
+INPUT_CSV_FILE = Path(r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_project\ARS_optim\saved_eval\12cases_for_sledtest_0327.csv")  # 可在此处修改输入CSV路径，或通过命令行参数覆盖
 
 def parse_args() -> argparse.Namespace:
     # 解析命令行参数，返回一个命名空间对象
@@ -415,7 +415,7 @@ def main() -> None:
     )
 
     # 根据需求生成宽格式CSV，每四列对应一个case
-    waveform_csv_path = waveform_dir / "predicted_waveforms.csv"
+    waveform_csv_path = waveform_dir / f"pred_pulses_of_{args.input_csv.stem}.csv"
     waveform_df = build_waveform_wide_dataframe(inputs_df["case_id"].to_numpy(dtype=np.int64), predicted_waveforms_xyz)
     waveform_df.to_csv(waveform_csv_path, index=False)
 

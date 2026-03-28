@@ -7,7 +7,7 @@ RUNS_DIR = "./InjuryPredict/runs"  # 模型训练结果的保存目录
 
 # 1. 优化与训练相关
 training_params = {
-    "Epochs": 400,
+    "Epochs": 500,
     "Batch_size": 64,
     "Learning_rate": 0.005,
     "Learning_rate_min": 0,
@@ -28,17 +28,17 @@ loss_params = {
 model_params = {
     "Ksize_init": 8,
     "Ksize_mid": 3,
-    "num_blocks_of_tcn": 3,
+    "num_blocks_of_tcn": 4,
     "tcn_channels_list": [32, 64, 128],  # 每个 TCN 块的输出通道数
     "tcn_output_dim": 128,  # TCN 编码器的输出特征维度
     "num_layers_of_mlpE": 3,
     "num_layers_of_mlpD": 2,
     "mlpE_hidden": 256,
-    "mlpD_hidden": 128,
+    "mlpD_hidden": 160,
     "mlp_encoder_output_dim": 128,  # MLP 编码器的输出特征维度
     "mlp_decoder_output_dim": 128,  # MLP 解码器的输出特征维度
     "dropout_MLP": 0.1,
-    "dropout_TCN": 0.05,
+    "dropout_TCN": 0.1,
     "use_channel_attention": True,  # 是否使用通道注意力机制
     "fixed_channel_weight": [0.7, 0.3],  # X, Y 通道的固定权重
 }

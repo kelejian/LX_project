@@ -8,17 +8,11 @@ from ARS_optim.src.param_manager import ParamManager
 
 
 class ConstraintEngine:
-    """统一管理 ARS 参数的只读校验、前向投影与软惩罚。
+    """统一管理 ARS 参数的输入端校验、输出端投影与软惩罚。
 
-    这里故意把“输入端校验”和“输出端合法化”拆开：
-    1. `validate_context_input`：只校验当前 context 列，供训练采样器与外部 CSV 的 context 检查使用；
-    2. `validate_full_input`：校验完整物理输入，但只看 base 范围和共享耦合规则；
-    3. `validate_output_solution`：校验寻优解，额外纳入 opt_min/opt_max 与仅输出端生效的额外约束；
-    4. `project_forward` / `compute_soft_penalty`：分别负责前向安全投影与反向梯度补偿。
-
-    这样做的原因是：同一条物理规则在不同阶段的适用范围并不相同。
-    如果把“输入端合法性”和“输出端寻优约束”混成一个入口，后续一旦切换某个
-    control 的 trainable 属性，就很容易出现静默误判。
+    输入端与输出端共用同一套物理规则，但适用范围不同，所以这里显式拆成
+    `validate_context_input`、`validate_full_input`、`validate_output_solution`
+    和 `project_forward` / `compute_soft_penalty`，避免 trainable 属性切换后出现静默误判。
     """
 
     def __init__(self, param_manager: ParamManager):
@@ -168,13 +162,22 @@ class ConstraintEngine:
                 "polygon_tensor": polygon_tensor,
             }
 
+        ra_ranges = self.rules.get("ra_ranges")
+        if ra_ranges is None:
+            if "ra_values" in self.rules:
+                raise ValueError("constraint_rules.ra_values 已废弃，请改用 ra_ranges: {\"is_driver_side_OT\": [min, max]}")
+            raise ValueError("constraint_rules 缺少 ra_ranges 配置")
+
         self.ra_range_cache: Dict[Tuple[int, int], Tuple[float, float]] = {}
-        for key, values in (self.rules.get("ra_values", {}) or {}).items():
-            side, ot = self._parse_side_ot_rule_key("ra_values", key)
+        for key, values in ra_ranges.items():
+            side, ot = self._parse_side_ot_rule_key("ra_ranges", key)
             arr = np.asarray(values, dtype=np.float32).reshape(-1)
-            if arr.size == 0:
-                raise ValueError(f"ra_values[{key!r}] 不能为空")
-            self.ra_range_cache[(side, ot)] = (float(np.min(arr)), float(np.max(arr)))
+            if arr.size != 2:
+                raise ValueError(f"ra_ranges[{key!r}] 必须是 [min, max] 形式")
+            ra_min, ra_max = float(arr[0]), float(arr[1])
+            if ra_min > ra_max:
+                raise ValueError(f"ra_ranges[{key!r}] 中最小值不能大于最大值")
+            self.ra_range_cache[(side, ot)] = (ra_min, ra_max)
 
     @staticmethod
     def _all_present(*indices: int) -> bool:
@@ -234,34 +237,17 @@ class ConstraintEngine:
     def _get_overlap_angle_special_mask(self, overlap: torch.Tensor, lower_tol: float = 0.0) -> torch.Tensor:
         """判断样本是否落入 overlap-angle 的特殊约束带。
 
-        params_constraint.md 对这一带的定义是 `0.25 <= |overlap| < 0.3`。
-        这里专门把它提炼成单一 helper，目的是让：
-        - 训练采样阶段的“冻结扰动”；
-        - 输入端/输出端的“合法性校验”
-        共用完全一致的上边界语义，避免一处按 `<0.3`、另一处按 `<=0.3`
-        导致边界样本在不同阶段出现不一致。
+        训练采样阶段的“冻结扰动”和输入/输出端校验都复用这里，
+        这样边界语义始终一致，不会一处按 `<0.3`、另一处按 `<=0.3`。
         """
         lower = self._overlap_abs_min - lower_tol
         return (overlap.abs() >= lower) & (overlap.abs() < self._overlap_abs_max)
 
-    def should_freeze_overlap_angle_jitter(self, context_params: torch.Tensor) -> torch.Tensor:
-        """返回训练采样阶段应冻结 overlap/impact_angle 扰动的样本掩码。"""
-        context_params = self._ensure_2d(context_params, len(self.context_indices), "context_params")
-        if self._context_overlap_local_idx is None or self._context_angle_local_idx is None:
-            return torch.zeros(context_params.shape[0], dtype=torch.bool, device=context_params.device)
-        overlap = context_params[:, self._context_overlap_local_idx]
-        return self._get_overlap_angle_special_mask(overlap, lower_tol=0.0)
-
     def build_context_jitter_mask(self, context_params: torch.Tensor) -> torch.Tensor:
         """构造 context 输入端允许被扰动的按列掩码。
 
-        这里集中编码训练采样阶段的“可扰动自由度”语义：
-        - 连续 context 列默认允许扰动；
-        - overlap-angle 特殊带内冻结这两个变量；
-        - 若某个 (side, OT) 对应的 seat_constraints 在某一轴上退化成零宽区间，
-          则该轴在输入端没有真实自由度，不应再被高斯噪声强行扰动。
-
-        返回值与 context_params 同形状；离散列天然为 False。
+        连续 context 列默认允许扰动；overlap-angle 特殊带和退化座椅自由度会被冻结。
+        返回值与 context_params 同形状，离散列天然为 False。
         """
         x = self._ensure_2d(context_params, len(self.context_indices), "context_params")
         mask = torch.zeros_like(x, dtype=torch.bool)
@@ -270,10 +256,12 @@ class ConstraintEngine:
             if param.get("type") == "continuous":
                 mask[:, local_idx] = True
 
-        protected_rows = self.should_freeze_overlap_angle_jitter(x)
-        if protected_rows.any():
-            mask[protected_rows, self._context_overlap_local_idx] = False
-            mask[protected_rows, self._context_angle_local_idx] = False
+        if self._context_overlap_local_idx is not None and self._context_angle_local_idx is not None:
+            overlap = x[:, self._context_overlap_local_idx]
+            protected_rows = self._get_overlap_angle_special_mask(overlap, lower_tol=0.0)
+            if protected_rows.any():
+                mask[protected_rows, self._context_overlap_local_idx] = False
+                mask[protected_rows, self._context_angle_local_idx] = False
 
         if not self._all_present(
             self._context_side_local_idx,
@@ -559,9 +547,8 @@ class ConstraintEngine:
     def _project_ra_ranges(self, x: torch.Tensor) -> torch.Tensor:
         """按 (is_driver_side, OT) 组合裁剪 RA 的合法子区间。
 
-        RA 在 yaml 里只有一个全局范围，但真实合法区间取决于当前乘员侧与体型。
-        因此这里不能只看 RA 自己的 min/max，而要在完整特征张量里读取 side/OT
-        后再做条件裁剪。
+        RA 自身的全局范围还不够，真实合法区间还取决于当前乘员侧与体型，
+        所以这里必须在完整特征张量里结合 side/OT 做条件裁剪。
         """
         if not self.ra_range_cache or self._ra_idx not in self._trainable_idx_set:
             return x
@@ -736,6 +723,8 @@ class ConstraintEngine:
         未来只要某个 control 的 trainable 属性变化，它就会离开 context。
         因此 context 校验只能依赖“当前真正出现在 context 里的列”，不能再偷偷补一组
         default trainable control 去凑完整特征，否则会把输入端语义污染成输出端语义。
+
+        若某条耦合约束的两端被拆到 context 和 trainable control 两侧, validate_context_input 这一层就不会检查这条耦合。
         """
         x = self._ensure_2d(context_params, len(self.context_indices), "context_params")
         tol = self._tol
@@ -817,21 +806,15 @@ class ConstraintEngine:
     def project_forward(self, full_features: torch.Tensor, strict: bool = False) -> torch.Tensor:
         """对完整特征张量做前向投影。
 
-        现在 strict=False 与 strict=True 共享同一套精确座椅投影逻辑：
-        - 中间迭代阶段也必须保证 surrogate 不看到域外的 SP/SH；
-        - 最终输出阶段只是沿用同一条合法化链路，不再维护一套 bbox/多边形双轨逻辑。
-
-        保留 strict 参数只是为了让调用点继续显式表达“中间候选解”与“最终落盘解”；
-        当前两条路径的核心几何投影已经统一，不再人为拆成两套实现。
+        中间迭代和最终落盘共用同一套几何投影逻辑，避免 surrogate 在任何阶段看到域外 SP/SH。
+        `strict` 只保留调用点语义，不再对应两套不同实现。
         """
         x = self._ensure_2d(full_features, self.total_dim, "full_features").clone()
         x = self._apply_trainable_bounds(x)
         x = self._project_control_couplings(x)
         x = self._project_output_extra_constraints(x)
         x = self._project_seat_feasible_region(x)
-        # RA 条件区间需在 strict=False 路径中执行：yaml 全局范围 [15, 40] 远宽于
-        # 特定 (side, OT) 组合的合法子区间（如主驾 OT=1 上限 25°），若不在此处投影，
-        # 训练/精调中间步会把超出条件区间的 RA 值送入 surrogate 模型，导致域外外推。
+        # RA 条件区间必须在中间迭代就生效，否则 surrogate 会看到超出条件子区间的域外值。
         x = self._project_ra_ranges(x)
 
         if strict:

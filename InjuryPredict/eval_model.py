@@ -102,7 +102,7 @@ if __name__ == "__main__":
     from dataclasses import dataclass
     @dataclass
     class args:
-        run_dir: str = r".\InjuryPredict\runs\PS_InjuryPredictModel_03220130"
+        run_dir: str = r".\InjuryPredict\runs\InjuryPredictModel_03280055"
         weight_file: str = 'best_val_loss.pth'
 
     record_path = os.path.join(args.run_dir, "TrainingRecord.json")

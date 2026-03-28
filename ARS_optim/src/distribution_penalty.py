@@ -11,6 +11,9 @@ class DistributionPenalty:
     - `compute` 对当前 batch 返回逐样本惩罚。
 
     它不负责采样、也不负责动作修复，只负责度量“当前样本离训练分布有多远”。
+
+    在核心思想和最终产生的工程优化效果上，distribution_penalty 的设计与高斯过程回归（GP）/克里金（Kriging）模型中的预测方差项（Predictive Variance）高度相似
+    主要是是在无法使用高斯过程（因为需要利用神经网络的快速推理、全流程可导和高维表征能力）的客观工程限制下，为了弥补 DNN 无法输出认知不确定性（Epistemic Uncertainty）而采取的一种降级替代方案。它在宏观目标（约束解域、防止欺骗性外推）上与 GP/Kriging 方差等效，可以一定程度上量化或对抗“认知不确定性（Epistemic Uncertainty）”。
     """
 
     def __init__(self, config: dict):
@@ -31,6 +34,8 @@ class DistributionPenalty:
         self.ref_mean: Optional[torch.Tensor] = None
         self.ref_inv_cov: Optional[torch.Tensor] = None
         self.ref_feature_dim: Optional[int] = None
+        self.ref_feature_mean: Optional[torch.Tensor] = None
+        self.ref_feature_scale: Optional[torch.Tensor] = None
         self.scale_maha: Optional[float] = None
         self.scale_knn: Optional[float] = None
 
@@ -54,7 +59,13 @@ class DistributionPenalty:
         if self.method == "knn" and reference_features.shape[0] < self.k:
             raise ValueError("knn 模式下参考样本数不能小于 k")
 
-        self.ref_features = reference_features.detach()
+        reference_features = reference_features.detach()
+        self.ref_feature_mean = reference_features.mean(dim=0)
+        self.ref_feature_scale = torch.clamp(
+            reference_features.std(dim=0, unbiased=False),
+            min=self.eps,
+        )
+        self.ref_features = self._standardize(reference_features)
         self.ref_feature_dim = int(reference_features.shape[1])
         if self.method == "mahalanobis":
             centered = self.ref_features - self.ref_features.mean(dim=0, keepdim=True)
@@ -92,6 +103,12 @@ class DistributionPenalty:
         maha_sq = torch.einsum("bi,ij,bj->b", delta, self.ref_inv_cov, delta)
         return torch.clamp(maha_sq, min=0.0)
 
+    def _standardize(self, x: torch.Tensor) -> torch.Tensor:
+        """按参考分布逐维标准化，避免距离度量被大尺度参数主导。"""
+        if self.ref_feature_mean is None or self.ref_feature_scale is None:
+            raise RuntimeError("distribution_penalty 尚未拟合，无法执行逐维标准化")
+        return (x - self.ref_feature_mean.unsqueeze(0)) / self.ref_feature_scale.unsqueeze(0)
+
     def _compute_knn(self, x: torch.Tensor) -> torch.Tensor:
         """返回逐样本到参考集最近 k 个邻居的平均欧氏距离。"""
         distances = torch.cdist(x, self.ref_features, p=2)
@@ -122,6 +139,8 @@ class DistributionPenalty:
             raise ValueError(
                 f"分布惩罚输入维度与参考分布不一致: current={x.shape[1]}, reference={self.ref_feature_dim}"
             )
+
+        x = self._standardize(x)
 
         if self.method == "mahalanobis":
             penalty = self._compute_mahalanobis(x)

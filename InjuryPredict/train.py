@@ -256,6 +256,13 @@ if __name__ == "__main__":
         "Valset_size": len(val_dataset),
         "validation_enabled": val_enabled,
         "INJURY_PROCESSED_DIR": str(INJURY_PROCESSED_DIR),
+        "data_interface": {
+            "processed_dir": str(INJURY_PROCESSED_DIR.resolve()),
+            "default_entrypoint_rule": (
+                "train.py 在未显式传入 processed_dir 时，默认通过 "
+                "common.settings.INJURY_PROCESSED_DIR 读取 processed .pt 子集。"
+            ),
+        },
         "model_params_count": {
             "total_params": total_params,
             "trainable_params": trainable_params

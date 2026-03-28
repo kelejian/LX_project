@@ -30,9 +30,7 @@ PulsePredict/
 
 - `RAW_DATA`
 - `NORMALIZATION_CONFIG_PATH`
-- `SPLIT_INDICES_DIR`
-
-因此如果你后续切换 `data_DS/`、`data_PS/` 等目录名，应优先修改 `common/settings.py`。
+- `PULSE_SPLIT_DIR`
 
 ## 4. 环境与依赖
 
@@ -56,11 +54,11 @@ python -m prepare_data
 
 - 打包后的 `raw_data_packed.npz`
 - `normalization_config.json`
-- `pulse_train_indices.csv`
-- `pulse_val_indices.csv`
-- `pulse_test_indices.csv`
+- `split_indices/pulse/pulse_train_indices.csv`
+- `split_indices/pulse/pulse_val_indices.csv`
+- `split_indices/pulse/pulse_test_indices.csv`
 
-这些文件的根路径都由 `common/settings.py` 决定。
+其中默认 split 目录由 `common.settings.PULSE_SPLIT_DIR` 决定。
 
 ## 6. 训练
 

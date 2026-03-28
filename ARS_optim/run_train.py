@@ -20,6 +20,8 @@ from common.settings import NORMALIZATION_CONFIG_PATH, get_split_indices_path
 from common.tools.logger import setup_logger
 from common.tools.seeding import set_random_seed
 
+from InjuryPredict.utils.tools import get_parameter_groups
+
 from ARS_optim.src.constraints import ConstraintEngine
 from ARS_optim.src.data_sampler import StateDataSampler
 from ARS_optim.src.param_manager import ParamManager
@@ -29,12 +31,17 @@ from ARS_optim.src.surrogate import SurrogateAdapter, load_surrogate_models
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train strategy network for ARS")
-    parser.add_argument("--config", type=str, default=None, help="override default config file path")
-    parser.add_argument("--batch_size", type=int, help="override batch size")
-    parser.add_argument("--lr", type=float, help="override learning rate")
-    parser.add_argument("--weight_decay", type=float, help="override weight decay")
-    parser.add_argument("--max_iterations", type=int, help="override max training iterations")
-    parser.add_argument("--device", type=str, help="override device (cpu/cuda)")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="训练配置文件路径；绝对路径或相对路径均可，默认使用 ARS_optim/configs/default_config.yaml",
+    )
+    parser.add_argument("--batch_size", type=int, help="覆盖配置中的 batch_size")
+    parser.add_argument("--lr", type=float, help="覆盖配置中的学习率")
+    parser.add_argument("--weight_decay", type=float, help="覆盖配置中的 weight_decay")
+    parser.add_argument("--max_iterations", type=int, help="覆盖配置中的最大训练迭代数")
+    parser.add_argument("--device", type=str, help="覆盖配置中的运行设备，例如 cpu 或 cuda")
     return parser.parse_args()
 
 
@@ -272,10 +279,6 @@ def _evaluate_strategy_batch(
 
     训练批和验证批都走同一条链路：先基于 context 生成 pulse，再由策略网络产出动作，
     最后交给代理模型计算逐样本 loss 与风险拆解。
-
-    这样做的目的不是增加封装层，而是避免训练循环和验证循环各自维护一套相同的前向逻辑。
-    同时也把 pulse 的来源固定为“当前 batch 显式生成一次并沿链路传递”，
-    不允许策略网、代理层或局部优化器在内部再各跑一次隐式 pulse fallback。
     """
     pulse_norm = surrogate.generate_pulse(context_params)
     actions, raw_full_features = strategy_net(context_params, pulse_norm)
@@ -349,10 +352,13 @@ def main():
     train_cfg["max_iterations"] = int(train_cfg.get("max_iterations", 0))
     train_cfg["lr"] = float(train_cfg.get("lr", 0.0))
     train_cfg["weight_decay"] = float(train_cfg.get("weight_decay", 0.0))
+    train_cfg["head_decay_ratio"] = float(train_cfg.get("head_decay_ratio", 0.1))
     if train_cfg["batch_size"] <= 0 or train_cfg["max_iterations"] <= 0:
         raise ValueError("batch_size 和 max_iterations 必须为正整数")
     if train_cfg["lr"] <= 0.0 or train_cfg["weight_decay"] < 0.0:
         raise ValueError("lr 必须为正数，weight_decay 必须非负")
+    if train_cfg["head_decay_ratio"] < 0.0:
+        raise ValueError("head_decay_ratio 必须非负")
 
     ema_cfg = train_cfg.get("ema", {}) or {}
     ema_enabled = bool(ema_cfg.get("enabled", True))
@@ -392,7 +398,24 @@ def main():
         config=config,
     ).to(device)
 
-    optimizer = optim.AdamW(strategy_net.parameters(), lr=train_cfg["lr"], weight_decay=train_cfg["weight_decay"])
+    optimizer_param_groups = get_parameter_groups(
+        strategy_net,
+        weight_decay=train_cfg["weight_decay"],
+        head_decay_ratio=train_cfg["head_decay_ratio"],
+        head_keywords=("output_head",),
+        verbose=False,
+    )
+    optimizer = optim.AdamW(optimizer_param_groups, lr=train_cfg["lr"])
+    for group_index, param_group in enumerate(optimizer.param_groups):
+        tensor_count = len(param_group["params"])
+        param_count = sum(param.numel() for param in param_group["params"])
+        logger.info(
+            "AdamW param_group[%d]: tensors=%d, params=%d, weight_decay=%.6g",
+            group_index,
+            tensor_count,
+            param_count,
+            float(param_group["weight_decay"]),
+        )
     scheduler = _build_scheduler(optimizer, train_cfg, train_cfg["max_iterations"])
     val_batch_size = int(train_cfg.get("val_batch_size", 1024))
 
@@ -558,9 +581,13 @@ def main():
 
             if writer is not None:
                 writer.add_scalar("Train/Loss", loss_value, iter_idx)
+                # Risk / Constraint / Distribution 分别对应目标风险、显式可行域软惩罚、分布偏离惩罚这三部分训练损失。
                 writer.add_scalar("Train/LossRisk", loss_risk, iter_idx)
                 writer.add_scalar("Train/LossConstraint", loss_constraint, iter_idx)
                 writer.add_scalar("Train/LossDistribution", loss_distribution, iter_idx)
+                # JitterAttemptRejectionRate: 在“单次扰动尝试”层面，被输入端合法性校验拒绝的比例。
+                # JitterFinalFallbackRate: 在最多 jitter_max_attempts 次尝试后，仍未得到合法扰动样本、最终回退原样本的比例。
+                # JitterChangedParamRatio: 最终输出 batch 中，允许扰动的连续 context 维度里，实际发生数值变化的平均占比。
                 writer.add_scalar("Train/JitterAttemptRejectionRate", jitter_attempt_rejection_rate, iter_idx)
                 writer.add_scalar("Train/JitterFinalFallbackRate", jitter_final_fallback_rate, iter_idx)
                 writer.add_scalar("Train/JitterChangedParamRatio", jitter_changed_param_ratio, iter_idx)

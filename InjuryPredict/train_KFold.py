@@ -370,6 +370,10 @@ if __name__ == "__main__":
         },
         "kfold_info": {
             "INJURY_PROCESSED_DIR": str(INJURY_PROCESSED_DIR),
+            "default_entrypoint_rule": (
+                "train_KFold.py 在未显式传入 processed_dir 时，默认通过 "
+                "common.settings.INJURY_PROCESSED_DIR 读取 processed .pt 子集。"
+            ),
             "total_samples_for_kfold": len(combined_indices),
             "k_value": K,
             "val_metrics_to_track": val_metrics_to_track  # 记录所有跟踪的指标

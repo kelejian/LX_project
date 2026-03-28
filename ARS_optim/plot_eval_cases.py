@@ -10,6 +10,24 @@ import pandas as pd
 from common.settings import FEATURE_ORDER
 
 
+BASE_FONT_SIZE = 15
+TITLE_FONT_SIZE = 15
+SUPTITLE_FONT_SIZE = 18
+ANNOTATION_FONT_SIZE = 15
+TICK_FONT_SIZE = 15
+
+plt.rcParams.update(
+    {
+        "font.size": BASE_FONT_SIZE,
+        "axes.titlesize": TITLE_FONT_SIZE,
+        "axes.labelsize": BASE_FONT_SIZE,
+        "xtick.labelsize": TICK_FONT_SIZE,
+        "ytick.labelsize": TICK_FONT_SIZE,
+        "figure.titlesize": SUPTITLE_FONT_SIZE,
+    }
+)
+
+
 METRIC_SUFFIXES = {
     "HIC",
     "Dmax",
@@ -22,6 +40,9 @@ METRIC_SUFFIXES = {
     "AIS_chest",
     "AIS_neck",
     "MAIS",
+}
+NON_CONTROL_STAGE_SUFFIXES = {
+    "ConvergenceStep",
 }
 UNIT_MAP = {
     "impact_velocity": "km/h",
@@ -83,10 +104,15 @@ TRUE_METRIC_COLUMNS = [
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Plot per-case comparison charts from ARS_optim evaluation CSV")
-    parser.add_argument("--eval_csv", required=True, type=str, help="Absolute path to evaluation_results.csv")
-    parser.add_argument("--case_ids", nargs="*", default=None, help="Explicit case_id list to plot")
-    parser.add_argument("--topn_joint_risk", type=int, default=0, help="Plot top-N cases with the largest JointRisk reduction")
-    parser.add_argument("--dpi", type=int, default=180, help="Figure DPI")
+    parser.add_argument(
+        "--eval_csv",
+        required=True,
+        type=str,
+        help="evaluation_results.csv 路径；绝对路径或相对路径均可",
+    )
+    parser.add_argument("--case_ids", nargs="*", default=None, help="显式指定需要绘图的 case_id 列表")
+    parser.add_argument("--topn_joint_risk", type=int, default=0, help="按 JointRisk 降幅选择前 N 个 case 绘图")
+    parser.add_argument("--dpi", type=int, default=180, help="输出图片 DPI")
     return parser.parse_args()
 
 
@@ -97,7 +123,11 @@ def _require_columns(df: pd.DataFrame, columns: Iterable[str], scope: str) -> No
 
 
 def _detect_stage_names_and_controls(df: pd.DataFrame) -> tuple[List[str], List[str]]:
-    base_control_names = {column[5:] for column in df.columns if column.startswith("Base_")} - METRIC_SUFFIXES
+    base_control_names = {
+        column[5:]
+        for column in df.columns
+        if column.startswith("Base_")
+    } - METRIC_SUFFIXES - NON_CONTROL_STAGE_SUFFIXES
     if not base_control_names:
         raise ValueError("结果 CSV 中未识别到任何 Base_ 可调 control 列")
 
@@ -105,7 +135,11 @@ def _detect_stage_names_and_controls(df: pd.DataFrame) -> tuple[List[str], List[
     _require_columns(df, [f"Base_{metric_name}" for metric_name in RESULT_METRIC_NAMES], "Base 指标绘图")
     for stage_name in OPT_STAGE_CANDIDATES:
         prefix = f"{stage_name}_"
-        stage_control_names = {column[len(prefix):] for column in df.columns if column.startswith(prefix)} - METRIC_SUFFIXES
+        stage_control_names = {
+            column[len(prefix):]
+            for column in df.columns
+            if column.startswith(prefix)
+        } - METRIC_SUFFIXES - NON_CONTROL_STAGE_SUFFIXES
         has_stage_metrics = any(f"{stage_name}_{metric_name}" in df.columns for metric_name in RESULT_METRIC_NAMES)
         if not stage_control_names and not has_stage_metrics:
             continue
@@ -169,10 +203,11 @@ def _plot_bar_group(ax, labels: List[str], values: List[float], title: str, unit
             textcoords="offset points",
             ha="center",
             va="bottom",
-            fontsize=9,
+            fontsize=ANNOTATION_FONT_SIZE,
         )
     ax.set_title(title)
     ax.set_ylabel(unit)
+    ax.tick_params(axis="both", labelsize=TICK_FONT_SIZE)
     ax.grid(axis="y", linestyle="--", alpha=0.3)
     if force_level_axis:
         ax.set_ylim(0, 5)
@@ -194,7 +229,7 @@ def _save_control_figure(
         labels = list(stage_names)
         values = [float(row[f"{stage_name}_{control_name}"]) for stage_name in stage_names]
         _plot_bar_group(axis, labels, values, f"{control_name} ({unit})", unit, "{:.4g}")
-    fig.suptitle(f"case_id={row['case_id']}\n{_format_context_text(row, context_names)}", fontsize=13)
+    fig.suptitle(f"case_id={row['case_id']}\n{_format_context_text(row, context_names)}", fontsize=SUPTITLE_FONT_SIZE)
     fig.tight_layout(rect=[0, 0, 1, 0.90])
     fig.savefig(output_dir / f"{case_prefix}_{CONTROL_FIG_NAME}", dpi=dpi, bbox_inches="tight")
     plt.close(fig)
@@ -227,7 +262,7 @@ def _save_metric_figure(
             value_fmt,
             force_level_axis=metric_name in AIS_METRICS,
         )
-    fig.suptitle(title, fontsize=13)
+    fig.suptitle(title, fontsize=SUPTITLE_FONT_SIZE)
     fig.tight_layout(rect=[0, 0, 1, 0.92])
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)

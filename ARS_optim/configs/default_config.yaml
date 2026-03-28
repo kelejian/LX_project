@@ -1,126 +1,223 @@
-# ARS_optim/configs/default_config.yaml
+# ============================================================
+# ARS_optim 默认运行配置
+# ============================================================
 #
-# 这个配置文件只描述 ARS_optim 自己需要关心的训练/评估超参数与外部模型权重位置。
-# 其中：
-# 1. 输入归一化仍然统一以项目根目录下的 normalization_config.json 为准；
-# 2. 参数可调范围与硬约束来自 param_space.yaml；
-# 3. 训练/评估脚本均默认在 LX_project 根目录下以 `python -m xxx` 方式运行。
+# 这份配置同时服务于：
+# 1. `python -m ARS_optim.run_train`
+# 2. `python -m ARS_optim.run_eval`
+#
+# 约定说明：
+# - 工况特征顺序、共享数据目录和 normalization_config 路径由 common.settings 统一管理。
+# - 这里不重复定义 shared data 的物理列顺序，只配置 ARS_optim 自己的训练、评估和代理模型参数。
+# - 路径字段若写相对路径，解释规则由代码固定处理：
+#   - `surrogate.pulse_ckpt_rel_path` 相对 `common.settings.PULSE_PREDICT_DIR`
+#   - `surrogate.injury_ckpt_rel_path` 相对 `common.settings.INJURY_PREDICT_DIR`
+#   - `evaluation.strategy_checkpoint` 在 `run_eval.py` 中相对 ARS_optim 目录解析, 也可以直接写为绝对路径。
+# - 当前默认开发口径是 combined 数据视角；split 的默认路径不在这里配置，而由 shared settings 决定。
 
 seed: 123
 device: "cuda"
 
-surrogate:
-  # PulsePredict 最优权重，相对 PULSE_PREDICT_DIR 根目录解析。
-  pulse_ckpt_rel_path: "saved/models/HybridPulseCNN/0303_213959/model_best.pth"
-  # InjuryPredict 最优权重，相对 INJURY_PREDICT_DIR 根目录解析。
-  injury_ckpt_rel_path: "runs/DS_InjuryPredictModel_03212058/best_val_loss.pth"
 
+# ============================================================
+# 代理模型权重
+# ============================================================
+#
+# ARS_optim 不重新训练 PulsePredict / InjuryPredict，而是直接加载这两个已训练好的子模型作为代理链路。
+surrogate:
+  # PulsePredict 最优权重路径；可写绝对路径，也可写相对 PULSE_PREDICT_DIR 的相对路径。
+  pulse_ckpt_rel_path: "saved/models/HybridPulseCNN/0328_002509/model_best.pth"
+
+  # InjuryPredict 最优权重路径；可写绝对路径，也可写相对 INJURY_PREDICT_DIR 的相对路径。具体值由你后续自行维护，因此当前只保留字段，不在代码里做自动兜底。
+  injury_ckpt_rel_path: "runs/InjuryPredictModel_03280055/best_val_loss.pth"
+
+
+# ============================================================
+# 策略网络结构与训练配置
+# ============================================================
 strategy_net:
-  # 波形编码器输入通道数。当前代理链路输出为二维碰撞加速度波形。
+  # 波形编码器输入通道数；当前代理链路输出的是二维归一化碰撞波形，因此固定为 2。
   pulse_channels: 2
-  # TCN 主干的逐层通道配置。
+
+  # TCN 波形编码器结构。`tcn_channels_list` 决定每个 stage 的通道数，`tcn_output_dim` 是最终压缩后的波形表征维度。
   tcn_channels_list: [64, 128, 256]
   tcn_output_dim: 128
   tcn_kernel_init: 8
   tcn_kernel_mid: 3
 
-  # context 编码器与融合后解码器的 MLP 规模。
+  # context MLP 编码器。
   mlp_encoder_hidden: 192
   mlp_encoder_layers: 3
   mlp_encoder_output_dim: 128
+
+  # 融合后解码器。
   mlp_decoder_hidden: 160
   mlp_decoder_layers: 3
   mlp_decoder_output_dim: 96
+
+  # MLP / TCN 内部 dropout。
   dropout_mlp: 0.1
-  dropout_tcn: 0.0
+  dropout_tcn: 0.1
 
   train:
-    # 自监督训练采用无限数据流，因此不使用 epoch，而用最大迭代步数停止。
+    # 自监督训练采用无限数据流，不按 epoch 组织，而是按最大迭代数停止。
     batch_size: 1024
     max_iterations: 10000
+
+    # AdamW 基础学习率与权重衰减。
     lr: 3.0e-4
     weight_decay: 1.0e-4
+
+    # output_head 的 weight_decay 会按此比例缩小，以避免输出层被过强正则压回 default 附近。
+    head_decay_ratio: 0.1
+
+    # 终端日志打印间隔。
     log_interval: 10
+
+    # 是否保存最优权重与最终权重。
     save_best: true
     save_last: true
 
     scheduler:
-      # 只调训练阶段的策略网络权重学习率。
-      # 可选: none | cosine | step
+      # 仅作用于策略网络训练阶段；可选：none | cosine | step。
       type: "cosine"
-      # 当 type=cosine 时，T_max 可写整数，也可写 "max_iters"。
-      T_max: "max_iters" # "max_iters" 表示与本段 max_iterations 保持一致，避免手动重复维护两份迭代上限。
+
+      # 当 type=cosine 时，T_max 可直接写整数，也可写 "max_iters" 表示自动跟随 max_iterations。
+      T_max: "max_iters"
       eta_min: 0.0
-      # 当 type=step 时，按 schedule_step_size 步长衰减 lr，gamma 是衰减率。
+
+      # 当 type=step 时生效。
       step_size: 400
       gamma: 0.5
 
-    val_interval: 200 # 每隔多少个 iteration 在 injury_val 固定切片上做一次完整验证。
-    val_batch_size: 1024 # 验证阶段批大小，不影响实际评估语义。
-    gradient_clip_max_norm: 2.0 # 梯度裁剪最大范数，抑制训练初期不稳定的梯度爆炸。
+    # 每隔多少 iteration 在固定 val split 上跑一次完整验证。
+    val_interval: 200
 
-    # 训练流来自 injury_train 经验池 + 合法扰动。
-    # 扰动后的样本若破坏 base 范围或耦合约束，会整行回退原样本。
-    jitter_ratio: 0.01
-    jitter_prob: 1.0 # 在“允许扰动”的连续 context 维度里，每一维被激活扰动的概率。
-    jitter_max_attempts: 3 # 每个基样本最多做几次独立扰动尝试，降低整样本完全回退率。
-    jitter_min_active_dims: 1 # 每次尝试至少激活多少个允许扰动的连续 context 维度，避免试探样本与基样本完全相同。
+    # 验证阶段 batch 大小，只影响推理吞吐，不改变评估语义。
+    val_batch_size: 1024
 
-    # TensorBoard 文件会单独写到本次训练目录下的 tensorboard/ 子目录。
+    # 梯度裁剪阈值，用于抑制训练初期的梯度爆炸。
+    gradient_clip_max_norm: 2.0
+
+    # --------------------------------------------------------
+    # 输入端采样扰动配置
+    # --------------------------------------------------------
+    # 训练数据流来自 injury_train 经验池 + 合法扰动；若扰动后的 context 破坏 base 范围或共享耦合约束，则整行回退到原样本，不做数值投影修补。
+    jitter_ratio: 0.02
+
+    # 在“允许扰动”的连续 context 维度里，每一维被激活扰动的概率。jitter_prob = 1.0 时，jitter_min_active_dims 可视为无效参数：其大小对采样结果无影响；当 jitter_prob < 1.0 时，是“防空采样”的下限约束：保证至少有一定数量的维度被扰动，避免抽到“允许扰动但实际上没有任何列发生变化”的空尝试。
+    jitter_prob: 1.0
+
+    # 每个基样本最多做几次独立扰动尝试。
+    jitter_max_attempts: 4
+
+    # 每次尝试至少激活多少个允许扰动的连续维度，避免抽到“允许扰动但实际上没有任何列发生变化”的空尝试。
+    jitter_min_active_dims: 1
+
+    # 是否输出 TensorBoard 日志；日志目录固定写入本次训练目录下的 tensorboard/。
     tensorboard: true
 
     ema:
-      # train_best 权重按 EMA 平滑后的 train_loss 选取；
-      # val_best 则始终按固定验证集上的 val_loss 选取。
+      # train_best 按 EMA 平滑后的 train_loss 选择；val_best 始终按固定验证集上的 val_loss 选择。
       enabled: true
       alpha: 0.98
       warmup_iters: 500
       log_to_tensorboard: true
 
+
+# ============================================================
+# 优化目标与局部精调
+# ============================================================
 optimization:
-  # true: 先做策略直推生成 Opt1，再从 Opt1 或 default 出发做局部精调；
-  # false: 不加载策略权重，局部精调直接从 default 起步。
+  # true 表示先执行策略网络直推得到 Opt1，再从 Opt1 出发做局部精调得到 Opt2；false 表示不使用策略权重，局部精调直接从 param_space.yaml 的 default 出发。
   direct_inference: true
 
-  # 局部精调步数。=0 时不生成 Opt2。
+  # 局部精调总步数；当 refine_steps=0 时，不生成 Opt2。
   refine_steps: 100
-  # Adam 在无量纲潜空间 z 上的初始学习率。
-  lr: 1e-4
+
+  # Adam 在无量纲潜变量 z 上的初始学习率；真实每维参数在物理空间中的单步更新量 = 调度后的学习率 × Adam 自适应因子 × 参数量程。
+  lr: 1.0e-3
 
   scheduler:
-    # 局部精调全程都使用这里定义的学习率调度器，避免后期震荡。
-    # 可选: none | cosine | step
+    # 局部精调学习率调度器；可选：none | cosine | step。
     type: "cosine"
-    # 当 type=cosine 时，T_max 可写整数，也可写 "max_iters"。
-    # 这里的 "max_iters" 专指局部精调总步数 refine_steps。
+
+    # 当 type=cosine 时，T_max 可写整数，也可写 "max_iters" 表示自动跟随 refine_steps。
     T_max: "max_iters"
     eta_min: 0.0
-    # 当 type=step 时，按 schedule_step_size 步长衰减 lr，gamma 是衰减率。
+
+    # 当 type=step 时生效。
     step_size: 400
     gamma: 0.5
 
+  convergence:
+    # 是否启用提前收敛判定。
+    enabled: true
+
+    # 在无量纲潜空间 z 中，以单步最大变化量作为动作收敛判据，因此不受各物理参数量纲不同的影响。
+    action_tol_ratio: 2.0e-3
+
+    # loss 的收敛阈值。
+    loss_tol: 1.0e-3
+
+    # 连续多少步同时满足动作与 loss 阈值，才判定为收敛。
+    patience: 20
+
   objectives:
+    # 加权联合风险中的各部位权重。
     weight_hic: 3.0
     weight_dmax: 1.0
     weight_nij: 1.0
-    # 物理约束软惩罚权重，作用于投影前的原始游离解。
-    weight_penalty: 2.0
+
+    # 物理约束软惩罚权重；它作用在 projection 前的原始游离解上，用来在前向投影截断后继续提供补偿梯度。
+    weight_penalty: 10.0
 
   distribution_penalty:
-    # 合法域内的分布偏离惩罚，抑制解落入训练经验池未覆盖的空洞区域。
-    enabled: false
-    method: "mahalanobis"      # mahalanobis | knn
+    # 合法域内部的分布偏离惩罚，用于抑制解落入训练经验池稀疏或未覆盖区域；其最终输出范围为：enabled=false 时恒为 0，enabled=true 时落在 [0, clip_max]。
+    enabled: true
+
+    # 可选：mahalanobis | knn
+    method: "knn"
+
+    # 分布偏离项总权重。
     weight: 0.01
-    feature_space: "context_control"  # context | context_control
-    k: 8
+
+    # 参考特征空间。context 只看 context 分布，context_control 看 [context | trainable_control] 联合分布。
+    feature_space: "context_control"
+
+    # k 越大：
+    # 惩罚越接近“这点是否处在一个周围也有不少训练样本支撑的区域”
+    # 对局部稀疏区、孤立点附近、训练分布边缘的抑制更强
+    # 更容易把解推向训练集里更稳定、更成团、更高密度的区域
+    # 代价是探索性会变弱，确实更容易出现你说的“往训练分布高密度中心收”的倾向
+    # 问的是“你是不是处在一片训练样本都认可的区域里？”
+    # k 越小：
+    # 惩罚更接近“这点附近是否至少贴着某几个训练样本”
+    # 更局部、更灵活，对细长流形、窄可行带、局部特殊模式更宽容
+    # 更不容易把解一味往大团中心拉
+    # 但副作用是更容易被少量孤立样本或边缘样本“放行”，OOD 抑制会更弱，也更容易出现不稳定的局部外推
+    # 问的是“你附近是不是至少有几个训练样本？”
+    k: 3
+
     eps: 1.0e-6
+
+    # 单样本分布惩罚上限，避免极端 OOD 样本直接主导总 loss。
     clip_max: 10.0
-    # <=0 表示使用完整 injury_train 参考池；>0 时按 seed 做一次性随机子采样。
-    max_ref_samples: 20000
+
+    # 参考样本数量；<=0 表示使用完整 injury_train 参考池，>0 表示按 seed 抽样子集。
+    max_ref_samples: -1
+
+    # 是否用训练参考分布自身的平均距离做尺度归一。
     normalize_by_train_stats: true
 
+
+# ============================================================
+# 评估配置
+# ============================================================
 evaluation:
-  # 评估阶段批大小，只影响分批推理开销，不改变逐 case 优化语义。
-  eval_batch_size: 1024
-  # 建议在每次切换评估权重时显式填写当前策略权重，或在运行 run_eval 时用 --strategy_ckpt 指定。
-  strategy_checkpoint: null # 仅在 direct_inference=true 时使用。
+  # 评估阶段的推理 batch 大小；它只影响吞吐，不改变逐 case 优化语义。
+  eval_batch_size: 64
+
+  # 可选的策略权重路径；只有在 direct_inference=true 时才会使用，若命令行显式传入 --strategy_ckpt，则命令行优先。
+  # strategy_checkpoint 既可写绝对路径，也可写相对 `ARS_optim` 目录的相对路径
+  strategy_checkpoint: "saved_models/strategy_net_0328_124457/checkpoints/val_best_model.pth"

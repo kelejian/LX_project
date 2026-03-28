@@ -10,8 +10,8 @@ from common.data_utils.split_io import load_int_vector_csv
 from common.settings import (
     FEATURE_ORDER,
     NORMALIZATION_CONFIG_PATH,
+    PULSE_SPLIT_DIR,
     RAW_DATA,
-    SPLIT_INDICES_DIR,
     get_split_indices_path,
 )
 #==========================================================================================
@@ -91,7 +91,7 @@ class PulseDataset(Dataset):
 #==========================================================================================
 class PulseDataLoader(BaseDataLoader):
     def __init__(self, packaged_data_path, split_indices_dir, processor_config, batch_size, num_workers=0, training=True):
-        self.split_dir = SPLIT_INDICES_DIR if split_indices_dir in (None, "") else Path(split_indices_dir)
+        self.split_dir = PULSE_SPLIT_DIR if split_indices_dir in (None, "") else Path(split_indices_dir)
         packaged_data_path = RAW_DATA if packaged_data_path in (None, "") else Path(packaged_data_path)
         processor_config = NORMALIZATION_CONFIG_PATH if processor_config in (None, "") else Path(processor_config)
         

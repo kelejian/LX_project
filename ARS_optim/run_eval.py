@@ -6,7 +6,7 @@ import argparse
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import numpy as np
 import pandas as pd
@@ -63,11 +63,28 @@ def parse_args():
         "--input_csv",
         type=str,
         default=None,
-        help="输入工况参数 CSV 的绝对路径；若不提供则优先使用 injury test split，不可用时自动回退到 injury val split",
+        help="输入工况参数 CSV 路径；绝对路径或相对路径均可。若不提供则优先使用 injury test split，不可用时自动回退到 injury val split",
     )
-    parser.add_argument("--output_csv", type=str, default="evaluation_results.csv", help="输出 CSV 文件名")
-    parser.add_argument("--strategy_ckpt", type=str, default=None, help="策略网络权重绝对路径")
+    parser.add_argument(
+        "--output_csv",
+        type=str,
+        default="evaluation_results.csv",
+        help="结果 CSV 文件名；若传入路径，仅使用其中的文件名部分",
+    )
+    parser.add_argument(
+        "--strategy_ckpt",
+        type=str,
+        default=None,
+        help="策略网络权重路径；绝对路径或相对路径均可",
+    )
+    parser.add_argument(
+        "--trace_case_ids",
+        nargs="+",
+        default=None,
+        help="需要导出局部精调逐步轨迹的 case_id 列表，例如 --trace_case_ids 101 205 999",
+    )
     parser.add_argument("--direct_inference", action="store_true", help="强制启用策略网络直推")
+
     return parser.parse_args()
 
 
@@ -88,6 +105,71 @@ def _build_output_dir(
     output_dir = base_dir / "saved_eval" / f"eval_{suffix}_{datetime.now().strftime('%m%d_%H%M%S')}"
     output_dir.mkdir(parents=True, exist_ok=False)
     return output_dir
+def _save_case_trace_tables(
+    results_dir: Path,
+    trace_records: Dict[int, Dict[str, object]],
+    requested_case_ids: Set[str],
+    logger,
+) -> Dict[str, object]:
+    """把逐 case 优化轨迹导出为独立 CSV。"""
+    if not requested_case_ids:
+        return {
+            "enabled": False,
+            "requested_case_ids": [],
+            "written_case_count": 0,
+            "trace_dir": None,
+            "files": [],
+            "missing_case_ids": [],
+        }
+
+    if not trace_records:
+        missing_case_ids = sorted(requested_case_ids)
+        logger.warning("未找到任何需要导出轨迹的 case_id: %s", missing_case_ids)
+        return {
+            "enabled": True,
+            "requested_case_ids": sorted(requested_case_ids),
+            "written_case_count": 0,
+            "trace_dir": None,
+            "files": [],
+            "missing_case_ids": missing_case_ids,
+        }
+
+    trace_dir = results_dir / "optimization_traces"
+    trace_dir.mkdir(parents=True, exist_ok=False)
+    file_records = []
+    matched_case_ids = set()
+
+    for row_index in sorted(trace_records):
+        trace_record = trace_records[row_index]
+        case_id = str(trace_record["case_id"])
+        rows = trace_record.get("rows", [])
+        if not rows:
+            continue
+        matched_case_ids.add(case_id)
+        trace_df = pd.DataFrame(rows)
+        safe_case_id = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in case_id).strip("_") or "case"
+        trace_path = trace_dir / f"case_{safe_case_id}_row_{int(row_index)}.csv"
+        trace_df.to_csv(str(trace_path), index=False)
+        file_records.append(
+            {
+                "case_id": case_id,
+                "row_index": int(row_index),
+                "path": str(trace_path),
+            }
+        )
+
+    missing_case_ids = sorted(requested_case_ids - matched_case_ids)
+    if missing_case_ids:
+        logger.warning("以下 trace_case_ids 未命中有效评估 case: %s", missing_case_ids)
+
+    return {
+        "enabled": True,
+        "requested_case_ids": sorted(requested_case_ids),
+        "written_case_count": len(file_records),
+        "trace_dir": str(trace_dir),
+        "files": file_records,
+        "missing_case_ids": missing_case_ids,
+    }
 
 
 def _resolve_strategy_ckpt(args, base_dir: Path, config: Dict) -> Optional[Path]:
@@ -136,7 +218,11 @@ def _assert_strategy_runtime_compatibility(
             )
 
 
-def _copy_config_snapshots(cfg_path: Path, param_space_path: Path, output_dir: Path) -> Dict[str, str]:
+def _copy_config_snapshots(
+    cfg_path: Path,
+    param_space_path: Path,
+    output_dir: Path,
+) -> Dict[str, str]:
     config_dir = output_dir / "configs_used"
     config_dir.mkdir(parents=True, exist_ok=False)
     cfg_snapshot = config_dir / "config.yaml"
@@ -247,15 +333,8 @@ def _prepare_eval_inputs(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], List[str], np.ndarray, List[int], List[int]]:
     """整理评估输入。
 
-    strict_provided_validation=True 只用于外部 input_csv：
-    - 已提供的 context 值必须逐行合法，否则跳过该 case；
-    - baseline 只有在“整组 trainable control 列齐全且整组合法”时才采用用户值；
-    - 只要 baseline 缺列、缺值或整组不合法，就整行回退到 default；
-    - 输入端校验只按完整物理定义域执行，不额外要求落在优化子范围内。
-
-    strict_provided_validation=False 只用于内部默认 split 评估：
-    - baseline 直接使用所选 split 已有完整参数；
-    - 只检查缺失值，不再按优化子范围做过滤。
+    外部 input_csv 走严格输入校验：context 非法就跳过，baseline 只有整组合法才采用，否则整行回退 default。
+    默认 split 评估直接使用已有参数，只检查缺失值，不再额外做优化子范围过滤。
     """
     context_params = param_manager.get_context_params()
     trainable_params = param_manager.get_trainable_params()
@@ -320,8 +399,7 @@ def _prepare_eval_inputs(
         candidate_indices = np.flatnonzero(valid_context_candidates)
         candidate_context_raw = context_df_raw.iloc[candidate_indices]
         candidate_context_tensor = torch.tensor(candidate_context_raw[context_names].values, dtype=torch.float32, device=device)
-        # 外部 input_csv 的 context 校验只针对 context 本身，不再补默认 trainable control。
-        # 这样 trainable 属性未来变化时，输入端语义仍然稳定：只看当前真正属于 context 的列。
+        # input_csv 的 context 校验只看当前真正属于 context 的列，不补默认 trainable control。
         context_valid_local = constraint_engine.validate_context_input(candidate_context_tensor).detach().cpu().numpy().astype(bool)
         if (~context_valid_local).any():
             logger.warning(
@@ -341,9 +419,7 @@ def _prepare_eval_inputs(
             ].to_numpy(dtype=np.float32)
 
             baseline_candidate = baseline_df_raw.loc[legal_context_indices, trainable_names].copy()
-            # baseline 采用严格整组策略：只要 trainable 列缺失、该行存在 NaN，
-            # 或整组不满足输入端完整物理定义域，就整行回退为 default。
-            # 这里故意不做“用户部分列 + default 其余列”的混搭，避免结果表出现隐性语义。
+            # baseline 采用严格整组策略，不做“用户部分列 + default 其余列”的混搭。
             baseline_has_missing_local = baseline_candidate[trainable_names].isna().any(axis=1).to_numpy()
 
             legal_context_tensor = torch.tensor(
@@ -498,9 +574,12 @@ def _load_eval_input(args, logger) -> tuple[pd.DataFrame, Dict[str, np.ndarray],
 def _compute_predictions_batch(
     context_tensor: torch.Tensor,
     baseline_trainable: torch.Tensor,
+    case_ids: List[str],
+    row_indices: List[int],
     surrogate: SurrogateAdapter,
     optimizer: LocalRefiner,
     eval_batch_size: int,
+    trace_case_ids: Set[str],
 ) -> Dict[str, object]:
     """按批次计算 Base/Opt1/Opt2 三个阶段的预测结果。
 
@@ -524,6 +603,8 @@ def _compute_predictions_batch(
     }
     total_time_cost = 0.0
     trajectory_all: List[float] = []
+    opt2_convergence_parts: List[torch.Tensor] = []
+    trace_records: Dict[int, Dict[str, object]] = {}
 
     def cat_or_nan(parts: List[torch.Tensor]) -> torch.Tensor:
         return torch.cat(parts, dim=0) if parts else torch.full((sample_count,), float("nan"), device=device)
@@ -544,7 +625,13 @@ def _compute_predictions_batch(
             stage_parts["Base"]["info"][key].append(base_info[key].detach())
 
         if optimizer.direct_inference or optimizer.refine_steps > 0:
-            opt_actions, opt_preds, opt_info = optimizer.optimize(context_batch, pulse_norm=pulse_batch)
+            opt_actions, opt_preds, opt_info = optimizer.optimize(
+                context_batch,
+                pulse_norm=pulse_batch,
+                case_ids=case_ids[start:end],
+                row_indices=row_indices[start:end],
+                trace_case_ids=trace_case_ids,
+            )
             direct_stage = opt_info.get("direct_stage")
             if direct_stage is not None:
                 stage_parts["Opt1"]["preds"].append(direct_stage["preds"].detach())
@@ -559,11 +646,23 @@ def _compute_predictions_batch(
                 stage_parts["Opt2"]["loss"].append(opt_info["final_loss_batch"].detach())
                 for key in STAGE_INFO_KEYS:
                     stage_parts["Opt2"]["info"][key].append(opt_info[key].detach())
+                convergence_steps = opt_info.get("convergence_steps")
+                if convergence_steps is not None:
+                    opt2_convergence_parts.append(convergence_steps.detach())
 
             total_time_cost += float(opt_info.get("time_cost", 0.0))
             trajectory_all.extend(opt_info.get("trajectory", []))
+            for row_index, trace_record in opt_info.get("trace_records", {}).items():
+                if row_index in trace_records:
+                    raise RuntimeError(f"重复写入同一 row_index 的优化轨迹: {row_index}")
+                trace_records[int(row_index)] = trace_record
 
-    output = {"total_time_cost": total_time_cost, "trajectory_all": trajectory_all}
+    output = {
+        "total_time_cost": total_time_cost,
+        "trajectory_all": trajectory_all,
+        "opt2_convergence_step": torch.cat(opt2_convergence_parts, dim=0) if opt2_convergence_parts else None,
+        "trace_records": trace_records,
+    }
     for prefix in STAGE_NAMES:
         content = stage_parts[prefix]
         output[prefix] = {
@@ -591,7 +690,13 @@ def _expand_stage_outputs_to_full(
     expanded = {
         "total_time_cost": stage_outputs["total_time_cost"],
         "trajectory_all": stage_outputs["trajectory_all"],
+        "trace_records": stage_outputs.get("trace_records", {}),
     }
+    convergence_src = stage_outputs.get("opt2_convergence_step")
+    convergence_full = torch.full((total_count,), float("nan"), dtype=torch.float32)
+    if convergence_src is not None and convergence_src.numel() > 0:
+        convergence_full[valid_indices_tensor] = convergence_src.detach().cpu().to(torch.float32)
+    expanded["opt2_convergence_step"] = convergence_full
     for stage_name in STAGE_NAMES:
         stage = stage_outputs[stage_name]
         preds_src = stage["preds"]
@@ -755,18 +860,14 @@ def _build_result_dataframe(
 ) -> tuple[pd.DataFrame, Dict[str, object]]:
     """组装最终导出 CSV 和宏观汇总指标。
 
-    对外结果表只保留：
-    - 一份原始 metadata/context；
+    结果表：
+    - 一份稳定标识列与 context；
     - 一份 baseline trainable control；
     - 每个真实生成阶段各自的可调参数、损伤、风险、AIS；
     - 每个优化阶段各自相对 baseline 的 reduction 列。
-
-    这里不再把多个优化阶段压缩成一组含糊的 `Opt_` 列。
-    若同时存在策略直推与局部精调，结果表必须显式保留 `Opt1_` 与 `Opt2_`，
-    否则下游绘图和结果分析无法区分“直推收益”和“精调新增收益”。
     """
-    excluded_input_cols = set(FEATURE_ORDER) | {"y_HIC", "y_Dmax", "y_Nij", "ais_head", "ais_chest", "ais_neck"}
-    metadata_cols = [col for col in df_input.columns if col not in excluded_input_cols]
+    # 自定义 input_csv 里可能带有备注、来源说明等无关列；结果表只保留稳定标识列 case_id，其余工况参数统一以当前评估实际使用的 context/Base/Opt 列为准，避免把无关输入原样带进导出结果。
+    metadata_cols = ["case_id"] if "case_id" in df_input.columns else []
     metadata_df = df_input[metadata_cols].reset_index(drop=True)
     frame_parts = [metadata_df, context_df.reset_index(drop=True)]
 
@@ -786,6 +887,17 @@ def _build_result_dataframe(
             action_df = pd.DataFrame({f"{stage_name}_{name}": opt_array[:, idx] for idx, name in enumerate(trainable_names)})
         frame_parts.append(action_df.reset_index(drop=True))
         frame_parts.append(_build_stage_metric_dataframe(stage_name, stage_outputs[stage_name], len(df_input), ot_array).reset_index(drop=True))
+        if stage_name == "Opt2":
+            convergence_steps = stage_outputs.get("opt2_convergence_step")
+            if convergence_steps is not None:
+                convergence_array = convergence_steps.detach().cpu().numpy().astype(np.float32, copy=False)
+                frame_parts.append(
+                    pd.DataFrame(
+                        {
+                            "Opt2_ConvergenceStep": convergence_array,
+                        }
+                    ).reset_index(drop=True)
+                )
 
     result_df = pd.concat(frame_parts, axis=1)
     truth_vs_df = None
@@ -844,7 +956,20 @@ def _build_evaluation_record(
     top_cases: List[Dict[str, object]],
     stage_outputs: Dict[str, object],
     evaluated_case_count: int,
+    trace_outputs: Dict[str, object],
 ) -> Dict[str, object]:
+    convergence_array = stage_outputs.get("opt2_convergence_step")
+    convergence_summary = None
+    if convergence_array is not None and stage_outputs["Opt2"]["preds"] is not None:
+        convergence_np = convergence_array.detach().cpu().numpy().astype(np.float32, copy=False)
+        converged_steps = convergence_np[np.isfinite(convergence_np)]
+        convergence_summary = {
+            "converged_case_count": int(converged_steps.size),
+            "mean_convergence_step": None if converged_steps.size == 0 else float(np.mean(converged_steps)),
+            "median_convergence_step": None if converged_steps.size == 0 else float(np.median(converged_steps)),
+            "max_convergence_step": None if converged_steps.size == 0 else int(np.max(converged_steps)),
+        }
+
     record = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "output_dir": str(output_dir),
@@ -853,8 +978,6 @@ def _build_evaluation_record(
         "strategy_checkpoint_path": str(strategy_ckpt_path) if strategy_ckpt_path is not None else None,
         "direct_inference": bool(config.get("optimization", {}).get("direct_inference", False)),
         "config_files": config_snapshots,
-        "evaluation_config": config.get("evaluation", {}),
-        "optimization_config": config.get("optimization", {}),
         "parameter_roles": {
             "context": context_names,
             "trainable_control": trainable_names,
@@ -880,14 +1003,15 @@ def _build_evaluation_record(
         },
         "summary_metrics": summary_metrics,
         "top_cases_by_reported_joint_risk_reduction": top_cases,
+        "trace_outputs": trace_outputs,
         "runtime": {
             "total_time_cost_sec": float(stage_outputs["total_time_cost"]),
             "avg_time_cost_sec": float(stage_outputs["total_time_cost"] / max(1, evaluated_case_count)),
             "trajectory_steps_logged": len(stage_outputs["trajectory_all"]),
+            "opt2_convergence": convergence_summary,
         },
     }
-    # summary_metrics / top_cases / distribution_penalty 里可能混入 np.float32、np.int64 等标量；
-    # 这里统一在导出前递归转成原生 Python 类型，避免 YAML 序列化阶段再因单个字段失败。
+    # 统一把 numpy 标量递归转成原生 Python 类型，避免 YAML 序列化被单个字段卡住。
     return convert_numpy_types(record)
 
 def main():
@@ -951,6 +1075,7 @@ def main():
         logger.info("Distribution Penalty 未启用：跳过训练流形参考分布加载与拟合。")
 
     strategy_ckpt_path = _resolve_strategy_ckpt(args, base_dir, config)
+    trace_case_ids = {str(case_id) for case_id in (args.trace_case_ids or [])}
     strategy_net = None
     if bool(config.get("optimization", {}).get("direct_inference", False)):
         if strategy_ckpt_path is None:
@@ -995,6 +1120,8 @@ def main():
         optimizer.refine_steps,
         int(config.get("evaluation", {}).get("eval_batch_size", 512)),
     )
+    if trace_case_ids:
+        logger.info("已启用局部精调轨迹导出: trace_case_ids=%s", sorted(trace_case_ids))
 
     df_input, truth_arrays, input_source = _load_eval_input(args, logger)
 
@@ -1024,9 +1151,12 @@ def main():
     stage_outputs_valid = _compute_predictions_batch(
         context_tensor=context_tensor,
         baseline_trainable=baseline_tensor,
+        case_ids=[str(case_id) for case_id in df_input.loc[valid_indices, "case_id"].tolist()],
+        row_indices=valid_indices.tolist(),
         surrogate=surrogate,
         optimizer=optimizer,
         eval_batch_size=eval_batch_size,
+        trace_case_ids=trace_case_ids,
     )
     stage_outputs = _expand_stage_outputs_to_full(
         stage_outputs=stage_outputs_valid,
@@ -1053,8 +1183,20 @@ def main():
     results_dir = output_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=False)
     output_csv_path = results_dir / Path(args.output_csv).name
-    config_snapshots = _copy_config_snapshots(cfg_path, param_space_path, output_dir)
+    config_snapshots = _copy_config_snapshots(
+        cfg_path,
+        param_space_path,
+        output_dir,
+    )
     result_df.to_csv(str(output_csv_path), index=False)
+    trace_outputs = _save_case_trace_tables(
+        results_dir=results_dir,
+        trace_records=stage_outputs.get("trace_records", {}),
+        requested_case_ids=trace_case_ids,
+        logger=logger,
+    )
+    if trace_outputs["written_case_count"] > 0:
+        logger.info("已导出 %d 个 case 的优化轨迹: %s", trace_outputs["written_case_count"], trace_outputs["trace_dir"])
     opt1_generated = stage_outputs["Opt1"]["preds"] is not None
     opt2_generated = stage_outputs["Opt2"]["preds"] is not None
 
@@ -1081,6 +1223,7 @@ def main():
         top_cases=top_cases,
         stage_outputs=stage_outputs,
         evaluated_case_count=evaluated_case_count,
+        trace_outputs=trace_outputs,
     )
     with open(results_dir / "evaluation_record.yaml", "w", encoding="utf-8") as file:
         yaml.safe_dump(evaluation_record, file, allow_unicode=True, sort_keys=False)
