@@ -134,15 +134,20 @@ class PulseTCNEncoder(nn.Module):
 class StrategyNet(nn.Module):
     """策略网络：context + pulse -> trainable controls。
 
-    结构借鉴 InjuryPredictModel：
+    结构参考 InjuryPredictModel：
     - TCN 波形编码器负责提取碰撞 pulse 的时序表征；
     - MLP 编码器负责处理 context 中的连续量与离散嵌入；
     - 融合层把 [pulse 编码, context 编码, 原始标量特征] 拼接后再做规范化与重标定；
     - MLP 解码器输出共享决策表示；
     - 最终输出头只保留一个共享 Linear，把表示映射到所有 trainable 控制参数的 logits。
 
-    约束投影仍由 ConstraintEngine 统一执行，避免策略网络、局部精调和评估 CSV
-    各自复制一套物理规则。
+    顺序约定：
+    - `context_features` 的输入顺序必须与 `ParamManager.get_context_names()` 一致；
+    - 网络输出的 logits 顺序必须与 `ParamManager.get_trainable_names()` 一致；
+    - 一旦需要拼回完整特征张量，则统一交给 `ConstraintEngine.compose_full_features()`，
+      由它按完整 `FEATURE_ORDER` 还原。
+
+    约束投影仍由 ConstraintEngine 统一执行。
     """
 
     def __init__(
@@ -264,13 +269,18 @@ class StrategyNet(nn.Module):
         with torch.no_grad():
             self.output_head.weight.zero_()
             # 输出头权重清零后，网络对任意输入都会退化为一个固定 bias。
-            # 这里把 bias 设为 default 动作在 [opt_min, opt_max] 内的 logit，
-            # 从而保证训练开始前任何合法输入都会输出 param_space.yaml 中的 default。
+            # 这里把 bias 设为 default 动作在 [opt_min, opt_max] 内的 logit，从而保证训练开始前任何合法输入都会输出 param_space.yaml 中的 default。
             ratio = (self.default_actions - self.min_bounds) / torch.clamp(self.max_bounds - self.min_bounds, min=1e-12)
             ratio = torch.clamp(ratio, min=1e-6, max=1.0 - 1e-6)
             self.output_head.bias.copy_(torch.log(ratio / (1.0 - ratio)))
 
     def _prepare_scalar_context_features(self, context_features: torch.Tensor) -> torch.Tensor:
+        """把 context 张量整理成策略网络使用的标量输入。
+
+        `context_features` 的列顺序来自 `ParamManager.get_context_names()`。
+        这里会把它拆成“连续列子序列”和“离散列子序列”分别处理，
+        但两者内部的相对顺序都保持 ParamManager 给出的顺序不变。
+        """
         parts = []
         if self.continuous_context_indices:
             continuous_raw = context_features[:, self.continuous_context_indices]
@@ -297,12 +307,19 @@ class StrategyNet(nn.Module):
         raw_output: torch.Tensor,
         context_features: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """把网络输出的 logits 映射回物理动作，并做前向投影。"""
+        """把输出头 logits 映射回物理动作，并还原完整特征。
+
+        - `raw_output` 的列顺序对应 `ParamManager.get_trainable_names()`；
+        - `raw_full_features` 是按完整 `FEATURE_ORDER` 拼回的投影前特征；
+        - `projected_actions` 则是前向投影后的合法动作，仍按 trainable 子序列顺序排列。
+        """
         norm_actions = torch.sigmoid(raw_output)
         spans = torch.clamp(self.max_bounds - self.min_bounds, min=1e-12)
         actions = norm_actions * spans.unsqueeze(0) + self.min_bounds.unsqueeze(0)
+        # raw_full_features 是投影前的完整特征，包含 context + action，用于后续对“原始游离解”计算反向约束软惩罚
         raw_full_features = self.constraint_engine.compose_full_features(context_features, actions)
         projected_full = self.constraint_engine.project_forward(raw_full_features, strict=False)
+        # projected_actions 来自前向投影后的合法解，保证送入 surrogate 的动作始终满足输出端约束。
         _, projected_actions = self.constraint_engine.split_from_full(projected_full)
         return projected_actions, raw_full_features
 
@@ -311,6 +328,16 @@ class StrategyNet(nn.Module):
         context_features: torch.Tensor,
         pulse_features: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """执行策略网络前向。
+
+        输入：
+        - `context_features`: 按 `ParamManager.get_context_names()` 排列；
+        - `pulse_features`: PulsePredict 输出的归一化波形特征。
+
+        返回：
+        - `projected_actions`: 按 `ParamManager.get_trainable_names()` 排列的合法动作；
+        - `raw_full_features`: 按完整 `FEATURE_ORDER` 排列的投影前特征。
+        """
         pulse_encoded = self.pulse_encoder(pulse_features)
         scalar_context = self._prepare_scalar_context_features(context_features)
         context_encoded = self.context_encoder(scalar_context)
@@ -320,4 +347,5 @@ class StrategyNet(nn.Module):
         decoded = self.decoder(fusion_vec)
         decoded = self.post_decoder_block(decoded)
         raw_output = self.output_head(decoded)
+        # 返回的 projected_actions 已经是严格合法的动作解，且是原始物理尺度；raw_full_features 是投影前的完整特征（也是原始物理尺度），包含 context + action，用于后续对“原始游离解”计算反向约束软惩罚。
         return self._decode_actions_from_logits(raw_output, context_features)

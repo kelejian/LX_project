@@ -74,8 +74,6 @@ def _build_scheduler(optimizer, train_cfg: dict, max_iters: int):
         )
     return None
 
-
-
 def _collect_strategy_net_diagnostics(
     strategy_net,
     surrogate: SurrogateAdapter,
@@ -256,7 +254,7 @@ def _build_training_summary(
             "reference_sampling": dist_ref_info,
         },
         "parameter_roles": {
-            "context": param_manager.get_context_names(),
+            "context": param_manager.get_context_names(), # 策略网络的输入参数特征及相应的输入顺序
             "trainable_control": param_manager.get_trainable_names(),
             "fixed_control": param_manager.get_fixed_control_names(),
         },
@@ -269,7 +267,6 @@ def _build_training_summary(
         "final_model": final_model_record,
     }
 
-
 def _evaluate_strategy_batch(
     strategy_net,
     surrogate: SurrogateAdapter,
@@ -278,19 +275,24 @@ def _evaluate_strategy_batch(
     """统一一批 context 上的策略前向与代理评估。
 
     训练批和验证批都走同一条链路：先基于 context 生成 pulse，再由策略网络产出动作，
-    最后交给代理模型计算逐样本 loss 与风险拆解。
+    最后交给代理模型计算: 逐样本总loss 与风险拆解（包括拆解后的loss项, 风险概率项, 损伤标量值项），并返回。
     """
+    # context_params 的列顺序与 ParamManager.get_context_names() 一致。
+    # pulse_norm 是代理波形模型直接输出的归一化二维波形，后续会同时送给策略网络和损伤代理。
     pulse_norm = surrogate.generate_pulse(context_params)
+    # actions 的列顺序与 ParamManager.get_trainable_names() 一致；
+    # raw_full_features 则已按完整 FEATURE_ORDER 拼回投影前的完整特征。
     actions, raw_full_features = strategy_net(context_params, pulse_norm)
     loss_batch, _, info = surrogate.predict_injury_and_loss(
-        context_params=context_params,
-        control_trainable=actions,
+        context_params=context_params,  # 合法的 context 子张量，顺序与 ParamManager.get_context_names() 一致
+        control_trainable=actions,  # 合法的 trainable control 子张量，顺序与 ParamManager.get_trainable_names() 一致
         pulse_norm=pulse_norm,
         include_opt_bounds=False,
+        # penalty_features 明确传入投影前原始解，确保反向约束软惩罚针对的是“游离解本身”而不是投影后的合法解。
         penalty_features=raw_full_features,
     )
+    # loss_batch 是逐样本的损失值张量（形状为 [batch_size]），info 包含了风险拆解等额外信息，供日志记录和分析使用。
     return loss_batch, info
-
 
 def _run_gradient_sanity_check(
     strategy_net,
@@ -546,6 +548,7 @@ def main():
     train_metric_name = "ema_train_loss" if ema_enabled else "train_loss"
 
     strategy_net.train()
+    # 训练主循环。每一步从采样流拿一批 context，计算损失并反向传播，更新权重和学习率调度器；每隔固定步数记录日志、评估验证集、保存 checkpoint，并把这些信息汇总到 history_rows 和 summary_info 里。
     try:
         for iter_idx in tqdm(range(train_cfg["max_iterations"]), desc="Training StrategyNet"):
             optimizer.zero_grad()
@@ -576,12 +579,12 @@ def main():
             # 训练最优权重默认按 EMA 指标挑选，是为了弱化随机采样流带来的单步抖动；
             # 但在 warmup 结束前 EMA 还没有稳定含义，因此这段区间不更新 train_best。
             # val_best 则始终来自固定 injury_val 全量评估，表示“泛化到固定验证切片的最好点”。
-            # 两者故意分开记录，避免把流式训练噪声下的最优点和固定验证集最优点混成一个概念。
+            # 两者分开记录，以避免混淆流式训练噪声下的最优点和固定验证集最优点。
             ema_ready = (iter_idx + 1) >= max(1, ema_warmup_iters) if ema_enabled else True
 
             if writer is not None:
                 writer.add_scalar("Train/Loss", loss_value, iter_idx)
-                # Risk / Constraint / Distribution 分别对应目标风险、显式可行域软惩罚、分布偏离惩罚这三部分训练损失。
+                # Risk / Constraint / Distribution 分别对应目标风险、显式可行域反向约束软惩罚、分布偏离惩罚这三部分训练损失。
                 writer.add_scalar("Train/LossRisk", loss_risk, iter_idx)
                 writer.add_scalar("Train/LossConstraint", loss_constraint, iter_idx)
                 writer.add_scalar("Train/LossDistribution", loss_distribution, iter_idx)

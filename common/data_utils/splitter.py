@@ -39,7 +39,7 @@ def stratified_split(
     seed: int = GLOBAL_SEED
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
     """
-    对数据集索引执行分层划分。
+    对数据集索引执行分层划分。分层划分确保训练集、验证集和测试集中各类别的分布与原始数据相似。支持强制分配特定 case_id 到训练、验证或测试集，以及排除特定 case_id。
     返回的是索引数组，而不是 case_id 列表。
     
     Args:

@@ -1,6 +1,7 @@
 # Project-wide ignores
 ARS_codetask_prompt.md
 data/
+data_*/
 data_PS/
 data_DS/
 # data/processed/

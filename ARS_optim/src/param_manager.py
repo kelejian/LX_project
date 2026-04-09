@@ -9,8 +9,12 @@ from common.settings import FEATURE_ORDER
 
 class ParamManager:
     """管理 ARS_optim 的参数定义与默认值。
-    1. 读取并校验 param_space.yaml 中真正影响运行的参数定义；
-    2. 向训练、评估和约束模块提供统一的索引、默认值与角色划分。
+
+    这里负责维护整个 ARS_optim 的“特征顺序契约”：
+    - `all_params`、完整特征向量、默认特征向量都严格按 `common.settings.FEATURE_ORDER` 排列；
+    - `context_params` 和 `trainable_params` 则是在这一总顺序下，按原始 index 取出的子序列。
+
+    训练、评估、约束和代理接口只要都通过 ParamManager 取索引和名称，就不会出现“某个模块自己重新定义特征顺序”的隐性错位。
     """
 
     def __init__(self, param_space_path_or_dict: Union[str, Path, dict]):
@@ -71,6 +75,7 @@ class ParamManager:
         return params
 
     def _validate_feature_order(self) -> None:
+        """确认 `param_space.yaml` 的参数顺序与 `FEATURE_ORDER` 完全一致。"""
         if len(self.all_params) != len(FEATURE_ORDER):
             raise ValueError(
                 f"参数数量与 FEATURE_ORDER 不一致: {len(self.all_params)} != {len(FEATURE_ORDER)}"
@@ -149,8 +154,10 @@ class ParamManager:
         return torch.tensor(defaults, dtype=torch.float32, device=device)
 
     def get_default_feature_vector(self, device: torch.device = torch.device("cpu")) -> torch.Tensor:
+        """返回按 `FEATURE_ORDER` 排列的完整默认特征向量。"""
         return torch.tensor(self.default_feature_values, dtype=torch.float32, device=device)
 
     def get_default_feature_matrix(self, batch_size: int, device: torch.device = torch.device("cpu")) -> torch.Tensor:
+        """返回按 `FEATURE_ORDER` 排列的完整默认特征矩阵 `[batch_size, feature_dim]`。"""
         base = self.get_default_feature_vector(device=device)
         return base.unsqueeze(0).expand(batch_size, -1).clone()

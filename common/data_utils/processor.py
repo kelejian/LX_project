@@ -149,7 +149,7 @@ class UnifiedDataProcessor:
                 raise RuntimeError(f"无法加载归一化配置: {self.config_path}")
 
     # ========================================================================
-    # 核心归一化/反归一化方法
+    # 波形归一化/反归一化方法，暂只支持 numpy.ndarray
     # ========================================================================
     
     def process_waveform(
@@ -181,7 +181,7 @@ class UnifiedDataProcessor:
             return data / scale_factor
     
     # ========================================================================
-    # 核心归一化/反归一化方法 (现已兼容 numpy.ndarray 与 torch.Tensor)
+    # 特征归一化/反归一化方法 (现已兼容 numpy.ndarray 与 torch.Tensor)
     # ========================================================================
     
     def process_continuous(
@@ -190,7 +190,10 @@ class UnifiedDataProcessor:
         feature_names: Optional[List[str]] = None,
         inverse: bool = False
     ) -> Union[np.ndarray, Any]:
-        """连续特征归一化/反归一化 (兼容 NumPy 和 PyTorch Tensor 以支持计算图)。"""
+        """
+        连续特征归一化/反归一化 (兼容 NumPy 和 PyTorch Tensor 以支持计算图)。
+        支持任意数量合法连续特征组合输入，逐列处理并保持输入形状。
+        """
         self._ensure_config()
         
         # 动态检测是否为 PyTorch 张量
@@ -244,7 +247,10 @@ class UnifiedDataProcessor:
         feature_names: Optional[List[str]] = None,
         inverse: bool = False
     ) -> Union[np.ndarray, Any]:
-        """离散特征编码/解码 (兼容 NumPy 和 PyTorch Tensor)。"""
+        """
+        离散特征编码/解码 (兼容 NumPy 和 PyTorch Tensor)。
+        支持任意数量合法离散特征组合输入，逐列处理并保持输入形状。
+        """
         self._ensure_config()
         
         is_tensor = 'Tensor' in type(data).__name__
@@ -313,7 +319,10 @@ class UnifiedDataProcessor:
         feature_names: List[str],
         inverse: bool = False
     ) -> Union[np.ndarray, Any]:
-        """通用接口：按特征名处理任意子集 (自动分发到连续/离散处理，完美兼容 Tensor)。"""
+        """
+        通用接口：按特征名处理任意子集 (自动分发到连续/离散处理，完美兼容 Tensor)
+        支持任意合法特征组合（混合连续+离散）输入，逐列处理并保持输入形状。
+        """
         self._ensure_config()
         
         is_tensor = 'Tensor' in type(values).__name__
@@ -361,6 +370,7 @@ class UnifiedDataProcessor:
             return result.squeeze(0) if n_samples == 1 and values.dim() == 1 else result
         else:
             return result.squeeze() if n_samples == 1 and values.ndim == 1 else result
+    
     def process_all_features(
         self,
         x_raw: np.ndarray,
@@ -392,7 +402,11 @@ class UnifiedDataProcessor:
         x_disc_processed = self.process_discrete(x_disc, DISCRETE_FEATURE_NAMES, inverse=inverse)
         
         return x_cont_processed, x_disc_processed
-    
+
+    # ========================================================================
+    # 外部接口: 获取归一化参数（供外部构建可微归一化层使用）
+    # ========================================================================    
+
     def get_waveform_scale_factor(self) -> float:
         """获取波形缩放因子（供外部构建可微归一化层使用）。"""
         self._ensure_config()

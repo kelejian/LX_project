@@ -26,11 +26,13 @@ PulsePredict/
 
 当前主流程不在 `config.json` 里硬编码共享数据路径。
 
-`PulsePredict/config.json` 中与数据相关的字段建议保留为 `null`，运行时会自动回落到 [common/settings.py](../common/settings.py) 中的统一路径约定，包括：
+当`PulsePredict/config.json` 中与数据相关的字段为 `null`，运行时会自动回落到 [common/settings.py](../common/settings.py) 中的统一路径约定，包括：
 
 - `RAW_DATA`
 - `NORMALIZATION_CONFIG_PATH`
 - `PULSE_SPLIT_DIR`
+
+建议保留 `config.json` 中的 `null` 设置。
 
 ## 4. 环境与依赖
 

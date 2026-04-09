@@ -133,7 +133,7 @@ optimization:
   direct_inference: true
 
   # 局部精调总步数；当 refine_steps=0 时，不生成 Opt2。
-  refine_steps: 100
+  refine_steps: 500
 
   # Adam 在无量纲潜变量 z 上的初始学习率；真实每维参数在物理空间中的单步更新量 = 调度后的学习率 × Adam 自适应因子 × 参数量程。
   lr: 1.0e-3
@@ -165,11 +165,11 @@ optimization:
 
   objectives:
     # 加权联合风险中的各部位权重。
-    weight_hic: 3.0
+    weight_hic: 3.5
     weight_dmax: 1.0
     weight_nij: 1.0
 
-    # 物理约束软惩罚权重；它作用在 projection 前的原始游离解上，用来在前向投影截断后继续提供补偿梯度。
+    # 反向物理约束软惩罚权重；它作用在 projection 前的原始游离解上，用来在前向投影截断后继续提供补偿梯度。
     weight_penalty: 10.0
 
   distribution_penalty:
@@ -180,7 +180,7 @@ optimization:
     method: "knn"
 
     # 分布偏离项总权重。
-    weight: 0.01
+    weight: 0.001
 
     # 参考特征空间。context 只看 context 分布，context_control 看 [context | trainable_control] 联合分布。
     feature_space: "context_control"

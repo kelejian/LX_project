@@ -389,7 +389,7 @@ def package_raw_packed(
 def _save_split(out_dir: Path, prefix: str, case_ids_all: np.ndarray,
                 train_case_ids: np.ndarray, val_case_ids: np.ndarray, test_case_ids: np.ndarray,
                 summary: Dict[str, Any]):
-    '''保存划分结果到指定目录。
+    '''保存划分结果到指定目录。目前主要用于 injury split 的 driver/passenger/combined 三套划分
     Args:
         out_dir: 输出目录
         prefix: 文件名前缀
@@ -427,9 +427,8 @@ def _save_pulse_split_with_first_occurrence_indices(
 ):
     """保存 pulse 划分结果。
 
-    - case_ids 文件仍保存 pulse_source_case_id（不改变语义）；
-    - indices 文件保存 pulse_source_case_id 在 raw_packed 中“首次出现”的原始行索引，
-      直接对应 raw_data_packed.npz 各数组的行。
+    - case_ids 文件保存 pulse_source_case_id；
+    - indices 文件保存 pulse_source_case_id 在 raw_packed 中“首次出现”的原始行索引，直接对应 raw_data_packed.npz 各数组的行。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -475,15 +474,14 @@ def generate_splits(
     val_ratio: float,
     test_ratio: float
 ):
-    """基于 raw_packed 生成 injury/pulse 两个任务的三套划分。
+    """基于 raw_packed 生成 pulse/injury/ 两个任务的三套划分。
 
     输出结构：
-      <out_dir>/injury/{driver,passenger,combined}/
-      <out_dir>/pulse/
+    <out_dir>/pulse/
+    <out_dir>/injury/{driver,passenger,combined}/
 
-    其中 injury 的 combined 严格由 driver 与 passenger 对应 split 的并集构成，
-    不会把某一侧的 val/test 样本混入另一侧的 train；
-    pulse 仅保留一套完整数据划分。
+    其中pulse 仅保留一套完整数据划分。injury 的 combined 严格由 driver 与 passenger 对应 split 的并集构成，不会把某一侧的 val/test 样本混入另一侧的 train；
+    
     """
     split_root = Path(out_dir)
     data = np.load(raw_npz_path)
@@ -520,7 +518,7 @@ def generate_splits(
     pulse_source_ids = np.unique(pulse_source_case_ids_all).astype(np.int64)
     pulse_train, pulse_val, pulse_test, pulse_summary = _split_case_ids_or_empty(
         case_ids=pulse_source_ids,
-        stratify_labels=np.zeros(pulse_source_ids.shape[0], dtype=np.int64),
+        stratify_labels=np.zeros(pulse_source_ids.shape[0], dtype=np.int64), # pulse_source_case_id 划分不进行分层，传入全零标签，效果等同于 random_split
         train_ratio=train_ratio,
         val_ratio=val_ratio,
         test_ratio=test_ratio,
@@ -644,7 +642,7 @@ def main():
     parser.add_argument(
         "--distribution",
         type=str,
-        default=r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0321.csv",
+        default=r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0408_del.csv",
         help="distribution 源文件路径，支持 .csv / .npz；绝对路径或相对路径均可",
     )
     parser.add_argument(

@@ -32,7 +32,7 @@ from InjuryPredict.utils.tools import convert_numpy_types
 
 from ARS_optim.src.constraints import ConstraintEngine
 from ARS_optim.src.data_sampler import StateDataSampler
-from ARS_optim.src.optimizer import LocalRefiner
+from ARS_optim.src.optimizer import Optimizer
 from ARS_optim.src.param_manager import ParamManager
 from ARS_optim.src.strategy_net import build_strategy_net_from_config, load_strategy_run_config
 from ARS_optim.src.surrogate import SurrogateAdapter, load_surrogate_models
@@ -239,6 +239,23 @@ def _copy_config_snapshots(
 
 
 def _build_stage_summary_metrics(result_df: pd.DataFrame, available_opt_stages: List[str]) -> Dict[str, object]:
+    """基于逐 case 结果表计算宏观汇总指标。
+
+    作用：
+    - 按阶段统计 `HIC/Dmax/Nij/Phead/Pchest/Pneck/JointRisk/AIS/MAIS` 的均值；
+    - 按优化阶段统计相对 `Base` 的平均降幅。
+
+    输入：
+    - `result_df`: `_build_result_dataframe()` 产出的逐 case 结果表。
+    - `available_opt_stages`: 本次评估实际生成的优化阶段名称列表，只能取 `Opt1/Opt2` 的子集。
+
+    输出：
+    - 返回一个字典，供 `evaluation_record.yaml` 写入宏观摘要。
+
+    注意：
+    - 这里使用 `nanmean`，因此会自动跳过被 `NaN` 占位的 skipped case。
+    - 该函数只读取现成列，不参与任何额外推理或结果修正。
+    """
     def safe_nanmean(series: pd.Series) -> float:
         values = np.asarray(series, dtype=np.float32)
         return float(np.nan) if np.isnan(values).all() else float(np.nanmean(values))
@@ -330,11 +347,24 @@ def _prepare_eval_inputs(
     device: torch.device,
     logger,
     strict_provided_validation: bool,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], List[str], np.ndarray, List[int], List[int]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], List[str], np.ndarray, List[int], List[int], List[int]]:
     """整理评估输入。
 
-    外部 input_csv 走严格输入校验：context 非法就跳过，baseline 只有整组合法才采用，否则整行回退 default。
-    默认 split 评估直接使用已有参数，只检查缺失值，不再额外做优化子范围过滤。
+    `input_csv` 模式下，按输入端规则逐行处理：
+    - `context` 缺失或不合法时跳过该行。
+    - `baseline` trainable control 只有整组合法才采用，否则整行回退为 default。
+
+    默认 split 评估直接使用数据集已有参数，只检查缺失值，不再重复做输入合法性过滤。
+
+    返回值依次为：
+    - `context_output_df`: 结果表中保留的 context 视图, 包含原始输入里的非法行
+    - `context_eval_df`: 真正送入模型的 context 数值表；被跳过的行（如缺失或非法）保持 NaN
+    - `baseline_eval_df`: baseline 损伤评估时使用的 trainable control 参数表；必要时已整行回退为 default
+    - `missing_context` / `missing_trainable`: 输入表缺失的参数列名
+    - `valid_mask`: 最终进入模型评估的行掩码
+    - `skipped_rows`: 因 context 缺失或不合法而跳过的原始行号
+    - `reverted_baseline_rows`: baseline 被整行回退为 default 的原始行号
+    - `invalid_default_baseline_rows`: baseline 回退到 default 后仍与当前 context 不兼容、因此被跳过的原始行号
     """
     context_params = param_manager.get_context_params()
     trainable_params = param_manager.get_trainable_params()
@@ -363,6 +393,7 @@ def _prepare_eval_inputs(
             raise ValueError(f"默认 split 评估样本缺失 trainable control 列: {missing_trainable}")
 
     if not strict_provided_validation:
+        # 默认 split 来自已处理好的合法数据，这里只检查缺失值。
         context_eval_df = context_df_raw.astype(np.float32)
         baseline_eval_df = baseline_df_raw.astype(np.float32)
         missing_context_rows = context_eval_df[context_names].isna().any(axis=1).to_numpy()
@@ -383,6 +414,7 @@ def _prepare_eval_inputs(
             valid_mask,
             [],
             [],
+            [],
         )
 
     context_output_df = context_df_raw.copy()
@@ -390,16 +422,18 @@ def _prepare_eval_inputs(
     valid_context_candidates = ~row_has_context_nan
     skipped_rows: List[int] = np.flatnonzero(row_has_context_nan).astype(int).tolist()
 
+    # 严格 `input_csv` 模式下，导出视图与模型输入分开维护；
+    # 后者只保留真正参与评估的合法数值。
     valid_mask = np.zeros(len(df_input), dtype=bool)
     context_eval_df = pd.DataFrame(np.nan, index=df_input.index, columns=context_names, dtype=np.float32)
     baseline_eval_df = pd.DataFrame(np.tile(default_trainable, (len(df_input), 1)), index=df_input.index, columns=trainable_names, dtype=np.float32)
     reverted_baseline_rows: List[int] = []
+    invalid_default_baseline_rows: List[int] = []
 
     if np.any(valid_context_candidates):
         candidate_indices = np.flatnonzero(valid_context_candidates)
         candidate_context_raw = context_df_raw.iloc[candidate_indices]
         candidate_context_tensor = torch.tensor(candidate_context_raw[context_names].values, dtype=torch.float32, device=device)
-        # input_csv 的 context 校验只看当前真正属于 context 的列，不补默认 trainable control。
         context_valid_local = constraint_engine.validate_context_input(candidate_context_tensor).detach().cpu().numpy().astype(bool)
         if (~context_valid_local).any():
             logger.warning(
@@ -412,18 +446,12 @@ def _prepare_eval_inputs(
 
         legal_context_indices = candidate_indices[context_valid_local]
         if legal_context_indices.size > 0:
-            valid_mask[legal_context_indices] = True
-            context_eval_df.loc[legal_context_indices, context_names] = context_df_raw.loc[
-                legal_context_indices,
-                context_names,
-            ].to_numpy(dtype=np.float32)
-
             baseline_candidate = baseline_df_raw.loc[legal_context_indices, trainable_names].copy()
-            # baseline 采用严格整组策略，不做“用户部分列 + default 其余列”的混搭。
+            # baseline 采用严格整组策略，不做“用户部分列 + default”的混搭。
             baseline_has_missing_local = baseline_candidate[trainable_names].isna().any(axis=1).to_numpy()
 
             legal_context_tensor = torch.tensor(
-                context_eval_df.loc[legal_context_indices, context_names].values,
+                context_df_raw.loc[legal_context_indices, context_names].values,
                 dtype=torch.float32,
                 device=device,
             )
@@ -436,6 +464,7 @@ def _prepare_eval_inputs(
                     dtype=torch.float32,
                     device=device,
                 )
+                # baseline 的合法性按完整样本校验：必须与当前 context 联合后仍满足输入端规则。
                 baseline_full = constraint_engine.compose_full_features(
                     legal_context_tensor[complete_row_indices],
                     baseline_complete_tensor,
@@ -454,9 +483,46 @@ def _prepare_eval_inputs(
                     "以下 input_csv 行的 baseline trainable control 缺失或整组不合法，已整行回退为 param_space.yaml 的 default。行号: %s",
                     _format_row_list(legal_context_indices[baseline_invalid_mask_local]),
                 )
-            reverted_indices = legal_context_indices[baseline_invalid_mask_local]
-            if reverted_indices.size > 0:
-                reverted_baseline_rows.extend(reverted_indices.astype(int).tolist())
+            # default 只能作为整组 fallback 候选，仍需与当前 context 联合校验；
+            # 否则一旦未来 trainable / context 角色切换，结果表里会混入物理上不合法的 baseline。
+            fallback_valid_local = np.zeros(len(legal_context_indices), dtype=bool)
+            if baseline_invalid_mask_local.any():
+                fallback_row_indices = np.flatnonzero(baseline_invalid_mask_local)
+                fallback_default_tensor = torch.tensor(
+                    np.tile(default_trainable, (fallback_row_indices.size, 1)),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                fallback_full = constraint_engine.compose_full_features(
+                    legal_context_tensor[fallback_row_indices],
+                    fallback_default_tensor,
+                )
+                fallback_valid_local[fallback_row_indices] = (
+                    constraint_engine.validate_full_input(fallback_full)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(bool)
+                )
+                invalid_default_indices = legal_context_indices[
+                    fallback_row_indices[~fallback_valid_local[fallback_row_indices]]
+                ]
+                if invalid_default_indices.size > 0:
+                    logger.warning(
+                        "以下 input_csv 行在 baseline 回退为 default 后，仍与当前 context 不兼容，将跳过该 case。行号: %s",
+                        _format_row_list(invalid_default_indices),
+                    )
+                    invalid_default_baseline_rows.extend(
+                        invalid_default_indices.astype(int).tolist()
+                    )
+                    skipped_rows.extend(invalid_default_indices.astype(int).tolist())
+                    baseline_eval_df.loc[invalid_default_indices, trainable_names] = np.nan
+
+                reverted_indices = legal_context_indices[
+                    fallback_row_indices[fallback_valid_local[fallback_row_indices]]
+                ]
+                if reverted_indices.size > 0:
+                    reverted_baseline_rows.extend(reverted_indices.astype(int).tolist())
 
             accepted_indices = legal_context_indices[baseline_valid_local]
             if accepted_indices.size > 0:
@@ -465,12 +531,24 @@ def _prepare_eval_inputs(
                     trainable_names,
                 ].to_numpy(dtype=np.float32)
 
+            final_valid_local = baseline_valid_local | fallback_valid_local
+            final_valid_indices = legal_context_indices[final_valid_local]
+            if final_valid_indices.size > 0:
+                valid_mask[final_valid_indices] = True
+                context_eval_df.loc[final_valid_indices, context_names] = context_df_raw.loc[
+                    final_valid_indices,
+                    context_names,
+                ].to_numpy(dtype=np.float32)
+
     if skipped_rows:
         skipped_array = np.asarray(sorted(set(skipped_rows)), dtype=np.int64)
-        logger.warning("input_csv 中共有 %d 个 case 因 context 缺失或非法被跳过，行号: %s", skipped_array.size, _format_row_list(skipped_array))
+        logger.warning("input_csv 中共有 %d 个 case 因 context 缺失、context 非法或 default baseline 与 context 不兼容而被跳过，行号: %s", skipped_array.size, _format_row_list(skipped_array))
     if reverted_baseline_rows:
         reverted_array = np.asarray(sorted(set(reverted_baseline_rows)), dtype=np.int64)
         logger.warning("input_csv 中共有 %d 个 case 的 baseline 可调控制参数被回退为 default，行号: %s", reverted_array.size, _format_row_list(reverted_array))
+    if invalid_default_baseline_rows:
+        invalid_default_array = np.asarray(sorted(set(invalid_default_baseline_rows)), dtype=np.int64)
+        logger.warning("input_csv 中共有 %d 个 case 在 baseline 回退 default 后仍不合法，因此被跳过，行号: %s", invalid_default_array.size, _format_row_list(invalid_default_array))
 
     return (
         context_output_df,
@@ -481,6 +559,7 @@ def _prepare_eval_inputs(
         valid_mask,
         sorted(set(skipped_rows)),
         sorted(set(reverted_baseline_rows)),
+        sorted(set(invalid_default_baseline_rows)),
     )
 
 def _load_default_split_eval_input(logger) -> tuple[pd.DataFrame, Dict[str, np.ndarray], Dict[str, object]]:
@@ -577,21 +656,41 @@ def _compute_predictions_batch(
     case_ids: List[str],
     row_indices: List[int],
     surrogate: SurrogateAdapter,
-    optimizer: LocalRefiner,
+    optimizer: Optimizer,
     eval_batch_size: int,
     trace_case_ids: Set[str],
 ) -> Dict[str, object]:
-    """按批次计算 Base/Opt1/Opt2 三个阶段的预测结果。
+    """按评估批次生成 `Base / Opt1 / Opt2` 三阶段结果。
 
-    这里显式把 Base、Opt1、Opt2 分开缓存。
-    结果 CSV 会直接按真实生成阶段展开，而不是再压缩成单一 `Opt_` 口径。
+    作用：
+    - 对已经通过输入端校验的有效 case 执行代理评估；
+    - 在配置允许时，继续执行策略直推和局部精调；
+    - 把各阶段的预测值、动作、损失分项、收敛步数和 trace 统一收集起来。
 
-    局部精调虽然在实现上按 batch 调用一次 `optimizer.optimize`，但优化器内部维护的是
-    `[batch_size, trainable_dim]` 形状的潜变量，并按样本逐行计算损失与 Adam 状态。
-    也就是说，这里只是把多个逐点优化并行向量化，而不是把一个 batch 当成单个分布目标来优化。
+    输入：
+    - `context_tensor`: 仅包含有效 case 的 `context` 张量。
+    - `baseline_trainable`: 与 `context_tensor` 严格对齐的 baseline 可调控制参数。
+    - `case_ids` / `row_indices`: 有效 case 在原输入表中的标识，用于 trace 和后续结果回填。
+    - `surrogate`: 统一封装波形生成、损伤预测和目标函数计算的代理接口。
+    - `optimizer`: 负责 `Opt1/Opt2` 的二阶段优化器。
+    - `eval_batch_size`: 仅控制并行切分粒度，不改变逐 case 优化语义。
+    - `trace_case_ids`: 需要额外导出局部精调过程表的 case 标识集合。
+
+    输出：
+    - 返回一个按阶段组织的字典，其中 `Base` 总是存在；
+    - `Opt1` 仅在启用策略直推时存在；
+    - `Opt2` 仅在启用局部精调时存在；
+    - 额外字段包括总耗时、逐 case 收敛步数和指定 case 的轨迹记录。
+
+    注意：
+    - 虽然实现上按 batch 调用 `optimizer.optimize()`，但局部精调仍是逐 case 优化；
+      这里只是把多个样本的逐点优化做成并行向量化。
+    - 当前函数只输出“有效 case 的紧凑结果”；skipped 行的 `NaN` 回填在
+      `_expand_stage_outputs_to_full()` 中统一处理。
     """
     sample_count = context_tensor.shape[0]
     device = context_tensor.device
+    # 每个阶段都按同一结构暂存：预测值、动作、逐样本 loss 和风险细项。
     stage_parts = {
         key: {
             "preds": [],
@@ -602,28 +701,31 @@ def _compute_predictions_batch(
         for key in STAGE_NAMES
     }
     total_time_cost = 0.0
-    trajectory_all: List[float] = []
-    opt2_convergence_parts: List[torch.Tensor] = []
-    trace_records: Dict[int, Dict[str, object]] = {}
+    opt2_convergence_parts: List[torch.Tensor] = []  # 各 batch 的逐 case Opt2 收敛步数
+    trace_records: Dict[int, Dict[str, object]] = {}  # 指定 case 的逐步优化明细
 
     def cat_or_nan(parts: List[torch.Tensor]) -> torch.Tensor:
+        # 某个阶段未启用时，用 NaN 向量占位，保证下游结果组装逻辑不必再分支判断长度。
         return torch.cat(parts, dim=0) if parts else torch.full((sample_count,), float("nan"), device=device)
 
     batch_starts = range(0, sample_count, eval_batch_size)
+    # 评估按有效样本的既有行序连续切 batch，不做随机打乱。
     for start in tqdm(batch_starts, total=(sample_count + eval_batch_size - 1) // eval_batch_size, desc="Evaluating batches"):
         end = min(start + eval_batch_size, sample_count)
         context_batch = context_tensor[start:end]
         baseline_batch = baseline_trainable[start:end]
 
         with torch.no_grad():
+            # Base 阶段直接评估“输入 context + baseline control”，不做任何优化。
             pulse_batch = surrogate.generate_pulse(context_batch)
             base_loss, base_preds, base_info = surrogate.predict_injury_and_loss(context_batch, baseline_batch, pulse_batch)
         stage_parts["Base"]["preds"].append(base_preds.detach())
         stage_parts["Base"]["actions"].append(baseline_batch.detach())
         stage_parts["Base"]["loss"].append(base_loss.detach())
+        # 各损伤风险分项与损失分量按阶段逐 batch 累积，后面统一拼接。
         for key in STAGE_INFO_KEYS:
             stage_parts["Base"]["info"][key].append(base_info[key].detach())
-
+        # 按配置决定是否继续执行 Opt1 / Opt2。
         if optimizer.direct_inference or optimizer.refine_steps > 0:
             opt_actions, opt_preds, opt_info = optimizer.optimize(
                 context_batch,
@@ -634,6 +736,7 @@ def _compute_predictions_batch(
             )
             direct_stage = opt_info.get("direct_stage")
             if direct_stage is not None:
+                # Opt1 是策略网络直推阶段；这里记录的是“直推后、局部精调前”的阶段结果。
                 stage_parts["Opt1"]["preds"].append(direct_stage["preds"].detach())
                 stage_parts["Opt1"]["actions"].append(direct_stage["actions"].detach())
                 stage_parts["Opt1"]["loss"].append(direct_stage["loss_batch"].detach())
@@ -641,25 +744,26 @@ def _compute_predictions_batch(
                     stage_parts["Opt1"]["info"][key].append(direct_stage["detail"][key].detach())
 
             if opt_info.get("refine_stage_enabled", False):
+                # Opt2 是局部精调后的最终结果；若未启用 refine，则这一整段保持为空。
                 stage_parts["Opt2"]["preds"].append(opt_preds.detach())
                 stage_parts["Opt2"]["actions"].append(opt_actions.detach())
                 stage_parts["Opt2"]["loss"].append(opt_info["final_loss_batch"].detach())
                 for key in STAGE_INFO_KEYS:
                     stage_parts["Opt2"]["info"][key].append(opt_info[key].detach())
-                convergence_steps = opt_info.get("convergence_steps")
+                convergence_steps = opt_info.get("convergence_steps")  # 当前 batch 的逐 case 收敛步数
                 if convergence_steps is not None:
                     opt2_convergence_parts.append(convergence_steps.detach())
 
+            # 这些附加信息按 batch 汇总，最终统一写入结果记录。
             total_time_cost += float(opt_info.get("time_cost", 0.0))
-            trajectory_all.extend(opt_info.get("trajectory", []))
             for row_index, trace_record in opt_info.get("trace_records", {}).items():
                 if row_index in trace_records:
                     raise RuntimeError(f"重复写入同一 row_index 的优化轨迹: {row_index}")
                 trace_records[int(row_index)] = trace_record
 
+    # 这里先保持“只覆盖有效 case”的紧凑结构；跳过行的 NaN 回填在 _expand_stage_outputs_to_full() 里统一处理。
     output = {
         "total_time_cost": total_time_cost,
-        "trajectory_all": trajectory_all,
         "opt2_convergence_step": torch.cat(opt2_convergence_parts, dim=0) if opt2_convergence_parts else None,
         "trace_records": trace_records,
     }
@@ -680,16 +784,29 @@ def _expand_stage_outputs_to_full(
     total_count: int,
     trainable_dim: int,
 ) -> Dict[str, object]:
-    """把“仅对有效 case 计算出来的阶段结果”扩回完整行数。
+    """把“只覆盖有效 case”的阶段结果扩回完整行序。
 
-    前面 input_csv 模式可能按行跳过非法 context，因此模型真正推理的张量只覆盖 valid_indices。
-    结果导出时仍需保留原 CSV 的完整行顺序，所以这里把有效结果写回对应位置，
-    其余 skipped 行统一填 NaN，保证结果表、summary 和 warning 行号能一一对应。
+    作用：
+    - 将代理推理和优化阶段的紧凑输出写回原始输入表的完整行数；
+    - 为 skipped case 统一补 `NaN` 占位，保持导出结果与原输入逐行对齐。
+
+    输入：
+    - `stage_outputs`: `_compute_predictions_batch()` 产出的紧凑阶段结果。
+    - `valid_indices`: 真正参与评估的原始行号，升序且无重复。
+    - `total_count`: 原始输入总行数。
+    - `trainable_dim`: 当前 trainable control 维数，用于构造动作列的占位张量。
+
+    输出：
+    - 返回与原始输入等长的阶段结果字典，可直接供结果表组装与汇总统计使用。
+
+    注意：
+    - 这里不重新排序，也不重算任何指标，只做“按行号回填 + skipped 行补 NaN”。
+    - `valid_indices` 是这一步的唯一对齐依据；只要切片和回填都使用同一份索引，
+      最终结果就不会发生 case 错配。
     """
     valid_indices_tensor = torch.as_tensor(valid_indices, dtype=torch.long)
     expanded = {
         "total_time_cost": stage_outputs["total_time_cost"],
-        "trajectory_all": stage_outputs["trajectory_all"],
         "trace_records": stage_outputs.get("trace_records", {}),
     }
     convergence_src = stage_outputs.get("opt2_convergence_step")
@@ -736,7 +853,26 @@ def _build_stage_metric_dataframe(
     row_count: int,
     ot_array: np.ndarray,
 ) -> pd.DataFrame:
-    """把单阶段输出整理成结果表所需的损伤、风险和 AIS 列。"""
+    """把单阶段输出整理成统一列结构的结果子表。
+
+    作用：
+    - 将单个阶段的 `preds/info` 张量转换成 `DataFrame`；
+    - 统一生成 `HIC/Dmax/Nij/Phead/Pchest/Pneck/JointRisk/AIS/MAIS` 列。
+
+    输入：
+    - `stage_label`: 阶段名前缀，如 `Base`、`Opt1`、`Opt2`。
+    - `stage`: 某一阶段在 `stage_outputs` 中对应的字典。
+    - `row_count`: 结果表总行数。
+    - `ot_array`: 与结果表行序对齐的 `OT` 数组，用于胸部 AIS 与风险计算。
+
+    输出：
+    - 返回一个与结果表等长的 `DataFrame`。
+
+    注意：
+    - 若该阶段未生成结果，则整张子表返回 `NaN`；
+    - 若某些行的预测值本身为 `NaN`，对应的 AIS/MAIS 也会显式置为 `NaN`，
+      避免把无效预测继续映射成表面上“有值”的等级。
+    """
     preds = stage["preds"]
     info = stage["info"]
 
@@ -776,6 +912,7 @@ def _build_stage_metric_dataframe(
     stage_df[f"{stage_label}_AIS_head"] = AIS_cal_head(stage_df[f"{stage_label}_HIC"].to_numpy(dtype=np.float32))
     stage_df[f"{stage_label}_AIS_chest"] = AIS_cal_chest(stage_df[f"{stage_label}_Dmax"].to_numpy(dtype=np.float32), ot_array)
     stage_df[f"{stage_label}_AIS_neck"] = AIS_cal_neck(stage_df[f"{stage_label}_Nij"].to_numpy(dtype=np.float32))
+    # `MAIS` 统一取头/胸/颈三个 AIS 等级中的最大值。
     stage_df[f"{stage_label}_MAIS"] = np.maximum.reduce(
         [
             stage_df[f"{stage_label}_AIS_head"].to_numpy(dtype=np.float32),
@@ -797,15 +934,22 @@ def _build_truth_metric_dataframe(
     truth_arrays: Dict[str, np.ndarray],
     ot_array: np.ndarray,
 ) -> pd.DataFrame:
-    """把默认 split 或外部 CSV 自带的真值整理成统一列结构。
+    """把真值数组整理成与阶段结果平行的 `True_*` 列。
 
-    run_eval 的结果表需要同时支持两类用途：
-    1. 比较 Base、Opt1、Opt2 各阶段的降损效果；
-    2. 在带真值的评估模式下，把代理预测与仿真真值并排查看。
+    作用：
+    - 将默认 split 或外部 CSV 自带的真值转换成统一列命名；
+    - 让 `True_*` 与 `Base/Opt1/Opt2_*` 共享同一套下游绘图和分析逻辑。
 
-    因此这里把 True_ 列也整理成与各阶段平行的结构。
-    这样下游绘图脚本和结果分析代码只需按统一列命名规则取值，
-    不必为 test split、val split 或外部 CSV 真值分别维护特例分支。
+    输入：
+    - `truth_arrays`: 至少包含 `y_HIC/y_Dmax/y_Nij`，可选包含 `ais_*` 真值。
+    - `ot_array`: 与结果表行序对齐的 `OT` 数组，用于胸部风险和 AIS 计算。
+
+    输出：
+    - 返回一个 `DataFrame`，列名统一以 `True_` 为前缀。
+
+    注意：
+    - 若输入已经提供 `ais_head/ais_chest/ais_neck` 真值，则优先直接使用；
+    - 若未提供，则根据 `True_HIC/True_Dmax/True_Nij` 现场计算。
     """
     truth_df = pd.DataFrame(
         {
@@ -858,20 +1002,39 @@ def _build_result_dataframe(
     truth_arrays: Dict[str, np.ndarray],
     trainable_names: List[str],
 ) -> tuple[pd.DataFrame, Dict[str, object]]:
-    """组装最终导出 CSV 和宏观汇总指标。
+    """组装最终导出的逐 case 结果表，并生成宏观汇总指标。
 
-    结果表：
-    - 一份稳定标识列与 context；
-    - 一份 baseline trainable control；
-    - 每个真实生成阶段各自的可调参数、损伤、风险、AIS；
-    - 每个优化阶段各自相对 baseline 的 reduction 列。
+    作用：
+    - 把 `context`、baseline、`Base/Opt1/Opt2` 各阶段输出以及可选真值拼成一张总表；
+    - 补齐每个阶段对应的动作列、损伤列、风险列、AIS/MAIS 列和 reduction 列；
+    - 基于结果表进一步生成 `evaluation_record.yaml` 需要的宏观摘要。
+
+    输入：
+    - `df_input`: 原始输入表，仅用于保留稳定标识列和完整行数。
+    - `context_df`: 当前评估实际使用的 `context` 表，行序已与原输入对齐。
+    - `baseline_df`: 当前评估实际使用的 baseline trainable control 表，行序已与原输入对齐。
+    - `stage_outputs`: 已扩回完整行数的阶段结果字典。
+    - `truth_arrays`: 可选真值数组；若缺失，则结果表不生成 `True_*` 与 `True_vs_*` 列。
+    - `trainable_names`: 当前 trainable control 名称列表，用于组装动作列。
+
+    输出：
+    - `result_df`: 最终导出的逐 case 结果表。
+    - `summary_metrics`: 基于 `result_df` 计算得到的宏观汇总指标字典。
+
+    关键注意点：
+    - 结果表必须严格保持与原始输入一致的行序；所有子表在拼接前都要 `reset_index(drop=True)`。
+    - `available_opt_stages` 以“该阶段是否真的产出了预测结果”为准，而不是仅看配置是否启用。
+    - `Reduction_*` 统一采用 `Base - 当前阶段` 的口径，便于汇总和绘图复用。
+    - `Opt2_ConvergenceStep` 只属于局部精调阶段；`Opt1` 是一次性直推，不存在收敛步数。
     """
-    # 自定义 input_csv 里可能带有备注、来源说明等无关列；结果表只保留稳定标识列 case_id，其余工况参数统一以当前评估实际使用的 context/Base/Opt 列为准，避免把无关输入原样带进导出结果。
+    # 自定义 input_csv 可能带有备注等无关列；结果表只保留稳定标识列 `case_id`，
+    # 其余参数一律以当前评估实际使用的 context/Base/Opt 列为准。
     metadata_cols = ["case_id"] if "case_id" in df_input.columns else []
     metadata_df = df_input[metadata_cols].reset_index(drop=True)
     frame_parts = [metadata_df, context_df.reset_index(drop=True)]
 
     ot_array = pd.to_numeric(context_df["OT"], errors="coerce").to_numpy(dtype=np.float32)
+    # 是否存在 `Opt1 / Opt2` 由该阶段是否真的产出预测结果决定，而不是只看配置开关。
     available_opt_stages = [stage_name for stage_name in OPT_STAGE_NAMES if stage_outputs[stage_name]["preds"] is not None]
 
     baseline_df = baseline_df.reset_index(drop=True).rename(columns={name: f"Base_{name}" for name in trainable_names})
@@ -888,6 +1051,7 @@ def _build_result_dataframe(
         frame_parts.append(action_df.reset_index(drop=True))
         frame_parts.append(_build_stage_metric_dataframe(stage_name, stage_outputs[stage_name], len(df_input), ot_array).reset_index(drop=True))
         if stage_name == "Opt2":
+            # 收敛步数只对应局部精调阶段；Opt1 是一次性直推，不存在“迭代收敛步数”的语义。
             convergence_steps = stage_outputs.get("opt2_convergence_step")
             if convergence_steps is not None:
                 convergence_array = convergence_steps.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -903,7 +1067,7 @@ def _build_result_dataframe(
     truth_vs_df = None
 
     if all(key in truth_arrays for key in ["y_HIC", "y_Dmax", "y_Nij"]):
-        # 只要输入侧自带真值，就把 True_ 列并排展开，便于与 Base/Opt1/Opt2 直接对比。
+        # 只要输入侧带有真值，就把 `True_*` 列与各阶段结果并排展开。
         truth_df = _build_truth_metric_dataframe(truth_arrays=truth_arrays, ot_array=ot_array).reset_index(drop=True)
         for stage_name in STAGE_NAMES:
             if stage_name != "Base" and stage_name not in available_opt_stages:
@@ -916,6 +1080,7 @@ def _build_result_dataframe(
 
     reduction_data = {}
     for stage_name in available_opt_stages:
+        # `Reduction_*` 始终表示“相对 baseline 下降了多少”。
         for metric_name in RESULT_METRIC_NAMES:
             reduction_data[f"Reduction_{stage_name}_{metric_name}"] = result_df[f"Base_{metric_name}"] - result_df[f"{stage_name}_{metric_name}"]
 
@@ -925,11 +1090,13 @@ def _build_result_dataframe(
     if truth_vs_df is not None:
         # True_vs_ 放在所有 Reduction_ 列之后，便于先看各阶段本体，再看降幅，再看与真值的偏差。
         result_df = pd.concat([result_df, truth_vs_df.reset_index(drop=True)], axis=1)
-
+    
+    # 这份摘要不写回 CSV，而是写入 evaluation_record 供整体统计查看。
     summary_metrics = _build_stage_summary_metrics(
         result_df=result_df,
         available_opt_stages=available_opt_stages,
     )
+
     return result_df, summary_metrics
 
 
@@ -947,6 +1114,7 @@ def _build_evaluation_record(
     missing_trainable: List[str],
     skipped_case_rows: List[int],
     reverted_baseline_rows: List[int],
+    invalid_default_baseline_rows: List[int],
     opt1_generated: bool,
     opt2_generated: bool,
     optimized_stage_name: Optional[str],
@@ -990,6 +1158,8 @@ def _build_evaluation_record(
         "skipped_cases_count": len(skipped_case_rows),
         "reverted_baseline_rows": reverted_baseline_rows,
         "reverted_baseline_count": len(reverted_baseline_rows),
+        "skipped_due_to_invalid_default_baseline_rows": invalid_default_baseline_rows,
+        "skipped_due_to_invalid_default_baseline_count": len(invalid_default_baseline_rows),
         "stage_status": {
             "base_generated": True,
             "opt1_generated": opt1_generated,
@@ -1007,7 +1177,6 @@ def _build_evaluation_record(
         "runtime": {
             "total_time_cost_sec": float(stage_outputs["total_time_cost"]),
             "avg_time_cost_sec": float(stage_outputs["total_time_cost"] / max(1, evaluated_case_count)),
-            "trajectory_steps_logged": len(stage_outputs["trajectory_all"]),
             "opt2_convergence": convergence_summary,
         },
     }
@@ -1060,9 +1229,7 @@ def main():
             jitter_prob=0.0,
         )
         max_ref_samples = int(config.get("optimization", {}).get("distribution_penalty", {}).get("max_ref_samples", 0))
-        # 评估端必须与训练端复用同一条参考集抽样语义：
-        # 未截断时取完整训练池，截断时用固定 seed 的一次性随机子样本。
-        # 不能在这里退回“前 N 条样本”，否则 penalty 的参考分布会和训练端脱节。
+
         reference, dist_ref_info = ref_sampler.get_distribution_reference(
             max_samples=max_ref_samples,
             feature_space=surrogate.distribution_penalty.feature_space,
@@ -1082,9 +1249,7 @@ def main():
             raise ValueError("direct_inference=True 时必须显式提供 strategy_checkpoint 或 --strategy_ckpt")
         if not strategy_ckpt_path.is_file():
             raise FileNotFoundError(f"策略权重不存在: {strategy_ckpt_path}")
-        # 策略网络的层参数不能再从当前工作区配置里重建，
-        # 必须回到该权重所属训练目录的 configs_used/config.yaml，
-        # 否则会出现“权重来自旧实验，结构却按新配置重建”的隐性错配。
+        # 策略网络的层参数由该权重所属训练目录的 configs_used/config.yaml 重建，而非当前评估的 cfg_path
         strategy_config, strategy_artifacts = load_strategy_run_config(strategy_ckpt_path)
         _assert_strategy_runtime_compatibility(
             current_param_space_path=param_space_path,
@@ -1107,7 +1272,8 @@ def main():
                 f"{strategy_ckpt_path}"
             ) from exc
 
-    optimizer = LocalRefiner(
+
+    optimizer = Optimizer(
         config=config,
         param_manager=param_manager,
         constraint_engine=constraint_engine,
@@ -1125,10 +1291,12 @@ def main():
 
     df_input, truth_arrays, input_source = _load_eval_input(args, logger)
 
+    # 如果输入 CSV 没有 case_id 列，则自动添加一个连续整数的 case_id 列，确保后续处理和结果表中都有稳定的行标识。
+    # 主要服务于trace_case_ids，与其它需要case_id标识的逻辑。但实际逐点优化评估时不依赖 case_id 来规定顺序，是由行顺序决定。
     if "case_id" not in df_input.columns:
-        df_input.insert(0, "case_id", np.arange(len(df_input), dtype=np.int64))
+        df_input.insert(0, "case_id", np.arange(len(df_input)) + 1, dtype=np.int32)
 
-    context_output_df, context_eval_df, baseline_df, missing_context, missing_trainable, valid_mask, skipped_case_rows, reverted_baseline_rows = _prepare_eval_inputs(
+    context_output_df, context_eval_df, baseline_df, missing_context, missing_trainable, valid_mask, skipped_case_rows, reverted_baseline_rows, invalid_default_baseline_rows = _prepare_eval_inputs(
         df_input=df_input,
         param_manager=param_manager,
         constraint_engine=constraint_engine,
@@ -1139,7 +1307,14 @@ def main():
     context_names = param_manager.get_context_names()
     trainable_names = param_manager.get_trainable_names()
     valid_indices = np.flatnonzero(valid_mask)
-    logger.info("评估样本统计: total=%d, valid=%d, skipped=%d, reverted_baseline=%d", len(df_input), int(valid_mask.sum()), len(skipped_case_rows), len(reverted_baseline_rows))
+    logger.info(
+        "评估样本统计: total=%d, valid=%d, skipped=%d, reverted_baseline=%d, invalid_default_baseline=%d",
+        len(df_input),
+        int(valid_mask.sum()),
+        len(skipped_case_rows),
+        len(reverted_baseline_rows),
+        len(invalid_default_baseline_rows),
+    )
     if valid_indices.size == 0:
         raise ValueError("所有 case 都因输入端校验失败被跳过，未生成任何可评估样本。")
     context_tensor = torch.tensor(context_eval_df.loc[valid_indices, context_names].values, dtype=torch.float32, device=device)
@@ -1148,6 +1323,7 @@ def main():
     eval_batch_size = int(config.get("evaluation", {}).get("eval_batch_size", 512))
     if eval_batch_size <= 0:
         raise ValueError("eval_batch_size 必须为正整数")
+    # 核心评估逻辑：按批次计算 Base/Opt1/Opt2 阶段结果。内部会启用具体的策略直推和局部精调逻辑。
     stage_outputs_valid = _compute_predictions_batch(
         context_tensor=context_tensor,
         baseline_trainable=baseline_tensor,
@@ -1214,6 +1390,7 @@ def main():
         missing_trainable=missing_trainable,
         skipped_case_rows=skipped_case_rows,
         reverted_baseline_rows=reverted_baseline_rows,
+        invalid_default_baseline_rows=invalid_default_baseline_rows,
         opt1_generated=opt1_generated,
         opt2_generated=opt2_generated,
         optimized_stage_name=optimized_stage_name,

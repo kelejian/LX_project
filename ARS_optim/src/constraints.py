@@ -8,11 +8,18 @@ from ARS_optim.src.param_manager import ParamManager
 
 
 class ConstraintEngine:
-    """统一管理 ARS 参数的输入端校验、输出端投影与软惩罚。
+    """统一管理 ARS 参数的输入端校验、输出端投影与反向约束软惩罚。
 
-    输入端与输出端共用同一套物理规则，但适用范围不同，所以这里显式拆成
-    `validate_context_input`、`validate_full_input`、`validate_output_solution`
-    和 `project_forward` / `compute_soft_penalty`，避免 trainable 属性切换后出现静默误判。
+    约束来源：
+    - 连续/离散参数定义、默认值和角色划分来自 `ParamManager`；
+    - 额外耦合规则来自 `param_space.yaml` 中编码后的 `constraint_rules`。
+
+    主要职责：
+    - `validate_context_input`: 按当前 `context` 子张量口径做输入端校验；
+    - `validate_full_input`: 按完整物理输入口径校验样本；
+    - `validate_output_solution`: 校验寻优解是否满足输出端全部约束；
+    - `project_forward`: 把候选解投影回合法域；
+    - `compute_soft_penalty`: 对投影前原始解计算反向约束软惩罚。
     """
 
     def __init__(self, param_manager: ParamManager):
@@ -127,6 +134,7 @@ class ConstraintEngine:
 
     @staticmethod
     def _parse_side_ot_rule_key(rule_name: str, key: str) -> Tuple[int, int]:
+        """把 `is_driver_side_OT` 形式的配置键解析成整数二元组。"""
         try:
             side_text, ot_text = key.split("_")
             return int(side_text), int(ot_text)
@@ -134,6 +142,11 @@ class ConstraintEngine:
             raise ValueError(f"{rule_name} 存在非法键 {key!r}，应为 'is_driver_side_OT' 形式") from exc
 
     def _build_rule_caches(self) -> None:
+        """预解析与 `(is_driver_side, OT)` 相关的规则缓存。
+
+        这些规则在训练采样、前向投影、输入校验和软惩罚里都会被高频查询，
+        因此在初始化阶段先展开成 cache，避免运行期重复解析 YAML 结构。
+        """
         self.seat_cache: Dict[Tuple[int, int], Dict[str, object]] = {}
         for key, points in (self.rules.get("seat_constraints", {}) or {}).items():
             side, ot = self._parse_side_ot_rule_key("seat_constraints", key)
@@ -145,6 +158,7 @@ class ConstraintEngine:
             sp_min, sh_min = np.min(polygon, axis=0)
             sp_max, sh_max = np.max(polygon, axis=0)
             shifted = np.roll(polygon, shift=-1, axis=0)
+            # 用鞋带公式判断顶点方向；若输入是顺时针，则统一翻成逆时针。
             signed_area = 0.5 * float(np.sum(polygon[:, 0] * shifted[:, 1] - shifted[:, 0] * polygon[:, 1]))
             is_degenerate = abs(signed_area) <= 1e-8
 
@@ -158,14 +172,11 @@ class ConstraintEngine:
                 "poly": polygon_ccw,
                 "path": MplPath(polygon_ccw),
                 "bbox": (float(sp_min), float(sp_max), float(sh_min), float(sh_max)),
-                "is_degenerate": is_degenerate,
                 "polygon_tensor": polygon_tensor,
             }
 
         ra_ranges = self.rules.get("ra_ranges")
         if ra_ranges is None:
-            if "ra_values" in self.rules:
-                raise ValueError("constraint_rules.ra_values 已废弃，请改用 ra_ranges: {\"is_driver_side_OT\": [min, max]}")
             raise ValueError("constraint_rules 缺少 ra_ranges 配置")
 
         self.ra_range_cache: Dict[Tuple[int, int], Tuple[float, float]] = {}
@@ -181,10 +192,16 @@ class ConstraintEngine:
 
     @staticmethod
     def _all_present(*indices: int) -> bool:
+        """判断一组索引是否都已存在。"""
         return all(idx is not None for idx in indices)
 
     @staticmethod
     def _project_points_to_polygon_boundary(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
+        """把二维点投到多边形边界上的最近位置。
+
+        这是无梯度的 numpy 版本，主要服务于输入校验和几何判定；
+        需要保留计算图的路径使用 `_project_points_to_polygon_boundary_torch`。
+        """
         edge_start = polygon
         edge_end = np.roll(polygon, shift=-1, axis=0)
         projected = np.empty_like(points, dtype=np.float32)
@@ -209,6 +226,7 @@ class ConstraintEngine:
         return projected
 
     def _ensure_2d(self, tensor: torch.Tensor, dim: int, name: str) -> torch.Tensor:
+        """检查张量是否为 `[N, dim]` 形状。"""
         if tensor.ndim != 2 or tensor.shape[1] != dim:
             raise ValueError(f"{name} 形状应为 [N, {dim}]，实际为 {tuple(tensor.shape)}")
         return tensor
@@ -218,6 +236,11 @@ class ConstraintEngine:
         context_params: torch.Tensor,
         control_trainable: torch.Tensor = None,
     ) -> torch.Tensor:
+        """把 `context` 与当前 trainable control 拼成完整特征矩阵。
+
+        未显式提供的 trainable control 会保留 `ParamManager` 给出的 default，
+        因此这个接口既可用于“完整输入校验”，也可用于“context + 当前动作”组合。
+        """
         context_params = self._ensure_2d(context_params, len(self.context_indices), "context_params")
         full = self.param_manager.get_default_feature_matrix(
             context_params.shape[0], device=context_params.device
@@ -231,6 +254,7 @@ class ConstraintEngine:
         return full
 
     def split_from_full(self, full_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """从完整特征矩阵拆回 `context` 与 trainable control 子张量。"""
         full_features = self._ensure_2d(full_features, self.total_dim, "full_features")
         return full_features[:, self.context_indices], full_features[:, self.trainable_indices]
 
@@ -277,6 +301,8 @@ class ConstraintEngine:
             if not row_mask.any():
                 continue
             sp_min, sp_max, sh_min, sh_max = info["bbox"]
+            # 这里故意按零宽线段单独处理，避免把 passenger 这类退化座椅区域误当成二维多边形。
+            # 输入端采样只按当前座椅可行域的自由度维数决定是否冻结某一维。
             if abs(sh_max - sh_min) <= self._tol:
                 mask[row_mask, self._context_sh_local_idx] = False
             if abs(sp_max - sp_min) <= self._tol:
@@ -285,21 +311,25 @@ class ConstraintEngine:
         return mask
 
     def _replace_column(self, x: torch.Tensor, column_idx: int, new_column: torch.Tensor) -> torch.Tensor:
+        """返回替换某一列后的新张量，避免在投影链中原地改值。"""
         x_new = x.clone()
         x_new[:, column_idx] = new_column
         return x_new
 
     def _get_side_ot_codes(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """从完整特征张量里取出 `(is_driver_side, OT)` 整数编码。"""
         side = torch.round(x[:, self._side_idx]).to(torch.int64)
         ot = torch.round(x[:, self._ot_idx]).to(torch.int64)
         return side, ot
 
     def _get_context_side_ot_codes(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """从 `context` 张量里取出 `(is_driver_side, OT)` 整数编码。"""
         side = torch.round(x[:, self._context_side_local_idx]).to(torch.int64)
         ot = torch.round(x[:, self._context_ot_local_idx]).to(torch.int64)
         return side, ot
 
     def _apply_trainable_bounds(self, x: torch.Tensor) -> torch.Tensor:
+        """把所有 trainable control 裁剪到 `opt_min/opt_max` 区间。"""
         if not self.trainable_indices:
             return x
         mins = self._trainable_mins_cpu.to(device=x.device, dtype=x.dtype)
@@ -316,15 +346,16 @@ class ConstraintEngine:
         delta: float,
         epsilon: float = 0.0,
     ) -> torch.Tensor:
+        """对一对参数施加“上界型”耦合投影。
+
+        目标约束为 `constrained <= reference + delta`。
+        若左侧可调，则直接裁左侧；若左侧不可调但右侧可调，则反向裁右侧。
+        """
         if constrained_idx in self._trainable_idx_set:
-            constrained = torch.min(
-                x[:, constrained_idx], x[:, reference_idx] + delta - epsilon
-            )
+            constrained = torch.min(x[:, constrained_idx], x[:, reference_idx] + delta - epsilon)
             return self._replace_column(x, constrained_idx, constrained)
         elif reference_idx in self._trainable_idx_set:
-            reference = torch.max(
-                x[:, reference_idx], x[:, constrained_idx] - delta + epsilon
-            )
+            reference = torch.max(x[:, reference_idx], x[:, constrained_idx] - delta + epsilon)
             return self._replace_column(x, reference_idx, reference)
         return x
 
@@ -335,6 +366,11 @@ class ConstraintEngine:
         reference_idx: int,
         delta: float,
     ) -> torch.Tensor:
+        """对一对参数施加“下界型”耦合投影。
+
+        目标约束为 `target >= reference + delta`。
+        若左侧可调，则直接裁左侧；若左侧不可调但右侧可调，则反向裁右侧。
+        """
         if target_idx in self._trainable_idx_set:
             target = torch.max(x[:, target_idx], x[:, reference_idx] + delta)
             return self._replace_column(x, target_idx, target)
@@ -351,8 +387,7 @@ class ConstraintEngine:
         - LLATTF 依赖 BTF；
         - LL2 依赖 LL1。
 
-        这样训练与局部精调的前向链路就始终沿同一拓扑顺序收敛，
-        不会因为多条规则互相“来回修正”而把语义变得不可预测。
+        这样训练与局部精调的前向链路就始终沿同一拓扑顺序收敛，不会因为多条规则互相“来回修正”而把语义变得不可预测。
         """
         x = self._project_upper_bound_pair(
             x,
@@ -396,24 +431,36 @@ class ConstraintEngine:
     ) -> torch.Tensor:
         """把一批二维点投影到任意简单多边形边界上的最近位置。
 
-        这里直接比较点到所有边线段的最近距离；该做法不依赖凸性，
-        因而能同时覆盖主驾 OT=1 这类凹多边形座椅可行域。
+        这是保留计算图的 torch 版本，供前向投影和软惩罚复用。
+        这里直接比较点到所有边线段的最近距离，不依赖凸性，因此也能覆盖凹多边形座椅可行域。
         """
         if points.ndim != 2 or points.shape[1] != 2:
             raise ValueError(f"points 形状应为 [N, 2]，实际为 {tuple(points.shape)}")
 
+        # polygon_tensor 的每一行是一个顶点，按相邻顶点首尾相连后就得到多边形边界。
         polygon = polygon_tensor.to(device=points.device, dtype=points.dtype)
         edge_start = polygon
         edge_end = torch.roll(polygon, shifts=-1, dims=0)
         edges = edge_end - edge_start
+
+        # diff[i, j] 表示第 i 个点相对第 j 条边起点的位移向量。
         diff = points.unsqueeze(1) - edge_start.unsqueeze(0)
+
+        # 对每条边做线段投影：
+        # t=0 对应边起点，t=1 对应边终点，0<t<1 对应边内部。
+        # 先按“无限长直线”求投影参数，再 clamp 到 [0, 1]，就得到“投到线段上”的最近点。
         denom = torch.clamp(torch.sum(edges * edges, dim=1), min=1e-12)
         t = torch.sum(diff * edges.unsqueeze(0), dim=2) / denom.unsqueeze(0)
         t = torch.clamp(t, min=0.0, max=1.0)
+
+        # candidates[i, j] 是第 i 个点投到第 j 条边线段上的候选最近点。
         candidates = edge_start.unsqueeze(0) + t.unsqueeze(2) * edges.unsqueeze(0)
+
+        # 对每个点，比较它到所有候选边界点的距离，选出最近的一条边。
         dist_sq = torch.sum((points.unsqueeze(1) - candidates) ** 2, dim=2)
         best_idx = torch.argmin(dist_sq, dim=1)
         row_idx = torch.arange(points.shape[0], device=points.device)
+        # 最后返回每个点投影到最近边界位置的坐标。
         return candidates[row_idx, best_idx]
 
     def _get_axis_interval_from_polygon(
@@ -422,11 +469,10 @@ class ConstraintEngine:
         fixed_value: float,
         axis: str,
     ) -> Tuple[float, float] | None:
-        """计算凸多边形与水平/竖直截线的可行区间。
+        """计算座椅可行域与水平/竖直截线的单维合法区间。
 
-        当只训练 SP 或只训练 SH 时，另一维来自 context，不能被投影修改。
-        因此这里求的是“在固定另一维后，当前可训练维度还能落到哪里”，
-        再对该单维做截断。这样才符合“未来 trainable 属性切换后仍自适应”的要求。
+        当只训练 `SP` 或只训练 `SH` 时，另一维来自 context，不能被投影修改。
+        因此这里不是做二维最近点投影，而是求“固定另一维后，当前可训练维度还能落到哪里”。
         """
         polygon = np.asarray(info["poly"], dtype=np.float32)
         intersections = []
@@ -436,18 +482,24 @@ class ConstraintEngine:
             x1, y1 = float(start[0]), float(start[1])
             x2, y2 = float(end[0]), float(end[1])
             if axis == "x":
+                # axis="x" 表示固定 SH=fixed_value，求截线 y=fixed_value 与多边形边界的交点 x。
                 if abs(y1 - y2) <= tol:
+                    # 若整条边本身就是水平边，并且恰好落在截线上，则这条边的两个端点都属于交点候选。
                     if abs(fixed_value - y1) <= tol:
                         intersections.extend([x1, x2])
                     continue
+                # 只有当截线高度落在当前边的 y 范围内时，这条边才可能与截线相交。
                 if min(y1, y2) - tol <= fixed_value <= max(y1, y2) + tol:
+                    # t 是截线在当前边线段参数方程中的位置，t∈[0,1] 才表示交点在线段内部。
                     t = (fixed_value - y1) / (y2 - y1)
                     if -tol <= t <= 1.0 + tol:
                         intersections.append(x1 + t * (x2 - x1))
                 continue
 
             if axis == "y":
+                # axis="y" 表示固定 SP=fixed_value，求截线 x=fixed_value 与多边形边界的交点 y。
                 if abs(x1 - x2) <= tol:
+                    # 若整条边本身就是竖直边，并且恰好落在截线上，则这条边的两个端点都属于交点候选。
                     if abs(fixed_value - x1) <= tol:
                         intersections.extend([y1, y2])
                     continue
@@ -460,15 +512,18 @@ class ConstraintEngine:
             raise ValueError(f"axis 仅支持 'x' 或 'y'，实际为 {axis!r}")
 
         if not intersections:
+            # 固定另一维后，截线与座椅可行域完全没有交集，说明当前样本不可能只靠单维调节进入合法域。
             return None
+        # 当前项目里的座椅几何在做这种单维切片后都对应一个连续区间，因此直接取最小/最大交点即可。
         return float(min(intersections)), float(max(intersections))
 
     def _project_seat_feasible_region(self, x: torch.Tensor) -> torch.Tensor:
         """把 SP/SH 投影回当前 side/OT 对应的精确座椅可行域。
 
-        这一层的职责是“确保每次送入 surrogate 的候选解都合法”，因此：
-        - 双变量都可调时，直接把二维点投到多边形/线段边界；
-        - 只有单变量可调时，只沿该变量方向截断，保持另一维 context 不变。
+        这是输出端投影的一部分，职责是保证送入 surrogate 的候选解不离开
+        当前 `(is_driver_side, OT)` 对应的座椅可行域：
+        - `SP/SH` 都可调时做二维投影；
+        - 只允许单维调节时，只沿该维做截断，保持另一维不变。
         """
         if not self.seat_cache:
             return x
@@ -486,21 +541,21 @@ class ConstraintEngine:
             indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
             sp_min, sp_max, sh_min, sh_max = info["bbox"]
 
-            # 当前项目中的退化情形实际就是线段，直接沿线段坐标做截断即可。
-            # 这类规则没有二维多边形内部，没必要再走最近边投影。
-            if sh_min == sh_max:
+            # 退化情形本质上是线段，可直接按对应轴的区间截断。
+            if abs(sh_max - sh_min) <= self._tol:
                 if sp_trainable:
                     x_new[indices, self._sp_idx] = torch.clamp(x_new[indices, self._sp_idx], sp_min, sp_max)
                 if sh_trainable:
                     x_new[indices, self._sh_idx] = sh_min
                 continue
-            if sp_min == sp_max:
+            if abs(sp_max - sp_min) <= self._tol:
                 if sp_trainable:
                     x_new[indices, self._sp_idx] = sp_min
                 if sh_trainable:
                     x_new[indices, self._sh_idx] = torch.clamp(x_new[indices, self._sh_idx], sh_min, sh_max)
                 continue
-
+            
+            # 双变量都可调时，必须按二维几何域整体处理，不能把多边形误当成矩形分别裁两轴。
             if sp_trainable and sh_trainable:
                 points = torch.stack([x_new[indices, self._sp_idx], x_new[indices, self._sh_idx]], dim=1)
                 valid_local = self._validate_seat_points_numpy(points.detach().cpu().numpy(), info)
@@ -550,17 +605,17 @@ class ConstraintEngine:
         RA 自身的全局范围还不够，真实合法区间还取决于当前乘员侧与体型，
         所以这里必须在完整特征张量里结合 side/OT 做条件裁剪。
         """
+        # 若 RA 当前属于 context，则这里不应静默改值；那种情形应由输入端校验直接拦截。
         if not self.ra_range_cache or self._ra_idx not in self._trainable_idx_set:
             return x
         side, ot = self._get_side_ot_codes(x)
+        ra_column = x[:, self._ra_idx].clone()
         for (rule_side, rule_ot), (ra_min, ra_max) in self.ra_range_cache.items():
             mask = (side == rule_side) & (ot == rule_ot)
             if not mask.any():
                 continue
-            ra_column = x[:, self._ra_idx]
-            bounded_ra = torch.where(mask, torch.clamp(ra_column, ra_min, ra_max), ra_column)
-            x = self._replace_column(x, self._ra_idx, bounded_ra)
-        return x
+            ra_column = torch.where(mask, torch.clamp(ra_column, ra_min, ra_max), ra_column)
+        return self._replace_column(x, self._ra_idx, ra_column)
 
     def _validate_seat_points_numpy(
         self,
@@ -569,21 +624,21 @@ class ConstraintEngine:
     ) -> np.ndarray:
         """在 numpy 侧校验 SP/SH 是否落在对应座椅可行域内。
 
-        评估输入校验不需要梯度，因此这里优先选择更直接的几何判定：
+        这里用于无梯度的输入校验和中间几何判定：
         - 线段退化情形直接按坐标范围判断；
         - 普通多边形先做 contains_points，再允许边界附近的数值误差通过投影距离容忍。
         """
         sp_min, sp_max, sh_min, sh_max = info["bbox"]
         tol = self._tol
 
-        if sh_min == sh_max:
+        if abs(sh_min - sh_max) <= tol:
             return (
                 (points[:, 0] >= sp_min - tol)
                 & (points[:, 0] <= sp_max + tol)
                 & (np.abs(points[:, 1] - sh_min) <= tol)
             )
 
-        if sp_min == sp_max:
+        if abs(sp_min - sp_max) <= tol:
             return (
                 (np.abs(points[:, 0] - sp_min) <= tol)
                 & (points[:, 1] >= sh_min - tol)
@@ -636,6 +691,12 @@ class ConstraintEngine:
         full_features: torch.Tensor,
         continuous_bounds: Dict[int, Tuple[float, float]],
     ) -> torch.Tensor:
+        """按给定连续边界规则校验完整特征张量。
+
+        这是 `validate_full_input` 与 `validate_output_solution` 共用的底层逻辑。
+        二者差别只在于连续边界采用 `base_*` 还是 `opt_*` 口径，
+        以及是否额外叠加输出端专属约束。
+        """
         x = self._ensure_2d(full_features, self.total_dim, "full_features")
         tol = self._tol
         valid = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
@@ -719,12 +780,9 @@ class ConstraintEngine:
     def validate_context_input(self, context_params: torch.Tensor) -> torch.Tensor:
         """只校验当前 context 张量本身，不再补任何默认 trainable control。
 
-        这一点对 ARS_optim 很关键：context = state + 当前固定 control。
-        未来只要某个 control 的 trainable 属性变化，它就会离开 context。
-        因此 context 校验只能依赖“当前真正出现在 context 里的列”，不能再偷偷补一组
-        default trainable control 去凑完整特征，否则会把输入端语义污染成输出端语义。
-
-        若某条耦合约束的两端被拆到 context 和 trainable control 两侧, validate_context_input 这一层就不会检查这条耦合。
+        这里故意只检查当前运行中被 ParamManager 划入 `context` 的列。
+        若某条耦合约束在当前角色划分下横跨 `context` 与 `trainable control`，
+        这一层不会补默认值去凑完整样本，而是把该约束留给完整输入校验或输出端约束处理。
         """
         x = self._ensure_2d(context_params, len(self.context_indices), "context_params")
         tol = self._tol
@@ -806,18 +864,19 @@ class ConstraintEngine:
     def project_forward(self, full_features: torch.Tensor, strict: bool = False) -> torch.Tensor:
         """对完整特征张量做前向投影。
 
-        中间迭代和最终落盘共用同一套几何投影逻辑，避免 surrogate 在任何阶段看到域外 SP/SH。
-        `strict` 只保留调用点语义，不再对应两套不同实现。
+        中间迭代和最终输出共用同一套拓扑投影顺序，保证 surrogate
+        在任何阶段都只看到已经回到合法域的候选解。
         """
+        # 顺序固定为：opt 边界 -> control 耦合 -> 输出端额外约束 -> 座椅可行域 -> RA 条件区间。
         x = self._ensure_2d(full_features, self.total_dim, "full_features").clone()
         x = self._apply_trainable_bounds(x)
         x = self._project_control_couplings(x)
         x = self._project_output_extra_constraints(x)
         x = self._project_seat_feasible_region(x)
-        # RA 条件区间必须在中间迭代就生效，否则 surrogate 会看到超出条件子区间的域外值。
         x = self._project_ra_ranges(x)
 
         if strict:
+            # `strict` 只保留“最终再做一次边界收口”的调用语义，不引入额外规则。
             x = self._apply_trainable_bounds(x)
 
         return x
@@ -829,6 +888,7 @@ class ConstraintEngine:
     ) -> torch.Tensor:
         """计算连续可导的约束软惩罚。
 
+        这里的输入应是投影前的原始完整特征，用于给原始游离解提供补偿梯度。
         当前覆盖的约束项包括：
         - AFT >= BTF（仅输出端额外约束）
         - AFT <= BTF + 25
@@ -889,7 +949,8 @@ class ConstraintEngine:
                 sp_min, sp_max, sh_min, sh_max = info["bbox"]
                 sp = x[mask, self._sp_idx]
                 sh = x[mask, self._sh_idx]
-                if info["is_degenerate"]:
+                # 软惩罚与输入校验/前向投影保持同一退化判定口径：只要某一轴零宽，就按线段 bbox 惩罚。
+                if abs(sp_max - sp_min) <= self._tol or abs(sh_max - sh_min) <= self._tol:
                     penalty[mask] += (
                         torch.relu(sp_min - sp) / self.base_continuous_scales[self._sp_idx]
                         + torch.relu(sp - sp_max) / self.base_continuous_scales[self._sp_idx]

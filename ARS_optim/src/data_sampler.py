@@ -110,12 +110,12 @@ class StateDataSampler:
                 float(self.context_params[idx]["base_max"])
                 for idx in self.context_cont_local_indices
             ]
-            self.cont_mins = torch.tensor(mins, dtype=torch.float32, device=device)
-            self.cont_maxs = torch.tensor(maxs, dtype=torch.float32, device=device)
-            self.cont_spans = torch.clamp(self.cont_maxs - self.cont_mins, min=1e-6)
+            self.cont_spans = torch.clamp(
+                torch.tensor(maxs, dtype=torch.float32, device=device)
+                - torch.tensor(mins, dtype=torch.float32, device=device),
+                min=1e-6,
+            )
         else:
-            self.cont_mins = None
-            self.cont_maxs = None
             self.cont_spans = None
 
     def _load_feature_matrix_from_pool(self, pool_path: Path) -> np.ndarray:
@@ -181,7 +181,7 @@ class StateDataSampler:
             active_mask[row_idx, chosen] = True
         return active_mask
 
-    def _apply_bounded_jitter(self, batch_context: torch.Tensor) -> torch.Tensor:
+    def _apply_rejection_jitter(self, batch_context: torch.Tensor) -> torch.Tensor:
         if not self.context_cont_local_indices or self.jitter_ratio <= 0:
             self._last_attempt_rejection_rate = 0.0
             self._last_final_fallback_rate = 0.0
@@ -214,6 +214,7 @@ class StateDataSampler:
 
             tentative = base_pending.clone()
             continuous = tentative[:, self.context_cont_local_indices]
+            # 标准正态分布的随机噪声（理论上无界），后续会乘以每个参数的范围和 jitter_ratio 来确定实际扰动幅度。多次扰动后依然不合法的样本会被拒绝掉。
             noise = torch.randn(
                 continuous.shape,
                 generator=self.rng,
@@ -258,16 +259,17 @@ class StateDataSampler:
         indices = torch.randint(
             0,
             self.pool_size,
-            (self.batch_size,),
+            (self.batch_size,), # 指定输出形状是一维，长度等于当前批次大小
             generator=self.rng,
             device=self.device,
         )
         batch_context = self.pool_context[indices].clone()
-        return self._apply_bounded_jitter(batch_context)
+        return self._apply_rejection_jitter(batch_context)
 
     def get_infinite_generator(self) -> Iterator[torch.Tensor]:
+        '''返回一个无限生成器，当外部调用 next() 时，会生成新的批次。'''
         while True:
-            yield self._generate_batch()
+            yield self._generate_batch() # 每次调用 _generate_batch 都会返回一个新的批次，且在内部应用拒绝采样和扰动逻辑。
 
     def get_source_info(self) -> dict:
         """返回当前采样器使用的经验池、split 和扰动配置。"""
@@ -307,7 +309,7 @@ class StateDataSampler:
                     "feature_space=context_control 时必须提供 trainable_indices"
                 )
             control_ref = (
-                self.pool_full[:, trainable_indices]
+                self.pool_full[:, trainable_indices] # 从 pool_full 中选取可训练控制参数的列
                 if trainable_indices
                 else self.pool_full[:, :0]
             )

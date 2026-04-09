@@ -120,6 +120,8 @@ python -m ARS_optim.plot_eval_cases --eval_csv ARS_optim/saved_eval/.../results/
 - 默认从 `injury/combined` 视角读取经验池与验证 / 测试划分
 - 与 `PulsePredict`、`InjuryPredict` 共用同一份 `normalization_config.json`
 - 通过配置文件和权重快照重建代理链路，不额外维护旧目录兼容逻辑
+- `run_eval` 在 `input_csv` 模式下只接受整组合法的 baseline trainable control；否则整组回退为 `param_space.yaml` 的 `default`
+- 若回退后的 `default` 与当前 `context` 联合后仍不合法，则该 `case` 会直接跳过，不再输出伪造的 baseline 评估结果
 
 ## 6. 运行约定
 

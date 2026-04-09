@@ -1,3 +1,4 @@
+import logging
 import json
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -21,6 +22,7 @@ from ARS_optim.src.constraints import ConstraintEngine
 from ARS_optim.src.distribution_penalty import DistributionPenalty
 from ARS_optim.src.param_manager import ParamManager
 
+LOGGER = logging.getLogger(__name__)
 
 def _resolve_checkpoint_path(base_dir: Path, cfg_value: str) -> Path:
     """把相对或绝对权重路径统一解析为绝对路径。"""
@@ -33,7 +35,17 @@ def load_surrogate_models(
     config: dict,
     device: torch.device,
 ) -> Tuple[HybridPulseCNN, InjuryPredictModel]:
-    """按各子项目原有保存格式重建 PulsePredict 与 InjuryPredict。"""
+    """按子项目原有保存格式重建 PulsePredict 与 InjuryPredict。
+
+    作用：
+    - 读取 `surrogate` 配置中声明的权重路径；
+    - 严格按照各子项目保存产物中已有的结构信息重建模型实例；
+    - 加载权重并返回可直接推理的模型对象。
+
+    注意：
+    - 这里只接受子项目正式保存产物，不猜测缺失配置；
+    - 若 checkpoint 同目录缺少必需的 `config.json` 或 `TrainingRecord.json`，直接报错。
+    """
     surrogate_cfg = config.get("surrogate", {})
 
     pulse_ckpt_path = _resolve_checkpoint_path(
@@ -55,7 +67,7 @@ def load_surrogate_models(
     pulse_model = HybridPulseCNN(**pulse_arch.get("args", {})).to(device)
     pulse_ckpt = torch.load(str(pulse_ckpt_path), map_location=device, weights_only=False)
     pulse_model.load_state_dict(pulse_ckpt["state_dict"])
-    print("[surrogate]: Loaded PulsePredict checkpoint from:", pulse_ckpt_path)
+    LOGGER.info("Loaded PulsePredict checkpoint from %s", pulse_ckpt_path)
 
     injury_ckpt_path = _resolve_checkpoint_path(
         Path(INJURY_PREDICT_DIR),
@@ -79,12 +91,22 @@ def load_surrogate_models(
     injury_model.load_state_dict(
         torch.load(str(injury_ckpt_path), map_location=device, weights_only=False)
     )
-    print("[surrogate]: Loaded InjuryPredict checkpoint from:", injury_ckpt_path)
+    LOGGER.info("Loaded InjuryPredict checkpoint from %s", injury_ckpt_path)
     return pulse_model, injury_model
 
 
 class SurrogateAdapter(nn.Module):
-    """封装波形生成、损伤预测和优化目标计算。"""
+    """统一封装波形生成、损伤预测与目标函数计算。
+
+    作用：
+    - 负责把 `context + trainable control` 映射到代理模型需要的输入形式；
+    - 调用 PulsePredict 生成归一化波形；
+    - 调用 InjuryPredict 输出损伤标量，并进一步拆出风险项、约束惩罚和分布偏离惩罚。
+
+    注意：
+    - 这里不训练代理模型，只做冻结推理与目标值计算；
+    - 输入归一化始终以根目录共享的 `normalization_config.json` 为准。
+    """
 
     def __init__(
         self,
@@ -131,7 +153,15 @@ class SurrogateAdapter(nn.Module):
         self._ot_index = self.param_manager.get_param("OT")["index"]
 
     def fit_distribution_reference(self, reference_features: torch.Tensor) -> None:
-        """拟合分布偏离惩罚所需的训练参考统计量。"""
+        """拟合分布偏离惩罚所需的参考统计量。
+
+        输入：
+        - `reference_features`: 训练经验池中的完整特征张量。
+
+        注意：
+        - 仅当分布偏离惩罚启用时才真正拟合；
+        - 该统计量对应经验分布约束，不负责显式可行域约束。
+        """
         if self.distribution_penalty.enabled:
             self.distribution_penalty.fit(reference_features)
 
@@ -140,7 +170,16 @@ class SurrogateAdapter(nn.Module):
         context_params: torch.Tensor,
         control_trainable: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """拼回完整物理特征，并映射到代理模型使用的归一化空间。"""
+        """拼回完整特征，并映射到代理模型使用的归一化空间。
+
+        作用：
+        - 将 `context_params` 与 `control_trainable` 拼成完整 `FEATURE_ORDER`；
+        - 基于共享归一化配置生成代理模型前向所需的归一化输入。
+
+        输出：
+        - `combined_phys`: 完整物理尺度特征；
+        - `model_input_norm`: 与 `combined_phys` 列顺序一致的归一化特征。
+        """
         combined_phys = self.constraint_engine.compose_full_features(
             context_params,
             control_trainable,
@@ -161,12 +200,37 @@ class SurrogateAdapter(nn.Module):
         detach_info: bool = True,
         penalty_features: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
-        # 这里返回逐样本 loss，而不是 batch mean。
-        # 训练、局部精调和评估都需要保留样本粒度，聚合由更外层控制。
+        """基于代理链路计算逐样本损伤预测与目标函数分项。
+
+        作用：
+        - 将当前候选解送入 InjuryPredict，得到物理尺度下的 `HIC/Dmax/Nij`；
+        - 将损伤标量映射为部位风险概率与联合风险；
+        - 进一步拆出 `loss_risk / loss_constraint / loss_distribution`。
+
+        输入：
+        - `context_params`: 当前批次的 `context` 特征，列顺序与 `ParamManager.get_context_names()` 一致。
+        - `control_trainable`: 当前候选 trainable control，列顺序与 `ParamManager.get_trainable_names()` 一致。
+        - `pulse_norm`: PulsePredict 生成的归一化二维波形，直接作为 InjuryPredict 的波形输入。
+        - `include_opt_bounds`: 是否把 `opt_min/opt_max` 也纳入反向约束软惩罚。
+        - `detach_info`: 是否对返回的分项指标做 `detach()`。
+        - `penalty_features`: 若显式提供，则约束软惩罚作用在这份完整特征上；通常用于惩罚投影前原始游离解。
+
+        输出：
+        - `total_loss`: 逐样本总目标值。
+        - `predictions_phys`: 物理尺度下的 `[HIC15, Dmax, Nij]`。
+        - `info`: 逐样本分项指标字典，供训练日志、评估导出和 trace 使用。
+
+        注意：
+        - `loss_risk` 是训练/精调使用的加权联合风险目标；
+        - `joint_risk` 是评估导出使用的无权重联合风险口径。
+        """
+        # `combined_phys` 保持完整 `FEATURE_ORDER` 的物理尺度；
+        # `model_input_norm` 与其列顺序一致，只是数值已归一化。
         combined_phys, model_input_norm = self._prepare_normalized_inputs(
             context_params,
             control_trainable,
         )
+        # InjuryPredict 的标量输入拆分统一依照 `common.settings` 中基于 `FEATURE_ORDER` 的索引定义。
         x_att_continuous = model_input_norm[:, CONTINUOUS_INDICES]
         x_att_discrete = model_input_norm[:, DISCRETE_INDICES].to(torch.long)
 
@@ -180,6 +244,7 @@ class SurrogateAdapter(nn.Module):
         nij = predictions_phys[:, 2]
         ot_tensor = combined_phys[:, self._ot_index]
 
+        # 先将三个部位的代理输出映射为风险概率，再构造优化目标和评估指标。
         p_head = torch.clamp(injury_risk.Injury_prob_cal_head(hic15), 1e-6, 1.0 - 1e-6)
         p_chest = torch.clamp(
             injury_risk.Injury_prob_cal_chest(dmax, OT=ot_tensor),
@@ -188,8 +253,7 @@ class SurrogateAdapter(nn.Module):
         )
         p_neck = torch.clamp(injury_risk.Injury_prob_cal_neck(nij), 1e-6, 1.0 - 1e-6)
 
-        # loss_risk 用于训练和精调时的目标函数；
-        # joint_risk 是评估阶段统一汇总口径，对应无权重联合风险。
+        # `loss_risk` 用于训练和精调；`joint_risk` 用于评估导出。
         loss_risk = 1.0 - (
             torch.pow(1.0 - p_head, self.w_head)
             * torch.pow(1.0 - p_chest, self.w_chest)
@@ -197,16 +261,14 @@ class SurrogateAdapter(nn.Module):
         )
         joint_risk = 1.0 - ((1.0 - p_head) * (1.0 - p_chest) * (1.0 - p_neck))
 
-        # 约束软惩罚默认作用在当前代理输入上。
-        # 训练策略网络时会额外传入 projection 前特征，保证前向投影后仍保留补偿梯度。
+        # 默认惩罚当前完整特征；若上游传入 `penalty_features`，则改为惩罚投影前原始游离解。
         penalty_source = combined_phys if penalty_features is None else penalty_features
         loss_constraint = self.constraint_engine.compute_soft_penalty(
             penalty_source,
             include_opt_bounds=include_opt_bounds,
         )
 
-        # 分布偏离惩罚和显式物理约束分离维护：
-        # 前者关心“是否远离经验池流形”，后者关心“是否越过可行域边界”。
+        # 分布偏离惩罚只回答“当前合法解是否偏离经验分布”，不负责处理可行域越界。
         loss_distribution = self.distribution_penalty.compute(
             context_params,
             control_trainable,
@@ -246,8 +308,18 @@ class SurrogateAdapter(nn.Module):
         return total_loss, predictions_phys, info
 
     def generate_pulse(self, context_params: torch.Tensor) -> torch.Tensor:
-        """基于 context 生成归一化后的二维碰撞波形。"""
-        # context 不是完整 FEATURE_ORDER，需要先补齐再抽取三项碰撞工况。
+        """基于 `context` 生成归一化二维碰撞波形。
+
+        作用：
+        - 从完整特征中抽取 PulsePredict 真正依赖的三项碰撞工况；
+        - 经过共享归一化后送入 PulsePredict；
+        - 输出可直接供 InjuryPredict 使用的二维归一化波形。
+
+        注意：
+        - PulsePredict 只依赖 `impact_velocity / impact_angle / overlap`；
+        - 返回值形状固定为 `[batch, 2, WAVEFORM_LENGTH]`。
+        """
+        # `context` 不是完整 `FEATURE_ORDER`，需要先补齐再抽取三项碰撞工况。
         full = self.constraint_engine.compose_full_features(context_params=context_params)
         impact_phys = full[:, self._impact_indices]
         impact_norm = self.data_processor.process_by_name(

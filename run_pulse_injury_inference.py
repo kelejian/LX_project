@@ -41,11 +41,11 @@ from PulsePredict.model.model import HybridPulseCNN
 
 
 DEFAULT_OUTPUT_ROOT = DATA_DIR / "inference_outputs"
-DEFAULT_PULSE_RUN_DIR = PULSE_PREDICT_DIR / "saved" / "models" / "HybridPulseCNN" / "0324_214803"
-DEFAULT_INJURY_RUN_DIR = INJURY_PREDICT_DIR / "runs" / "DS_InjuryPredictModel_03212058"
+DEFAULT_PULSE_RUN_DIR = PULSE_PREDICT_DIR / "saved" / "models" / "HybridPulseCNN" / "0328_002509"
+DEFAULT_INJURY_RUN_DIR = INJURY_PREDICT_DIR / "runs" / "InjuryPredictModel_03280055"
 PULSE_FEATURE_NAMES = ["impact_velocity", "impact_angle", "overlap"]
 
-INPUT_CSV_FILE = Path(r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_project\ARS_optim\saved_eval\12cases_for_sledtest_0327.csv")  # 可在此处修改输入CSV路径，或通过命令行参数覆盖
+INPUT_CSV_FILE = Path(r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\LX_project\ARS_optim\saved_eval\cases_for_sledtest_0331.csv")  # 可在此处修改输入CSV路径，或通过命令行参数覆盖
 
 def parse_args() -> argparse.Namespace:
     # 解析命令行参数，返回一个命名空间对象
@@ -205,7 +205,7 @@ def load_pulse_model(config_path: Path, checkpoint_path: Path, device: torch.dev
 
 
 def load_injury_model(record_path: Path, checkpoint_path: Path, device: torch.device) -> InjuryPredictModel:
-    # 从训练记录和checkpoint加载伤害预测模型
+    # 从训练记录和checkpoint加载损伤预测模型
     record = load_json(record_path)
     model = InjuryPredictModel(**record["hyperparameters"]["model"]).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -236,36 +236,43 @@ def predict_pulses(
     inputs_df: pd.DataFrame,
     device: torch.device,
     batch_size: int,
-) -> np.ndarray:
-    # 对输入参数执行脉冲预测，返回三通道波形数据数组
+) -> Tuple[np.ndarray, np.ndarray]:
+    # 对输入参数执行脉冲预测，返回三通道波形数据 np.ndarray 数组
     pulse_raw = inputs_df[PULSE_FEATURE_NAMES].to_numpy(dtype=np.float32)
     pulse_norm = processor.process_by_name(pulse_raw, PULSE_FEATURE_NAMES, inverse=False).astype(np.float32)
+    # 归一化波形直接走伤害推理链路；物理波形只在需要落盘或可视化时才使用。
 
-    predicted_batches: List[np.ndarray] = []
+    predicted_norm_batches: List[np.ndarray] = []
+    predicted_physical_batches: List[np.ndarray] = []
     with torch.no_grad():
         for start, end in batched_indices(len(inputs_df), batch_size):
             batch = torch.from_numpy(pulse_norm[start:end]).to(device)
             model_output = pulse_model(batch)
             pulse_output = extract_pulse_output(model_output, pulse_model)
             pulse_output_np = pulse_output.detach().cpu().numpy()
+            predicted_norm_batches.append(pulse_output_np.astype(np.float32, copy=False))
             pulse_physical = processor.process_waveform(pulse_output_np, inverse=True).astype(np.float32)
-            predicted_batches.append(pulse_physical)
+            predicted_physical_batches.append(pulse_physical)
 
-    return np.concatenate(predicted_batches, axis=0)
+    return (
+        np.concatenate(predicted_norm_batches, axis=0),
+        np.concatenate(predicted_physical_batches, axis=0),
+    )
 
 
 def predict_injuries(
     injury_model: InjuryPredictModel,
     processor: UnifiedDataProcessor,
     inputs_df: pd.DataFrame,
-    predicted_waveforms_xyz: np.ndarray,
+    predicted_waveforms_norm_xyz: np.ndarray,
     device: torch.device,
     batch_size: int,
 ) -> np.ndarray:
-    # 给定预测波形，运用伤害模型得到HIC15/Dmax/Nij并返回数组
+    # 给定预测波形，运用损伤预测模型得到HIC15/Dmax/Nij并返回数组
     scalar_raw = inputs_df[FEATURE_ORDER].to_numpy(dtype=np.float32)
     x_continuous, x_discrete = processor.process_all_features(scalar_raw, inverse=False)
-    x_wave_xy = processor.process_waveform(predicted_waveforms_xyz[:, :2, :], inverse=False).astype(np.float32)
+    # PulsePredict 与 InjuryPredict 共享同一套 waveform 归一化配置，因此这里直接复用模型原始输出。
+    x_wave_xy = predicted_waveforms_norm_xyz[:, :2, :].astype(np.float32, copy=False)
 
     prediction_batches: List[np.ndarray] = []
     with torch.no_grad():
@@ -406,7 +413,7 @@ def main() -> None:
 
     print(f"[1/4] Loaded {len(inputs_df)} cases from {args.input_csv}")
     print(f"[2/4] Running pulse inference on {device}")
-    predicted_waveforms_xyz = predict_pulses(
+    predicted_waveforms_norm_xyz, predicted_waveforms_xyz = predict_pulses(
         pulse_model=pulse_model,
         processor=processor,
         inputs_df=inputs_df,
@@ -427,12 +434,12 @@ def main() -> None:
         injury_model=injury_model,
         processor=processor,
         inputs_df=inputs_df,
-        predicted_waveforms_xyz=predicted_waveforms_xyz,
+        predicted_waveforms_norm_xyz=predicted_waveforms_norm_xyz,
         device=device,
         batch_size=args.batch_size,
     )
     injury_df = build_injury_results_dataframe(inputs_df, injury_predictions)
-    injury_csv_path = injury_dir / "predicted_injuries.csv"
+    injury_csv_path = injury_dir / f"pred_injuries_of_{args.input_csv.stem}.csv"
     injury_df.to_csv(injury_csv_path, index=False)
 
     manifest = {

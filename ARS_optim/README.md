@@ -124,6 +124,8 @@ python -m ARS_optim.run_eval --input_csv your_cases.csv
 - 如果提供 `--input_csv`，则按输入文件中的 `context` 与可选 baseline control 做评估
 - 如果不提供 `--input_csv`，则优先使用 `injury test split`
 - 若 test split 不可用，则自动回退到 `injury val split`
+- `input_csv` 模式下，baseline trainable control 只有整组合法才采用；否则整组回退为 `param_space.yaml` 中的 `default`
+- 若 baseline 回退为 `default` 后，和当前 `context` 联合起来仍不合法，则该 `case` 会直接跳过，并在结果记录中写明原因
 - 若启用 `direct_inference`，先生成 `Opt1`
 - 若 `refine_steps > 0`，再继续生成 `Opt2`
 
