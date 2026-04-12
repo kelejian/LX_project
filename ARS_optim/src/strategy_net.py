@@ -11,6 +11,7 @@ from InjuryPredict.utils.models import BaseMLP, DiscreteFeatureEmbedding, Featur
 from ARS_optim.src.constraints import ConstraintEngine
 from ARS_optim.src.param_manager import ParamManager
 from common.data_utils.processor import UnifiedDataProcessor
+from common.settings import WAVEFORM_LENGTH
 
 
 def build_strategy_net_from_config(
@@ -79,11 +80,20 @@ def load_strategy_run_config(strategy_ckpt_path: Path) -> Tuple[Dict[str, Any], 
 
 
 class PulseTCNEncoder(nn.Module):
-    """轻量 TCN 波形编码器。
+    """策略网络的波形编码器。
 
-    这里复用 InjuryPredict 中的 `TemporalBlock` 残差块，但不再引入 ChannelAttention。
-    策略网络只需要稳定提取 pulse 的阶段性模式作为决策增强特征，
-    没必要把 InjuryPredict 的多任务输出与注意力分支整套搬进来。
+    作用：
+    - 复用 `TemporalBlock` 提取 pulse 的时序特征；
+    - 通过“可学习位置编码 + 注意力时序池化”完成时间维聚合；
+    - 输出固定维度的波形表示，供后续融合层使用。
+
+    输入 / 输出：
+    - 输入张量形状为 `(B, C, L)`；
+    - 输出张量形状为 `(B, output_dim)`。
+
+    设计说明：
+    - 位置编码长度由共享波形长度配置和初始下采样规则共同决定；
+    - 注意力分数基于注入位置编码后的特征计算，池化时使用原始时序特征。
     """
 
     def __init__(
@@ -102,6 +112,9 @@ class PulseTCNEncoder(nn.Module):
             raise ValueError("TCN 卷积核大小必须为正整数")
 
         padding_init = max(0, (kernel_size_init - 2) // 2)
+        self.input_length = int(WAVEFORM_LENGTH)
+        # 初始卷积负责下采样；后续 TemporalBlock 保持时间步长度不变。
+        self.tcn_output_length = (self.input_length + 2 * padding_init - kernel_size_init) // 2 + 1
         self.initial_conv = nn.Sequential(
             nn.Conv1d(in_channels, channels_list[0], kernel_size=kernel_size_init, stride=2, padding=padding_init, bias=False),
             nn.BatchNorm1d(channels_list[0]),
@@ -121,13 +134,53 @@ class PulseTCNEncoder(nn.Module):
             )
             in_dim = out_dim
         self.temporal_blocks = nn.Sequential(*blocks)
-        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.pos_embedding = nn.Embedding(
+            num_embeddings=self.tcn_output_length,
+            embedding_dim=in_dim,
+        )
+        self.register_buffer(
+            "position_ids",
+            torch.arange(self.tcn_output_length).expand((1, -1)),
+        )
+        self.pe_dropout = nn.Dropout(dropout)
+        hidden_attn_dim = max(1, in_dim // 2)
+        self.attention_mlp = nn.Sequential(
+            nn.Conv1d(in_channels=in_dim, out_channels=hidden_attn_dim, kernel_size=1, bias=False),
+            nn.BatchNorm1d(hidden_attn_dim),
+            nn.SiLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Conv1d(in_channels=hidden_attn_dim, out_channels=1, kernel_size=1, bias=True),
+        )
         self.output_proj = nn.Linear(in_dim, output_dim)
 
     def forward(self, pulse_features: torch.Tensor) -> torch.Tensor:
+        """编码归一化 pulse 波形。
+
+        输入：
+        - `pulse_features`: 形状为 `(B, C, L)` 的归一化波形，`L` 默认由
+          `common.settings.WAVEFORM_LENGTH` 定义。
+
+        输出：
+        - 返回形状为 `(B, output_dim)` 的 pulse 编码向量。
+        """
         x = self.initial_conv(pulse_features)
         x = self.temporal_blocks(x)
-        x = self.global_avg_pool(x).squeeze(-1)
+        feature_length = x.size(2)
+        if feature_length > self.tcn_output_length:
+            raise ValueError(
+                f"当前 pulse 特征长度 {feature_length} 超出位置编码上限 {self.tcn_output_length}，"
+                f"请检查输入波形长度或编码器配置。"
+            )
+
+        pos_ids = self.position_ids[:, :feature_length].to(x.device)
+        pos_embeds = self.pos_embedding(pos_ids)
+        pos_embeds = self.pe_dropout(pos_embeds).permute(0, 2, 1)
+
+        # 位置编码仅用于计算时间权重，池化对象仍是原始时序特征。
+        x_with_pos = x + pos_embeds
+        attention_scores = self.attention_mlp(x_with_pos)
+        attention_weights = torch.softmax(attention_scores, dim=2)
+        x = torch.sum(x * attention_weights, dim=2)
         return self.output_proj(x)
 
 
@@ -269,7 +322,8 @@ class StrategyNet(nn.Module):
         with torch.no_grad():
             self.output_head.weight.zero_()
             # 输出头权重清零后，网络对任意输入都会退化为一个固定 bias。
-            # 这里把 bias 设为 default 动作在 [opt_min, opt_max] 内的 logit，从而保证训练开始前任何合法输入都会输出 param_space.yaml 中的 default。
+            # bias 取 default 动作在 `[opt_min, opt_max]` 内对应的 logit，
+            # 因此初始化后对任意合法输入都会输出 `param_space.yaml` 中的 default。
             ratio = (self.default_actions - self.min_bounds) / torch.clamp(self.max_bounds - self.min_bounds, min=1e-12)
             ratio = torch.clamp(ratio, min=1e-6, max=1.0 - 1e-6)
             self.output_head.bias.copy_(torch.log(ratio / (1.0 - ratio)))

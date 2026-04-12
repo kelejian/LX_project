@@ -3,6 +3,8 @@
 import torch
 import torch.nn as nn
 
+from common.settings import WAVEFORM_LENGTH
+
 class FeatureSELayer(nn.Module):
     """ 
     针对 1D 特征向量的 SE 门控模块。
@@ -173,9 +175,19 @@ class TemporalConvNet(nn.Module):
                  dropout=0.1, hidden=128, use_channel_attention=True, fixed_channel_weight=None,
                  use_attention_pooling=True):
         """
-        损伤预测模型一部分, 负责提取X,Y加速度曲线特征(x_acc), 作为encoder一部分
+        损伤预测模型中的波形编码器，负责提取碰撞波形的时序表示。
+
         Args:
-            use_attention_pooling (bool): 是否使用注意力池化替代全局平均池化。
+            in_channels (int): 波形输入通道数。
+            tcn_channels_list (list[int]): TCN 各层输出通道数。
+            Ksize_init (int): 初始下采样卷积的卷积核大小。
+            Ksize_mid (int): 后续 TemporalBlock 的卷积核大小。
+            dropout (float): TCN 与时序池化子模块中的 Dropout 概率。
+            hidden (int): 时序池化后的全连接投影输出维度。
+            use_channel_attention (bool): 是否对输入通道做注意力加权。
+            fixed_channel_weight (list[float] | None): 固定通道权重；为 `None` 时使用自适应通道注意力。
+            use_attention_pooling (bool): 是否使用注意力时序池化；
+                为 `False` 时退化为全局平均池化。
         """
         super(TemporalConvNet, self).__init__()
 
@@ -197,8 +209,11 @@ class TemporalConvNet(nn.Module):
         if len(kernel_sizes) > 1:
             assert all([k % 2 == 1 for k in kernel_sizes[1:]]), "kernel_sizes[1:]必须为奇数"
 
-        # 初始卷积层, 并进行一次下采样
-        padding_init = (kernel_sizes[0] - 2) // 2  # 保持输入输出长度一致
+        # 初始卷积层，同时把时间步长度降为原始波形长度的一半左右。
+        padding_init = (kernel_sizes[0] - 2) // 2
+        self.input_length = int(WAVEFORM_LENGTH)
+        # TemporalBlock 不改变时序长度，因此可学习 PE 的长度只需覆盖初始 stride=2 下采样后的长度。
+        self.tcn_output_length = (self.input_length + 2 * padding_init - kernel_sizes[0]) // 2 + 1
         self.initial_conv = nn.Sequential(
             nn.Conv1d(in_channels, tcn_channels_list[0], kernel_size=kernel_sizes[0], stride=2, padding=padding_init),  # 下采样
             nn.BatchNorm1d(tcn_channels_list[0]),
@@ -223,50 +238,45 @@ class TemporalConvNet(nn.Module):
 
         self.temporal_blocks = nn.Sequential(*layers)
 
-        # --- 3. 池化层 ---
-        
+        # --- 3. 时序池化 / 时间维聚合层 ---
         # C_out 即 TCN 的最终输出通道数
         C_out = tcn_channels_list[-1] 
 
         if self.use_attention_pooling:
-            # --- 方案 注意力池化 + 可学习 PE ---
-            
-            # (a) 定义TCN输出的时间步长度 (L_feat)
-            tcn_output_length = 150 // 2
-            
-            # (b) 可学习的位置编码 (Learned PE)
+            # 注意力时序池化：先注入位置编码，再学习每个时间步的聚合权重。
             self.pos_embedding = nn.Embedding(
-                num_embeddings=tcn_output_length, 
+                num_embeddings=self.tcn_output_length, 
                 embedding_dim=C_out
             )
-            # 注册 position_ids 缓冲区
+            # 预先缓存位置索引，前向时只按实际特征长度切片。
             self.register_buffer(
                 'position_ids', 
-                torch.arange(tcn_output_length).expand((1, -1))
+                torch.arange(self.tcn_output_length).expand((1, -1))
             )
-            self.pe_dropout = nn.Dropout(dropout) # 添加 Dropout
+            self.pe_dropout = nn.Dropout(dropout)  # 位置编码单独做 dropout，避免时序位置模板过强
 
-            # (c) 注意力权重计算网络 (attention_mlp)
+            # 输入为注入位置编码后的时序特征，输出每个时间步的注意力分数。
             C_hidden_attn = C_out // 2 
             self.attention_mlp = nn.Sequential(
                 nn.Conv1d(in_channels=C_out, out_channels=C_hidden_attn, kernel_size=1, bias=False),
                 nn.BatchNorm1d(C_hidden_attn),
                 nn.SiLU(inplace=True),
-                nn.Dropout(dropout), # 添加 Dropout
+                nn.Dropout(dropout),
                 nn.Conv1d(in_channels=C_hidden_attn, out_channels=1, kernel_size=1, bias=True)
             )
         else:
-            # --- 原始 GAP 方案 ---
+            # 全局平均池化对应一种无参数的时间维聚合方式。
             self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
 
         # --- 4. 最终全连接层 ---
-        # 无论哪种池化, 输出维度都是 (B, C_out), fc层保持不变
+        # 无论采用哪种时序池化方式，聚合后的通道维都保持为 C_out。
         self.fc = nn.Linear(C_out, hidden)
 
     def forward(self, x):
         """
         Args:
-            x (torch.Tensor): 输入张量,形状为 (B, C, L), C是通道数=3, L是序列长度=150
+            x (torch.Tensor): 输入张量,形状为 (B, C, L), 其中 L 为碰撞波形长度，
+                默认由 common.settings.WAVEFORM_LENGTH 定义。
 
         Returns:
             torch.Tensor: 输出张量,形状为 (B, hidden)
@@ -276,50 +286,48 @@ class TemporalConvNet(nn.Module):
             x = self.channel_attention(x)  # (B, C, L)
         
         # 2. 初始卷积
-        x = self.initial_conv(x)  # (B, C_0, L/2)
+        x = self.initial_conv(x)  # (B, C_0, L_init_feat)
         
         # 3. TCN 堆叠
-        x = self.temporal_blocks(x)  # (B, C_out, L_feat), L_feat=75
+        x = self.temporal_blocks(x)  # (B, C_out, L_feat)
 
-        # 4. 池化
+        # 4. 时序池化 / 时间维聚合
         if self.use_attention_pooling:
-            # --- 方案3: 注意力池化 + 可学习 PE (含 Dropout) ---
-            
-            # (a) 获取当前特征长度 L_feat (应为 75)
+            # 获取当前特征长度 L_feat。
             L_feat = x.size(2)
+            if L_feat > self.tcn_output_length:
+                raise ValueError(
+                    f"当前特征长度 {L_feat} 超出位置编码上限 {self.tcn_output_length}，"
+                    f"请检查输入波形长度或位置编码配置。"
+                )
             
-            # (b) 获取位置编码 (B, L_feat, C_out)
+            # 取出与当前特征长度匹配的位置编码。
             pos_ids = self.position_ids[:, :L_feat].to(x.device)
             pos_embeds = self.pos_embedding(pos_ids)
             
-            # *** 应用 PE Dropout ***
-            # P_learn_dropout = P_learn * M_pe
+            # 对位置编码单独施加 dropout。
             pos_embeds = self.pe_dropout(pos_embeds)
             
-            # (c) 转换维度: (B, L_feat, C_out) -> (B, C_out, L_feat)
+            # 转换回 Conv1d 使用的 `(B, C, L)` 排列。
             pos_embeds = pos_embeds.permute(0, 2, 1)
 
-            # (d) 注入 PE
-            # F_pos = F + P_learn_dropout
+            # 注意力分数基于注入位置编码后的特征计算。
             x_pos = x + pos_embeds # (B, C_out, L_feat)
 
-            # (e) 计算注意力分数 (B, C_out, L_feat) -> (B, 1, L_feat)
+            # 计算每个时间步的注意力分数。
             attention_scores = self.attention_mlp(x_pos)
             
-            # (f) 归一化权重 (Softmax)
-            # A = Softmax(S)
+            # 在时间维做 softmax，得到归一化权重。
             attention_weights = torch.softmax(attention_scores, dim=2) 
             
-            # (g) 加权求和 (用原始特征 x, 而非 x_pos)
-            # F_weighted = F * A
+            # 池化时使用原始时序特征，位置编码仅参与时间权重计算。
             weighted_features = x * attention_weights
             
-            # (h) 压缩维度 -> (B, C_out)
-            # v = sum(F_weighted)
+            # 沿时间维压缩，得到固定维度的波形表示。
             x = torch.sum(weighted_features, dim=2)
         
         else:
-            # --- 原始 GAP 方案 ---
+            # 使用全局平均池化做时间维聚合。
             x = self.global_avg_pool(x)  # (B, C_out, 1)
             x = x.squeeze(-1)           # (B, C_out)
 
@@ -515,7 +523,8 @@ class InjuryPredictModel(nn.Module):
     def forward(self, x_acc, x_att_continuous, x_att_discrete):
         """
         参数:
-            x_acc (torch.Tensor): 碰撞波形数据，形状为 (B, 2, 150)。
+            x_acc (torch.Tensor): 碰撞波形数据，形状为 (B, 2, L)，
+                其中 L 默认由 common.settings.WAVEFORM_LENGTH 定义。
             x_att_continuous (torch.Tensor): 连续特征，形状为 (B, 11)。
             x_att_discrete (torch.Tensor): 离散特征，形状为 (B, 2)。
 
