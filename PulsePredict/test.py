@@ -71,7 +71,7 @@ def main(config):
     # 强制 dataset 提供 UnifiedDataProcessor
     processor = getattr(data_loader, 'processor', None)
     if processor is None:
-        raise RuntimeError("Dataset.processor (UnifiedDataProcessor) is required — run prepare_data.py to generate normalization_config.json")
+        raise RuntimeError("数据集缺少 `processor`，请先运行 `python -m prepare_data` 生成归一化配置。")
     # 打印测试集数据量
     logger.info(f"测试集数据量: {len(data_loader.train_test_indices)}")
 
@@ -84,17 +84,20 @@ def main(config):
 
     metric_fns = [getattr(module_metric, met) for met in config['metrics']]
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info('Loading checkpoint: {} ...'.format(config.resume))
-    checkpoint = torch.load(config.resume)
+    checkpoint = torch.load(config.resume, map_location=device)
     state_dict = checkpoint['state_dict']
     if config['n_gpu'] > 1:
         model = torch.nn.DataParallel(model)
-    model.load_state_dict(state_dict)
 
     # prepare model for testing
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     criterion = criterion.to(device)
+    model.load_state_dict(state_dict)
+    if 'criterion_state_dict' not in checkpoint:
+        raise KeyError("检查点中缺少 `criterion_state_dict`，无法按训练时的任务权重进行测试。")
+    criterion.load_state_dict(checkpoint['criterion_state_dict'])
     model.eval()
 
     # --- 2. 收集所有测试样本的结果 ---
@@ -104,7 +107,7 @@ def main(config):
     all_losses = []
 
     with torch.no_grad():
-        for batch_idx, (data, target, case_ids) in enumerate(tqdm(data_loader, desc="Predicting")):
+        for batch_idx, (data, target, case_ids) in enumerate(tqdm(data_loader, desc="testing")):
             data, target = data.to(device), target.to(device)
             # ------------------- 使用统一的模型接口 ----------------------
             output = model(data)
@@ -179,9 +182,6 @@ def main(config):
         logger.info(title.center(50, "="))
         logger.info("="*50)
 
-        # --- MODIFICATION START ---
-        # 为新的复杂逻辑 (A AND (B OR C)) 添加硬编码分支
-        
         if case_name == 'angle_gt15_and_full_or_samesign':
             # 手动构建复杂的布尔掩码
             
@@ -191,7 +191,6 @@ def main(config):
             
             # Condition B: 重叠率 = 100% (即 |overlap| == 1.0)
             param_overlap = all_raw_params[:, 2]
-            # 使用 np.isclose 来安全地比较浮点数
             mask_B = np.isclose(np.abs(param_overlap), 1.0)
             
             # Condition C: 角度和重叠率同号
@@ -201,7 +200,7 @@ def main(config):
             combined_mask = mask_A & (mask_B | mask_C)
 
         else:
-            # --- 原始逻辑：处理所有只包含 AND 的简单条件 ---
+            # 其余工况均按“多个条件取交集”处理。
             combined_mask = np.full(all_raw_params.shape[0], True)
 
             for cond in config_item['conditions']:
@@ -234,8 +233,6 @@ def main(config):
                     continue
                 
                 combined_mask &= current_mask
-        
-        # --- MODIFICATION END ---
             
         # 找到最终满足所有条件的样本索引
         indices = np.where(combined_mask)[0]
@@ -255,8 +252,10 @@ def main(config):
 
 def plot_samples(data, batch_idx, pred_mean_orig, target_orig, case_ids, processor, config, logger, plot_iso_ratings=False):
     """
-    为指定批次的样本绘图。
-    :param processor: UnifiedDataProcessor 实例（用于逆归一化）
+    为指定批次内的全部样本绘制预测与真实波形对比图。
+
+    参数:
+        processor: 用于输入工况反归一化的 UnifiedDataProcessor 实例。
     """
     num_samples_to_plot = data.shape[0]
     print(f"\nPlotting samples from batch {batch_idx}...")
@@ -314,11 +313,11 @@ def evaluate_subset(preds, targets, losses, metric_fns, logger, header_info=None
         logger.info('    {:15s}: {}'.format(str(key), value))
 
 if __name__ == '__main__':
-    args = argparse.ArgumentParser(description='LX-CrashPulsePredictionModel Test')
+    args = argparse.ArgumentParser(description='PulsePredict 测试入口')
     args.add_argument('-c', '--config', default=None, type=str,
                       help='config file path (default: None)')
     args.add_argument('-r', '--resume', default=None, type=str,
-                      help='path to latest checkpoint (default: None)')
+                      help='path to the checkpoint which to test (default: None)')
     args.add_argument('-d', '--device', default=None, type=str,
                       help='indices of GPUs to enable (default: all)')
 

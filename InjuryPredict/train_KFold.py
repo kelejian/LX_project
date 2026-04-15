@@ -29,7 +29,7 @@ from common.settings import INJURY_PROCESSED_DIR, get_injury_processed_dataset_p
 
 from InjuryPredict.utils import models
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
-from InjuryPredict.utils.weighted_loss import weighted_loss
+from InjuryPredict.utils.loss import weighted_loss
 from InjuryPredict.utils.tools import get_parameter_groups, build_metric_trackers, round_float_fields, round_to_significant, convert_numpy_types
 from InjuryPredict.utils.tools import get_regression_metrics, get_classification_metrics, get_mais_3c_metrics, MAIS_3C_DISPLAY_LABELS, plot_scatter, plot_confusion_matrix
 from InjuryPredict.config import RUNS_DIR, training_params, loss_params, model_params, kfold_params

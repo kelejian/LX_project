@@ -5,14 +5,12 @@ from abc import abstractmethod
 
 class BaseModel(nn.Module):
     """
-    Base class for all models
+    模型基类。
     """
     @abstractmethod
     def forward(self, *inputs):
         """
-        Forward pass logic
-
-        :return: Model output
+        定义前向传播接口。
         """
         raise NotImplementedError
 
@@ -20,16 +18,13 @@ class BaseModel(nn.Module):
     @abstractmethod
     def get_metrics_output(self, model_output):
         """
-        Extracts the primary output for metrics calculation.
-
-        :param model_output: The output from the forward pass.
-        :return: The tensor to be used for computing metrics.
+        提取用于计算评估指标的主输出张量。
         """
         raise NotImplementedError
 
     def __str__(self):
         """
-        Model prints with number of trainable parameters
+        在模型字符串后附加可训练参数量，便于日志中快速核对模型规模。
         """
         model_parameters = filter(lambda p: p.requires_grad, self.parameters())
         params = sum([np.prod(p.size()) for p in model_parameters])

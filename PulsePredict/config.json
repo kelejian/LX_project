@@ -4,7 +4,6 @@
     "arch": {
         "type": "HybridPulseCNN",
         "args": {
-            "GauNll_use": true,
             "mlp_hidden_dim": 256, 
             "seed_proj_channels": 256,
             "seed_proj_pe_dim": 64,
@@ -44,7 +43,7 @@
             "lr": 0.0015,
             "weight_decay": 0.1
         },
-        "head_decay_ratio": 0.001
+        "head_decay_ratio": 1e-3
     },
 
     "loss": {
@@ -56,8 +55,8 @@
                     "prior_weight": 1.0,
                     "args": {
                         "scale_weights": [0, 0.2, 1.0],
-                        "base_loss_type": "GaussianNLLLoss",
-                        "base_loss_args": { "eps": 1e-06, "reduction": "none" },
+                        "base_loss_type": "MSELoss",
+                        "base_loss_args": {},
                         "channel_weights": [1.0, 0.5, 0.01]
                     }
                 },
@@ -72,7 +71,7 @@
                 },
                 {
                     "type": "SlopeLoss",
-                    "prior_weight": 0.2,
+                    "prior_weight": 0.1,
                     "args": {
                         "apply_smoothing": false,
                         "smoothing_window_size": 5,
@@ -91,7 +90,7 @@
                 },
                 {
                     "type": "InitialLoss",
-                    "prior_weight": 0.05,
+                    "prior_weight": 0.01,
                     "args": {
                         "percentage": 0.04,
                         "weight_target": 0.5,
@@ -101,7 +100,7 @@
                 },
                 {
                     "type": "TerminalLoss",
-                    "prior_weight": 0.01,
+                    "prior_weight": 0.002,
                     "args": {
                         "percentage": 0.04,
                         "weight_target": 2.0,
@@ -120,7 +119,7 @@
                 },
                 {
                     "type": "DeltaVLoss",
-                    "prior_weight": 0.25,
+                    "prior_weight": 0.3,
                     "args": {
                         "dt": 0.001,
                         "loss_type": "MSELoss",

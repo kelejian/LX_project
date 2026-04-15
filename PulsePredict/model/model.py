@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from PulsePredict.base import BaseModel
 
 # ==========================================================================================
-# 基础组件定义 (Basic Components)
+# 基础组件定义
 # ==========================================================================================
 
 class ResMLPBlock(nn.Module):
@@ -14,7 +14,7 @@ class ResMLPBlock(nn.Module):
     残差 MLP 块
     
     用途: 用于深度编码器，增加网络深度的同时防止梯度消失和模型退化
-    结构: Linear -> BN -> SiLU -> Dropout -> Linear -> BN -> SiLU -> Dropout + 残差连接
+    结构: Linear -> BN -> SiLU -> (Dropout) -> Linear -> BN -> SiLU -> (Dropout) + 残差连接
     
     参数:
         hidden_dim: 隐藏层维度
@@ -383,13 +383,13 @@ class DeepRegressionHead(nn.Module):
     """
     深层回归头
     
-    功能: 将特征空间映射到物理输出空间 (Mean & Variance)
+    功能: 将特征空间映射到物理输出空间
     设计原则: 移除 BN 和 Dropout，保证回归数值的绝对尺度和连续性
     """
     def __init__(self, in_channels, out_channels=1, hidden_dim=64, num_layers=2):
         """
         :param in_channels: 输入特征通道数
-        :param out_channels: 输出物理量通道数 (1或2)
+        :param out_channels: 输出物理量通道数
         :param hidden_dim: 中间隐藏层通道数
         :param num_layers: 隐藏层(Conv+Act)的数量。
                            0 表示纯线性映射 (Conv1x1); 
@@ -441,7 +441,7 @@ class DeepRegressionHead(nn.Module):
 
 
 # ==========================================================================================
-# 主模型定义 (Hybrid PulseCNN)
+# 主模型定义
 # ==========================================================================================
 class HybridPulseCNN(BaseModel):
     """
@@ -460,7 +460,6 @@ class HybridPulseCNN(BaseModel):
         output_lengths: 各解码阶段的输出长度列表 [L1, L2, L3]
         decoder_blocks_per_stage: [int, int, int], 控制各阶段 ResBlock 的堆叠数量。
         head_config: dict, 控制回归头的结构。
-        GauNll_use: 是否使用高斯负对数似然损失（输出均值和方差）
     """
     def __init__(self, input_dim=3, output_channels=3, 
                  mlp_hidden_dim=256, 
@@ -471,17 +470,20 @@ class HybridPulseCNN(BaseModel):
                  channel_configs=[128, 64, 32],
                  output_lengths=[37, 75, 150],
                  decoder_blocks_per_stage=[1, 1, 2],
-                 head_config={'hidden_dim': 64, 'num_layers': 2}, 
-                 GauNll_use=True):
+                 head_config={'hidden_dim': 64, 'num_layers': 2}):
         super().__init__()
-        
-        self.GauNll_use = GauNll_use
+
         self.output_lengths = output_lengths
         self.channel_configs = channel_configs
+
+        if len(channel_configs) != 3:
+            raise ValueError("`channel_configs` 必须包含 3 个阶段的通道配置。")
+        if len(output_lengths) != 3:
+            raise ValueError("`output_lengths` 必须包含 3 个阶段的输出长度。")
         
         # 确保 decoder_blocks_per_stage 长度正确
         if len(decoder_blocks_per_stage) != 3:
-            raise ValueError("decoder_blocks_per_stage must have length 3 (for 3 stages).")
+            raise ValueError("`decoder_blocks_per_stage` 必须包含 3 个阶段的残差块数量。")
         
         # 自动计算各阶段上采样倍率
         self.upscale_factors = []
@@ -499,8 +501,8 @@ class HybridPulseCNN(BaseModel):
             nn.SiLU(inplace=True)
         )
         self.encoder_body = nn.Sequential(
-            ResMLPBlock(mlp_hidden_dim, dropout=0.1),
-            ResMLPBlock(mlp_hidden_dim, dropout=0.1)
+            ResMLPBlock(mlp_hidden_dim),
+            ResMLPBlock(mlp_hidden_dim)
         )
         self.z_dim = mlp_hidden_dim
 
@@ -516,8 +518,7 @@ class HybridPulseCNN(BaseModel):
             output_len=self.init_len,
             output_channels=self.gru_input_dim,
             pos_dim=seed_proj_pe_dim, 
-            proj_channels=seed_proj_channels,
-            dropout=0.1
+            proj_channels=seed_proj_channels
         )
 
         # Bi-GRU 时序瓶颈
@@ -542,11 +543,9 @@ class HybridPulseCNN(BaseModel):
             s1_blocks.append(ResBlock1D(channel_configs[0], channel_configs[0]))
         self.s1_resblocks = nn.Sequential(*s1_blocks)
         
-        # 动态构建 Head
-        head_out_dim = 2 if GauNll_use else 1
         self.s1_head = DeepRegressionHead(
             channel_configs[0], 
-            out_channels=output_channels * head_out_dim,
+            out_channels=output_channels,
             hidden_dim=head_config.get('hidden_dim', 64),
             num_layers=head_config.get('num_layers', 2)
         )
@@ -576,12 +575,12 @@ class HybridPulseCNN(BaseModel):
             s2_blocks = []
             for _ in range(decoder_blocks_per_stage[1]):
                 s2_blocks.append(ResBlock1D(channel_configs[1], channel_configs[1]))
-            layers['resblocks'] = nn.Sequential(*s2_blocks) # 注意这里改名为 resblocks
+            layers['resblocks'] = nn.Sequential(*s2_blocks)
             
-            # Head
+            # 每个分支独立输出单轴波形
             layers['head'] = DeepRegressionHead(
                 channel_configs[1], 
-                out_channels=head_out_dim,
+                out_channels=1, # 目前不使用GaussNLL, 故不输出方差
                 hidden_dim=head_config.get('hidden_dim', 64),
                 num_layers=head_config.get('num_layers', 2)
             )
@@ -614,10 +613,10 @@ class HybridPulseCNN(BaseModel):
                 s3_blocks.append(ResBlock1D(channel_configs[2], channel_configs[2]))
             layers['resblocks'] = nn.Sequential(*s3_blocks)
             
-            # Head
+            # 每个分支独立输出单轴波形
             layers['head'] = DeepRegressionHead(
                 channel_configs[2], 
-                out_channels=head_out_dim,
+                out_channels=1,
                 hidden_dim=head_config.get('hidden_dim', 64),
                 num_layers=head_config.get('num_layers', 2)
             )
@@ -628,20 +627,15 @@ class HybridPulseCNN(BaseModel):
         前向传播
 
         输入: (B, input_dim)
-        输出: 
-            - 若 GauNll_use=True: [(s1_mean, s1_var), (s2_mean, s2_var), (s3_mean, s3_var)]
-            其中每个 tuple 的 mean 和 var 形状均为 (B, output_channels, output_lengths[i])
-            
-            - 若 GauNll_use=False: [s1_pred, s2_pred, s3_pred]
-            其中每个 pred 是张量，形状为 (B, output_channels, output_lengths[i])
+        输出:
+            [s1_pred, s2_pred, s3_pred]
+            其中每个阶段输出都是张量，形状为 (B, output_channels, output_lengths[i])
 
-        Stage 输出长度:
+        各阶段输出长度:
             s1: output_lengths[0]
             s2: output_lengths[1]
             s3: output_lengths[2]
         """
-        B = x.size(0)
-        
         # ====================================================================
         # 1. 编码阶段: 提取全局特征
         # ====================================================================
@@ -664,9 +658,8 @@ class HybridPulseCNN(BaseModel):
         f_s1 = self.s1_context(f_s1_in, z_prime)
         f_s1 = self.s1_resblocks(f_s1)
         
-        # 输出预测: (B, channel_configs[0], output_lengths[0]) -> (B, output_channels*(1or2), output_lengths[0])
-        s1_out = self.s1_head(f_s1)
-        s1_tuple = self._process_head_output(s1_out)
+        # 输出预测: (B, channel_configs[0], output_lengths[0]) -> (B, output_channels, output_lengths[0])
+        s1_pred = self.s1_head(f_s1)
 
         # ====================================================================
         # 4. Stage 2 解码: 三叉戟中分辨率分支
@@ -695,12 +688,11 @@ class HybridPulseCNN(BaseModel):
             
             # 缓存特征用于下一阶段
             f_s2_feats[axis] = feat
-            # 输出预测: (B, channel_configs[1], output_lengths[1]) -> (B, (1or2), output_lengths[1])
+            # 输出预测: (B, channel_configs[1], output_lengths[1]) -> (B, 1, output_lengths[1])
             s2_preds_list.append(layers['head'](feat))
 
-        # 拼接三轴输出: (B, output_channels*(1or2), output_lengths[1])
-        s2_out = torch.cat(s2_preds_list, dim=1)
-        s2_tuple = self._process_head_output(s2_out)
+        # 拼接三轴输出: (B, output_channels, output_lengths[1])
+        s2_pred = torch.cat(s2_preds_list, dim=1)
 
         # ====================================================================
         # 5. Stage 3 解码: 独立高分辨率精炼
@@ -727,39 +719,18 @@ class HybridPulseCNN(BaseModel):
             feat = layers['context'](feat, z_prime)
             feat = layers['resblocks'](feat)
             
-            # 输出预测: (B, channel_configs[2], output_lengths[2]) -> (B, (1or2), output_lengths[2])
+            # 输出预测: (B, channel_configs[2], output_lengths[2]) -> (B, 1, output_lengths[2])
             s3_preds_list.append(layers['head'](feat))
 
-        # 拼接三轴输出: (B, output_channels*(1or2), output_lengths[2])
-        s3_out = torch.cat(s3_preds_list, dim=1)
-        s3_tuple = self._process_head_output(s3_out)
+        # 拼接三轴输出: (B, output_channels, output_lengths[2])
+        s3_pred = torch.cat(s3_preds_list, dim=1)
 
-        return [s1_tuple, s2_tuple, s3_tuple]
-
-    def _process_head_output(self, raw_out):
-        """
-        处理回归头输出，分离均值和方差
-        
-        输入: (B, output_channels*k, L)，k=1（仅均值）或 k=2（均值+方差）
-        输出: 
-            - GauNll_use=True: (mean, var)，元组，每个形状为 (B, output_channels, L)
-            - GauNll_use=False: raw_out，张量，形状为 (B, output_channels, L)
-        """
-        if self.GauNll_use:
-            # 通道布局: [Mx, Vx, My, Vy, Mz, Vz] -> 重塑为 [x:(M,V), y:(M,V), z:(M,V)]
-            B, C, L = raw_out.shape
-            reshaped = raw_out.view(B, 3, 2, L)
-            mean = reshaped[:, :, 0, :]      # (B, output_channels, L)
-            log_var = reshaped[:, :, 1, :]   # (B, output_channels, L)
-            var = torch.exp(log_var)         # 转换为方差
-            return (mean, var)
-        else:
-            return raw_out
+        return [s1_pred, s2_pred, s3_pred]
     
     def get_metrics_output(self, model_output):
         """
         提取用于评估指标的模型输出
         
-        返回: 最终阶段的波形(均值)预测 (B, output_channels, output_lengths[-1])
+        返回: 最终阶段的波形预测 (B, output_channels, output_lengths[-1])
         """
-        return model_output[-1][0] if self.GauNll_use else model_output[-1]
+        return model_output[-1]

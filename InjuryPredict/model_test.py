@@ -653,7 +653,7 @@ def _run_demo_model_tests():
     import numpy as np
 
     from utils.models import InjuryPredictModel
-    from utils.weighted_loss import weighted_loss
+    from InjuryPredict.utils.loss import weighted_loss
     from config import model_params, loss_params
     
     from common.settings import get_injury_processed_dataset_path
@@ -738,12 +738,12 @@ if __name__ == "__main__":
     parser.add_argument("--weight_file", "-w", type=str, default="best_val_loss.pth",
                         help="模型权重文件名（仅在 inference 模式下需要）")
     args = parser.parse_args()
+    set_random_seed()
 
     if args.mode == "inference":
         # copy logic from original test_inference_time main
         if args.run_dir is None:
             parser.error("--run_dir required when mode is inference")
-        set_random_seed()
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # load training_record json

@@ -1,9 +1,11 @@
 # PulsePredict 使用说明
 
-## 1. 简要说明
+## 1. 项目简介
 
-`PulsePredict` 是基于 PyTorch 的碰撞加速度时序波形预测子项目。输入为三维工况标量（速度、角度、重叠率），输出为三通道加速度波形。该 README 仅包含运行所需的必要说明。
+`PulsePredict` 用于根据碰撞工况参数预测三通道碰撞脉冲波形。
 
+- 输入：碰撞速度、碰撞角度、重叠率等工况标量
+- 输出：三通道波形序列
 
 ## 2. 项目结构
 
@@ -19,22 +21,20 @@ PulsePredict/
 ├─ config.json        # 默认配置
 ├─ train.py           # 训练入口
 ├─ test.py            # 测试入口
-└─ interfere_data.py  # 绘图与导出工具
+└─ interfere_data.py  # 推理与绘图脚本
 ```
 
-## 3. 路径约定
+## 3. 数据路径约定
 
-当前主流程不在 `config.json` 里硬编码共享数据路径。
-
-当`PulsePredict/config.json` 中与数据相关的字段为 `null`，运行时会自动回落到 [common/settings.py](../common/settings.py) 中的统一路径约定，包括：
+当 `PulsePredict/config.json` 中的数据路径字段为 `null` 时，程序会回退到 [common/settings.py](../common/settings.py) 中的统一路径配置，例如：
 
 - `RAW_DATA`
 - `NORMALIZATION_CONFIG_PATH`
 - `PULSE_SPLIT_DIR`
 
-建议保留 `config.json` 中的 `null` 设置。
+因此一般不需在 `PulsePredict/config.json` 中写死共享数据路径，保留 `config.json` 中的 `null` 设置即可。
 
-## 4. 环境与依赖
+## 4. 环境准备
 
 确保已经在项目根目录下执行：
 
@@ -64,13 +64,13 @@ python -m prepare_data
 
 ## 6. 训练
 
-从零训练：
+从零开始训练：
 
 ```bash
 python -m PulsePredict.train -c PulsePredict/config.json
 ```
 
-调整常用参数示例：
+修改常用超参数：
 
 ```bash
 python -m PulsePredict.train -c PulsePredict/config.json --bs 64 --lr 0.001
@@ -101,15 +101,7 @@ python -m PulsePredict.interfere_data
 ```
 
 该脚本会结合 checkpoint 和配置文件绘制精度分布图、散点图或导出 case 数据。
+注意：
 
-需要注意：
-
-- 波形数据、归一化配置默认仍走 `common.settings`
-- checkpoint 默认值仍是脚本内的便捷实验路径，如需复用到其他运行目录，请显式修改或传入相应路径
-
-## 9. 推荐阅读顺序
-
-1. 先看根目录 [README.md](../README.md)
-2. 再看 [common/settings.py](../common/settings.py) 中的共享路径约定
-3. 运行 `python -m prepare_data`
-4. 再运行 `PulsePredict.train` 或 `PulsePredict.test`
+- 波形数据、归一化配置默认依然按 `common.settings`
+- checkpoint 路径需在脚本中显式设置

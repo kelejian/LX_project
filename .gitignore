@@ -1,5 +1,6 @@
 # Project-wide ignores
 ARS_codetask_prompt.md
+Injprompt.md
 data/
 data_*/
 data_PS/

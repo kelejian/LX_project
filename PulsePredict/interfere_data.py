@@ -475,8 +475,6 @@ def main():
     inference_dataset = TensorDataset(norm_params_tensor, true_waveforms_tensor)
     inference_loader = DataLoader(inference_dataset, batch_size=BATCH_SIZE, shuffle=False)
     
-    GauNll_use = model_arch_args.get('GauNll_use', True) # 默认GauNll
-    
     with torch.no_grad():
         for batch_data, batch_target in tqdm(inference_loader, desc="Inference"):
             batch_data = batch_data.to(device)
@@ -657,7 +655,7 @@ def main():
                 )
                 logger.info(f"组合图 '{group_name}' 已保存至: {save_path} (包含 {found_count}/{len(group_case_ids)} 个工况)")
             else:
-                logger.warning(f"组 '{group_name}' 中没有找到任何有效工况，跳过绘图。")
+                logger.warning(f"分组 '{group_name}' 中没有找到有效工况，已跳过绘图。")
         
         logger.info("组合波形绘图完成。")
 

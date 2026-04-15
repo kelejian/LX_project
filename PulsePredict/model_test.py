@@ -7,6 +7,7 @@ from torchinfo import summary
 from torchviz import make_dot
 import time
 
+from common.tools.seeding import set_random_seed
 
 # ==========================================================================================
 # 自定义 FLOPs 计算 Hooks (用于 ptflops 不默认支持的操作)
@@ -548,6 +549,8 @@ def _get_output_names(outputs):
 
 
 if __name__ == "__main__":
+    set_random_seed()
+
     from PulsePredict.utils import read_json
     from PulsePredict.parse_config import ConfigParser
     import PulsePredict.model.model as module_arch

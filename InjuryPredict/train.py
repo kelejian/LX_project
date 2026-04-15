@@ -18,7 +18,7 @@ from common.settings import INJURY_PROCESSED_DIR, get_injury_processed_dataset_p
 
 from InjuryPredict.utils import models
 from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
-from InjuryPredict.utils.weighted_loss import weighted_loss
+from InjuryPredict.utils.loss import weighted_loss
 from InjuryPredict.utils.tools import get_parameter_groups, build_metric_trackers, round_to_significant, round_float_fields, convert_numpy_types, get_mais_3c_metrics
 from InjuryPredict.config import RUNS_DIR, training_params, loss_params, model_params, val_metrics_to_track
 

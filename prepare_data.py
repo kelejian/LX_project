@@ -9,7 +9,7 @@ from typing import Dict, Any, Tuple, Optional
 import numpy as np
 import pandas as pd
 
-from common.tools.seeding import GLOBAL_SEED
+from common.tools.seeding import GLOBAL_SEED, set_random_seed
 from common.settings import (
     FEATURE_ORDER,
     NORMALIZATION_CONFIG_PATH,
@@ -658,10 +658,11 @@ def main():
 
     parser.add_argument("--out-raw",type=str,default=str(RAW_DATA),help="raw_packed 输出文件路径；绝对路径或相对路径均可",)
     parser.add_argument("--out-splits",type=str,default=str(SPLIT_ROOT_DIR),help="split 输出根目录；绝对路径或相对路径均可，目录下会自动创建 injury/{driver,passenger,combined} 与 pulse 子目录")
-    parser.add_argument("--seed", type=int, default=GLOBAL_SEED, help="随机种子; 默认值为common/utils/seeding.py中的GLOBAL_SEED")
+    parser.add_argument("--seed", type=int, default=GLOBAL_SEED, help="随机种子; 默认值为common/tools/seeding.py中的GLOBAL_SEED")
     parser.add_argument("--non-strict", action="store_true", help="非严格模式：遇到缺失波形/异常case则跳过; 若无此标志则严格模式报错退出")
 
     args = parser.parse_args()
+    set_random_seed(args.seed)
 
     ensure_dirs()
 

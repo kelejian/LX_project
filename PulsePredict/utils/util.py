@@ -7,7 +7,6 @@ from collections import OrderedDict
 import matplotlib.pyplot as plt
 import numpy as np
 import os
-import torch
 
 def ensure_dir(dirname):
     dirname = Path(dirname)
@@ -25,22 +24,20 @@ def write_json(content, fname):
         json.dump(content, handle, indent=4, sort_keys=False)
 
 def inf_loop(data_loader):
-    ''' wrapper function for endless data loader. '''
+    """将有限 DataLoader 包装为无限迭代器。"""
     for loader in repeat(data_loader):
         yield from loader
 
 def prepare_device(n_gpu_use):
     """
-    setup GPU device if available. get gpu device indices which are used for DataParallel
+    根据配置选择训练设备，并返回 DataParallel 需要的设备编号列表。
     """
     n_gpu = torch.cuda.device_count()
     if n_gpu_use > 0 and n_gpu == 0:
-        print("Warning: There\'s no GPU available on this machine,"
-              "training will be performed on CPU.")
+        print("警告：当前环境未检测到 GPU，将使用 CPU 训练。")
         n_gpu_use = 0
     if n_gpu_use > n_gpu:
-        print(f"Warning: The number of GPU\'s configured to use is {n_gpu_use}, but only {n_gpu} are "
-              "available on this machine.")
+        print(f"警告：配置要求使用 {n_gpu_use} 张 GPU，但当前仅检测到 {n_gpu} 张，将自动下调。")
         n_gpu_use = n_gpu
     device = torch.device('cuda:0' if n_gpu_use > 0 else 'cpu')
     list_ids = list(range(n_gpu_use))
@@ -95,9 +92,9 @@ def plot_waveform_comparison(pred_wave, true_wave, params, case_id, epoch, batch
 
     :param pred_wave: 单个样本的预测波形 (numpy array, shape: (3, 150))
     :param true_wave: 单个样本的真实波形 (numpy array, shape: (3, 150))
-    :param params: 一个包含原始工况参数的字典, e.g., {'vel': 50.0, 'ang': 30.0, 'ov': 0.5}
-    :param case_id: 样本的原始Case ID。
-    :param epoch: 当前的epoch数或'test'字符串。
+    :param params: 一个包含原始工况参数的字典，例如 {'vel': 50.0, 'ang': 30.0, 'ov': 0.5}
+    :param case_id: 样本的原始工况编号。
+    :param epoch: 当前 epoch 编号或 'test' 字符串。
     :param batch_idx: 当前的批次索引。
     :param sample_idx: 样本在批次中的索引。
     :param save_dir: 图片保存的根目录 (仅在训练时使用)。
@@ -112,14 +109,14 @@ def plot_waveform_comparison(pred_wave, true_wave, params, case_id, epoch, batch
     # 确保保存图片的目录存在
     os.makedirs(plot_dir, exist_ok=True)
 
-    # 将PyTorch Tensors转换为Numpy arrays (如果尚未转换)
+    # 将 PyTorch Tensor 转为 NumPy，便于后续绘图。
     if not isinstance(pred_wave, np.ndarray):
         pred_wave = pred_wave.detach().cpu().numpy()
     if not isinstance(true_wave, np.ndarray):
         true_wave = true_wave.detach().cpu().numpy()
 
-    # 创建时间轴
-    time = np.arange(1, len(pred_wave[0]) + 1)  # 时间单位为ms
+    # 创建时间轴，单位为毫秒。
+    time = np.arange(1, len(pred_wave[0]) + 1)
     fig, axes = plt.subplots(3, 1, figsize=(12, 12))
     
     # --- 创建包含工况参数的新标题 ---

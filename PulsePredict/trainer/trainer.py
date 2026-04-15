@@ -1,140 +1,151 @@
-import numpy as np
 import torch
 from PulsePredict.base import BaseTrainer
 from PulsePredict.utils import inf_loop, MetricTracker
 
+
 class Trainer(BaseTrainer):
-    """
-    Generic Trainer class
-    """
-    def __init__(self, model, criterion, metric_ftns, optimizer, config, device,
-                 data_loader, valid_data_loader=None, lr_scheduler=None, len_epoch=None):
+    """PulsePredict 训练器。"""
+
+    def __init__(
+        self,
+        model,
+        criterion,
+        metric_ftns,
+        optimizer,
+        config,
+        device,
+        data_loader,
+        valid_data_loader=None,
+        lr_scheduler=None,
+        len_epoch=None,
+    ):
         super().__init__(model, criterion, metric_ftns, optimizer, config, lr_scheduler=lr_scheduler)
         self.config = config
         self.device = device
         self.data_loader = data_loader
+
         if len_epoch is None:
             self.len_epoch = len(self.data_loader)
         else:
             self.data_loader = inf_loop(data_loader)
             self.len_epoch = len_epoch
+
         self.valid_data_loader = valid_data_loader
         self.do_validation = self.valid_data_loader is not None
-        # self.lr_scheduler = lr_scheduler
-        
-        len_epoch = len(self.data_loader)
-        self.log_step = max(1, len_epoch // 5)
-        
-        # loss_names_to_track = [type(item['instance']).__name__ for item in self.criterion] # Old: 从配置中动态获取各项loss的名称用于监控
-        # 从 AutoWeightedLoss 实例中直接获取 Loss 名称列表
-        loss_names_to_track = self.criterion.loss_names
+        self.log_step = max(1, len(self.data_loader) // 5)
 
-        self.train_metrics = MetricTracker('loss', *loss_names_to_track, *[m.__name__ for m in self.metric_ftns], writer=self.writer)
-        self.valid_metrics = MetricTracker('loss', *loss_names_to_track, *[m.__name__ for m in self.metric_ftns], writer=self.writer)
+        loss_names = self.criterion.loss_names
+        metric_names = [metric.__name__ for metric in self.metric_ftns]
+        self.train_metrics = MetricTracker("loss", *loss_names, *metric_names, writer=self.writer)
+        self.valid_metrics = MetricTracker("loss", *loss_names, *metric_names, writer=self.writer)
 
     def _train_epoch(self, epoch):
-        """
-        Training logic for an epoch
-        """
         self.model.train()
         self.train_metrics.reset()
-        processor = getattr(self.data_loader, 'processor', None)
+
+        processor = getattr(self.data_loader, "processor", None)
         if processor is None:
-            raise RuntimeError("Dataset.processor (UnifiedDataProcessor) is required for inverse transforms.")
-        
+            raise RuntimeError("数据集缺少 `processor`，无法执行反归一化评估。")
+
         for batch_idx, (data, target, case_ids) in enumerate(self.data_loader):
-            data, target = data.to(self.device), target.to(self.device)
+            data = data.to(self.device)
+            target = target.to(self.device)
 
             self.optimizer.zero_grad()
-            
             output = self.model(data)
             loss, loss_components = self.criterion(output, target)
-
             loss.backward()
             self.optimizer.step()
 
             self.writer.set_step((epoch - 1) * self.len_epoch + batch_idx)
-            # 更新总损失和各项损失到MetricTracker
-            self.train_metrics.update('loss', loss.item())
-            for loss_name, loss_val in loss_components.items():
-                self.train_metrics.update(loss_name, loss_val)
+            self.train_metrics.update("loss", loss.item())
+            # 这里写入 TensorBoard 的各子项 `Loss` 来自 `loss_components`，对应的是各任务的原始损失值；
+            # 这些数值不包含 Kendall 自适应缩放系数，也不包含 `log_var` 正则项，目的在于保留可解释的物理监控曲线。
+            for loss_name, loss_value in loss_components.items():
+                self.train_metrics.update(loss_name, loss_value)
 
-            # Get the primary model output for metrics calculation
             metrics_output = self.model.get_metrics_output(output)
-            # Use UnifiedDataProcessor for inverse transform (tensor -> numpy -> processor -> tensor)
             with torch.no_grad():
                 metrics_output_np = processor.process_waveform(metrics_output.detach().cpu().numpy(), inverse=True)
                 target_np = processor.process_waveform(target.detach().cpu().numpy(), inverse=True)
+
             metrics_output_orig = torch.from_numpy(metrics_output_np).to(metrics_output.device).type_as(metrics_output)
             target_orig = torch.from_numpy(target_np).to(target.device).type_as(target)
 
-            for met in self.metric_ftns:
-                self.train_metrics.update(met.__name__, met(metrics_output_orig, target_orig))
+            for metric in self.metric_ftns:
+                self.train_metrics.update(metric.__name__, metric(metrics_output_orig, target_orig))
 
             if batch_idx % self.log_step == 0:
-                self.logger.debug('Train Epoch: {} {} Loss: {:.6f}'.format(
-                    epoch, self._progress(batch_idx), loss.item()))
+                self.logger.debug(
+                    "Train Epoch: {} {} Loss: {:.6f}".format(epoch, self._progress(batch_idx), loss.item())
+                )
 
-            if batch_idx == self.len_epoch:
+            if batch_idx + 1 >= self.len_epoch:
                 break
 
-        # <--- 在每个训练 Epoch 结束时记录权重直方图 --->
-        for name, p in self.model.named_parameters():
-            self.writer.add_histogram(name, p, bins='auto')
-            
+        for name, param in self.model.named_parameters():
+            self.writer.add_histogram(name, param, bins="auto")
+
+        # 这里额外记录的是任务级权重状态，而不是原始子损失；
+        # 因此 TensorBoard 中会同时存在两类曲线：一类是原始任务损失，另一类是 Kendall 权重相关统计量。
+        for loss_name, stats in self.criterion.get_weight_state().items():
+            for stat_name, stat_value in stats.items():
+                self.writer.add_scalar(f"{stat_name}/{loss_name}", stat_value)
+
         log = self.train_metrics.result()
 
-        if self.do_validation: # 当存在验证集时，进行验证
+        if self.do_validation:
             val_log = self._valid_epoch(epoch)
-            log.update(**{'val_'+k : v for k, v in val_log.items()})
+            log.update(**{f"val_{key}": value for key, value in val_log.items()})
 
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
+
         return log
 
     def _valid_epoch(self, epoch):
-        """
-        Validate after training an epoch
-        """
         self.model.eval()
         self.valid_metrics.reset()
-        processor = getattr(self.data_loader, 'processor', None)
+
+        processor = getattr(self.data_loader, "processor", None)
         if processor is None:
-            raise RuntimeError("Dataset.processor (UnifiedDataProcessor) is required for inverse transforms.")
-        
+            raise RuntimeError("数据集缺少 `processor`，无法执行反归一化评估。")
+
         with torch.no_grad():
             for batch_idx, (data, target, case_ids) in enumerate(self.valid_data_loader):
-                data, target = data.to(self.device), target.to(self.device)
+                data = data.to(self.device)
+                target = target.to(self.device)
 
                 output = self.model(data)
                 loss, loss_components = self.criterion(output, target)
 
-                self.writer.set_step((epoch - 1) * len(self.valid_data_loader) + batch_idx, 'valid')
-                # 更新总损失和各项损失到MetricTracker
-                self.valid_metrics.update('loss', loss.item())
-                for loss_name, loss_val in loss_components.items():
-                    self.valid_metrics.update(loss_name, loss_val)
-                
+                self.writer.set_step((epoch - 1) * len(self.valid_data_loader) + batch_idx, "valid")
+                self.valid_metrics.update("loss", loss.item())
+                # 验证阶段记录的各子项 `Loss` 与训练阶段一致，均为未乘入自适应权重的原始任务损失。
+                for loss_name, loss_value in loss_components.items():
+                    self.valid_metrics.update(loss_name, loss_value)
+
                 metrics_output = self.model.get_metrics_output(output)
-                # Use UnifiedDataProcessor for inverse transform (tensor -> numpy -> processor -> tensor)
                 metrics_output_np = processor.process_waveform(metrics_output.detach().cpu().numpy(), inverse=True)
                 target_np = processor.process_waveform(target.detach().cpu().numpy(), inverse=True)
+
                 metrics_output_orig = torch.from_numpy(metrics_output_np).to(metrics_output.device).type_as(metrics_output)
                 target_orig = torch.from_numpy(target_np).to(target.device).type_as(target)
 
-                for met in self.metric_ftns:
-                    self.valid_metrics.update(met.__name__, met(metrics_output_orig, target_orig))
+                for metric in self.metric_ftns:
+                    self.valid_metrics.update(metric.__name__, metric(metrics_output_orig, target_orig))
 
-        for name, p in self.model.named_parameters():
-            self.writer.add_histogram(name, p, bins='auto')
+        for name, param in self.model.named_parameters():
+            self.writer.add_histogram(name, param, bins="auto")
+
         return self.valid_metrics.result()
 
     def _progress(self, batch_idx):
-        base = '[{}/{} ({:.0f}%)]'
-        if hasattr(self.data_loader, 'n_samples'):
+        template = "[{}/{} ({:.0f}%)]"
+        if hasattr(self.data_loader, "n_samples"):
             current = batch_idx * self.data_loader.batch_size
             total = self.data_loader.n_samples
         else:
             current = batch_idx
             total = self.len_epoch
-        return base.format(current, total, 100.0 * current / total)
+        return template.format(current, total, 100.0 * current / total)
