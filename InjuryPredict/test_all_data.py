@@ -22,20 +22,24 @@ from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from common.tools.seeding import set_random_seed
 
 from InjuryPredict.utils import models
-from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
+from InjuryPredict.Injurydata_prepare import load_processed_subset
 from InjuryPredict.config import RUNS_DIR
 from InjuryPredict.utils.tools import get_mais_3c_metrics
 
 # --- 1. 配置区：请在此处设置您的路径 ---
 
 # 1.1) 要评估的模型所在的运行目录
-RUN_DIR = Path(RUNS_DIR) / "InjuryPredictModel_KFold_03131040"
+RUN_DIR = Path(RUNS_DIR) / "InjuryPredictModel_04161405"
 
 # 1.2) 要加载的模型权重文件名（相对于 RUN_DIR）
-FOLD = Path("Fold_1") # 可以指定K折中的某一折，例如 Path("Fold_1")，如果没有K折划分则保持 Path("")
-WEIGHT_FILE = FOLD / Path("best_val_loss.pth")
+FOLD = Path("") # 可以指定K折中的某一折，例如 Path("Fold_1")，如果没有K折划分则保持 Path("")
+WEIGHT_FILE = FOLD / Path("final_model.pth")
 
 # --- 结束配置 ---
+
+def make_weight_output_label(weight_file: Path) -> str:
+    """将权重相对路径转为稳定的导出文件标签，避免不同子目录下的同名权重覆盖结果。"""
+    return "_".join(Path(weight_file).with_suffix("").parts)
 
 def load_original_features(raw_packed_path: str) -> pd.DataFrame:
     """从 raw_packed.npz 恢复原始标量特征与 case 映射。"""
@@ -72,7 +76,7 @@ def load_model_and_data(run_dir, weight_file):
     if not os.path.exists(record_path):
         raise FileNotFoundError(f"未找到 TrainingRecord.json 文件于: {run_dir}")
         
-    with open(record_path, "r") as f:
+    with open(record_path, "r", encoding="utf-8") as f:
         training_record = json.load(f)
     model_params = training_record["hyperparameters"]["model"]
     
@@ -117,7 +121,9 @@ def load_model_and_data(run_dir, weight_file):
 
     # 5. 加载权重
     weight_path = os.path.join(run_dir, weight_file)
-    model.load_state_dict(torch.load(weight_path, map_location=device))
+    if not os.path.exists(weight_path):
+        raise FileNotFoundError(f"未找到模型权重文件: {weight_path}")
+    model.load_state_dict(torch.load(weight_path, map_location=device, weights_only=False))
     model.eval()
     
     return model, full_dataset, device, case_id_map
@@ -134,11 +140,12 @@ def run_inference(model, dataset, device):
     with torch.no_grad():
         for batch in data_loader:
             # 从底层 Dataset 的 __getitem__ 解包
-            (batch_x_acc, batch_x_att_continuous, batch_x_att_discrete,
-             batch_y_HIC, batch_y_Dmax, batch_y_Nij,
-             batch_ais_head, batch_ais_chest, batch_ais_neck, batch_y_MAIS, batch_OT) = [d.to(device) for d in batch]
+            (_batch_x_acc_gt, batch_x_acc_pred, batch_x_att_continuous, batch_x_att_discrete,
+             _batch_y_HIC, _batch_y_Dmax, _batch_y_Nij,
+             _batch_ais_head, _batch_ais_chest, _batch_ais_neck, _batch_y_MAIS, _batch_OT) = [d.to(device) for d in batch]
 
-            batch_pred, _, _ = model(batch_x_acc, batch_x_att_continuous, batch_x_att_discrete)
+            # 完整数据集导出默认使用预测波形源，避免把真值波形评估结果误认为部署域表现。
+            batch_pred, _, _ = model(batch_x_acc_pred, batch_x_att_continuous, batch_x_att_discrete) # [B, 2, L], [B, C], [B, D] -> [B, 3]
             
             all_preds_list.append(batch_pred.cpu().numpy())
             
@@ -258,7 +265,7 @@ def create_results_dataframe(dataset, predictions_np, original_features_df, case
     # 7. 合并原始的标量特征
     final_df = pd.merge(results_df, original_features_df, on='case_id', how='left')
     
-    # 8. 调整列顺序以满足您的要求
+    # 8. 调整列顺序以满足导出分析需要
     original_feature_names = list(original_features_df.columns.drop('case_id'))
     
     ordered_columns = [
@@ -376,11 +383,8 @@ if __name__ == "__main__":
     final_results_df = create_results_dataframe(full_dataset, predictions_np, original_features_df, case_id_map)
     
     # 5. 保存到 CSV 文件
-    if FOLD == Path(""):
-        fold_suffix = ""
-    else:
-        fold_suffix = f"_{FOLD.name}"
-    output_filename = f"full_dataset_predictions{fold_suffix}_{WEIGHT_FILE.name.replace('.pth', '.csv')}"
+    weight_label = make_weight_output_label(WEIGHT_FILE)
+    output_filename = f"full_dataset_predictions_{weight_label}.csv"
     output_path = RUN_DIR / output_filename
     
     final_results_df.to_csv(output_path, index=False, float_format='%.4f')

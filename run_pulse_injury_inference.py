@@ -41,7 +41,7 @@ from PulsePredict.model.model import HybridPulseCNN
 
 
 DEFAULT_OUTPUT_ROOT = DATA_DIR / "inference_outputs"
-DEFAULT_PULSE_RUN_DIR = PULSE_PREDICT_DIR / "saved" / "models" / "HybridPulseCNN" / "0328_002509"
+DEFAULT_PULSE_RUN_DIR = PULSE_PREDICT_DIR / "saved" / "models" / "HybridPulseCNN" / "0415_161324"
 DEFAULT_INJURY_RUN_DIR = INJURY_PREDICT_DIR / "runs" / "InjuryPredictModel_03280055"
 PULSE_FEATURE_NAMES = ["impact_velocity", "impact_angle", "overlap"]
 

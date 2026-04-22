@@ -21,7 +21,7 @@ from torchviz import make_dot
 import numpy as np
 from torch.utils.data import DataLoader, ConcatDataset
 
-from InjuryPredict.Injurydata_prepare import InjuryPackedDataset, load_processed_subset
+from InjuryPredict.Injurydata_prepare import load_processed_subset
 from common.tools.seeding import set_random_seed
 from InjuryPredict.utils import models
 from common.settings import get_injury_processed_dataset_path
@@ -42,21 +42,21 @@ def test_inference_time(model, loader):
         for i in range(num_runs):
             for batch in loader:
                 # 只取模型输入需要的部分，并移动到设备
-                batch_x_acc = batch[0].to(device)
-                batch_x_att_continuous = batch[1].to(device)
-                batch_x_att_discrete = batch[2].to(device)
+                batch_x_acc_pred = batch[1].to(device)
+                batch_x_att_continuous = batch[2].to(device)
+                batch_x_att_discrete = batch[3].to(device)
 
                 # 预热阶段 (仅在第一次迭代时执行)
                 if i == 0:
                     for _ in range(50):
-                        model(batch_x_acc, batch_x_att_continuous, batch_x_att_discrete)
+                        model(batch_x_acc_pred, batch_x_att_continuous, batch_x_att_discrete) # [B, 2, L], [B, C], [B, D] -> [B, 3]
 
                 # 开始计时
                 if device.type == 'cuda':
                     torch.cuda.synchronize() # 确保CUDA操作同步
                 start_time = time.time()
 
-                model(batch_x_acc, batch_x_att_continuous, batch_x_att_discrete)
+                model(batch_x_acc_pred, batch_x_att_continuous, batch_x_att_discrete) # [B, 2, L], [B, C], [B, D] -> [B, 3]
 
                 # 结束计时
                 if device.type == 'cuda':
@@ -421,6 +421,7 @@ def test_model(
         with torch.no_grad():
             # 预热
             for _ in range(num_warmup):
+                # 通用测试入口不固定模型输入形状；具体输入形状由 test_model 的 inputs 参数决定，并在后续统一打印。
                 if isinstance(_input_data, tuple):
                     _ = model(*_input_data)
                 else:
@@ -432,6 +433,7 @@ def test_model(
             # 计时测试
             start_time = time.time()
             for _ in range(num_iterations):
+                # 通用测试入口不固定模型输入形状；此处仅测量同一 inputs 下的重复前向耗时。
                 if isinstance(_input_data, tuple):
                     _ = model(*_input_data)
                 else:
@@ -472,6 +474,7 @@ def test_model(
     else:
         model.train()
     
+    # 通用测试入口不固定模型输入形状；输出结构由后续分支根据实际返回值打印。
     if isinstance(_input_data, tuple):
         outputs = model(*_input_data)
     else:
@@ -511,6 +514,7 @@ def test_model(
             optimizer.zero_grad()
             
             # 需要重新前向传播
+            # 反向传播测试复用相同 inputs，确保前向、损失和梯度检查处于同一输入形状下。
             if isinstance(_input_data, tuple):
                 outputs_train = model(*_input_data)
             else:
@@ -653,8 +657,7 @@ def _run_demo_model_tests():
     import numpy as np
 
     from utils.models import InjuryPredictModel
-    from InjuryPredict.utils.loss import weighted_loss
-    from config import model_params, loss_params
+    from config import model_params
     
     from common.settings import get_injury_processed_dataset_path
     train_pt = get_injury_processed_dataset_path("train")
@@ -702,25 +705,25 @@ def _run_demo_model_tests():
     # 示例输入数据（模拟数据集第1个batch）
     batch_size = 64
 
-    x_acc = torch.tensor(train_dataset.dataset.x_acc[:batch_size], dtype=torch.float32).to(device)
+    x_acc_pred = torch.tensor(train_dataset.dataset.x_acc_pred[:batch_size], dtype=torch.float32).to(device)
     x_att_con = torch.tensor(train_dataset.dataset.x_att_continuous[:batch_size], dtype=torch.float32).to(device)
     x_att_dis = torch.tensor(train_dataset.dataset.x_att_discrete[:batch_size], dtype=torch.long).to(device)
     y_HIC = torch.tensor(train_dataset.dataset.y_HIC[:batch_size], dtype=torch.float32).to(device)
     y_Dmax = torch.tensor(train_dataset.dataset.y_Dmax[:batch_size], dtype=torch.float32).to(device)
     y_Nij = torch.tensor(train_dataset.dataset.y_Nij[:batch_size], dtype=torch.float32).to(device)
-    y = torch.stack([y_HIC, y_Dmax, y_Nij], dim=1)
+    y = torch.stack([y_HIC, y_Dmax, y_Nij], dim=1) # [B], [B], [B] -> [B, 3]
 
     print(f"\n{'='*80}")
     print(f"模型: {type(model).__name__} | 设备: {device}")
-    print(f"输入: x_acc{tuple(x_acc.shape)}, x_att_con{tuple(x_att_con.shape)}, x_att_dis{tuple(x_att_dis.shape)}")
+    print(f"输入: x_acc_pred{tuple(x_acc_pred.shape)}, x_att_con{tuple(x_att_con.shape)}, x_att_dis{tuple(x_att_dis.shape)}")
     print(f"标签: {tuple(y.shape)}")
     print(f"{'='*80}")
 
-    criterion = weighted_loss()
+    criterion = nn.MSELoss()
     
     test_model(
         model, 
-        inputs=(x_acc, x_att_con, x_att_dis), 
+        inputs=(x_acc_pred, x_att_con, x_att_dis), 
         labels=y,
         criterion=criterion,
         print_flops_per_layer=False
@@ -747,7 +750,7 @@ if __name__ == "__main__":
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # load training_record json
-        with open(os.path.join(args.run_dir, "TrainingRecord.json"), "r") as f:
+        with open(os.path.join(args.run_dir, "TrainingRecord.json"), "r", encoding="utf-8") as f:
             training_record = json.load(f)
         model_params = training_record["hyperparameters"]["model"]
 

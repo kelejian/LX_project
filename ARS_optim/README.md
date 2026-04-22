@@ -195,4 +195,3 @@ python -m ARS_optim.plot_eval_cases --eval_csv ARS_optim/saved_eval/.../results/
 - 统一在 `LX_project` 根目录下运行
 - 统一使用 `python -m xxx`
 - 评估阶段若加载策略权重，会严格校验当前 `param_space.yaml` 和 `normalization_config.json` 是否与权重目录中的快照一致
-- 不保留旧数据划分与旧路径布局的兼容逻辑

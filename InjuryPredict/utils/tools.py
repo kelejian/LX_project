@@ -112,18 +112,30 @@ def plot_confusion_matrix(cm, labels, title, save_path):
 def get_compare_func(func_indicator):
     """根据配置中的比较指示器返回比较函数、初始值和判优函数。"""
     if func_indicator == max or (isinstance(func_indicator, str) and func_indicator.lower() == 'max'):
-        return max, float('-inf'), lambda curr, best: curr > best
+        return max, float('-inf'), lambda curr, best: curr > best # lambda curr, best: curr > best 是一个匿名函数，用于比较当前值和最佳值，返回 True 如果当前值更优（更大），否则返回 False。
     return min, float('inf'), lambda curr, best: curr < best
 
 
 def build_metric_trackers(metrics_to_track, model_filename_fn=None):
-    """根据配置构建指标跟踪器字典（仅跟踪验证集指标）。"""
+    """
+    根据配置构建验证指标的静态跟踪规则表。
+
+    返回字典的 key 是去掉可选 `val_` 前缀后的指标名，必须对应 run_one_epoch 返回字典中的验证阶段 key；value 只保存判优方向、初始值、判优函数和权重文件名，不保存训练过程中不断变化的 best value。
+
+    value 字段含义:
+        compare_indicator: 字符串 'max' 或 'min'，表示该指标越大越优或越小越优。
+        initial_value: 动态状态初始化时使用的哨兵值，'max' 对应 -inf，'min' 对应 +inf。
+        is_better: 判优函数，输入 (current_value, best_value)，返回当前值是否优于历史最优值。
+        model_filename: 当前指标刷新最优值时保存的权重文件名。
+        display_name: 日志打印使用的验证指标显示名，格式为 val/<metric_key>。
+    """
     if model_filename_fn is None:
         model_filename_fn = lambda metric_name: f"best_val_{metric_name}.pth"
 
     trackers = {}
     for metric_name, compare_indicator in metrics_to_track:
         raw_metric_name = str(metric_name).strip()
+        # 配置层允许写 "val_xxx" 以强调验证集语义；训练循环读取 val_metrics 时使用去前缀后的真实 key。
         metric_key = raw_metric_name[4:] if raw_metric_name.startswith('val_') else raw_metric_name
         if metric_key not in AVAILABLE_VAL_METRIC_NAMES:
             raise ValueError(
@@ -142,6 +154,7 @@ def build_metric_trackers(metrics_to_track, model_filename_fn=None):
             raise ValueError(f"无效的比较方式: {compare_indicator}. 仅支持 'max' 或 'min'.")
 
         _, initial_value, is_better = get_compare_func(compare_indicator)
+        # tracker 是“静态规则”：训练循环会据此初始化 metric_states，并在每个 epoch 后更新动态最优值。
         trackers[metric_key] = {
             'compare_indicator': compare_mode,
             'initial_value': initial_value,

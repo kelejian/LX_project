@@ -424,6 +424,8 @@ class InjuryPredictModel(nn.Module):
             use_channel_attention (bool): 是否使用通道注意力机制。
         """
         super(InjuryPredictModel, self).__init__()
+        # 该维度用于课程学习中的波形特征一致性，只对应 TCN 输出，不包含标量 MLP 编码特征。
+        self.wave_feature_dim = int(tcn_output_dim)
 
         # 1. 离散特征嵌入层
         self.discrete_embedding = DiscreteFeatureEmbedding(num_classes_of_discrete)
