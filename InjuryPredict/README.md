@@ -23,9 +23,22 @@ InjuryPredict/
 本子项目涉及的共享数据路径统一来自 [common/settings.py](../common/settings.py)，尤其是：
 
 - `NORMALIZATION_CONFIG_PATH`
+- `DEFAULT_INJURY_VARIANT`
+- `INJURY_SPLIT_ROOT_DIR`
 - `INJURY_SPLIT_DIR`
+- `INJURY_PROCESSED_ROOT_DIR`
 - `INJURY_PROCESSED_DIR`
 - `get_injury_processed_dataset_path(...)`
+
+其中 `*_ROOT_DIR` 是容器目录，例如 `data/split_indices/injury/` 或 `data/processed/injury/`，其下再分 `combined / driver / passenger`。`INJURY_SPLIT_DIR` 和 `INJURY_PROCESSED_DIR` 是当前默认入口，默认由 `DEFAULT_INJURY_VARIANT` 决定。
+
+做主副驾数据源消融时，通常先生成三套 processed `.pt`，再只切换 `DEFAULT_INJURY_VARIANT`：
+
+```python
+DEFAULT_INJURY_VARIANT = "combined"   # 主副驾合训
+DEFAULT_INJURY_VARIANT = "driver"     # 仅主驾训练/评估
+DEFAULT_INJURY_VARIANT = "passenger"  # 仅副驾训练/评估
+```
 
 ## 4. 数据准备
 
@@ -45,7 +58,7 @@ python -m prepare_data
 python -m InjuryPredict.Injurydata_prepare
 ```
 
-默认会读取 `common.settings.INJURY_SPLIT_DIR`，并把 `.pt` 文件写入 `common.settings.INJURY_PROCESSED_DIR`，两者都对应 `combined` 视角。
+默认会读取 `common.settings.INJURY_SPLIT_DIR`，并把 `.pt` 文件写入 `common.settings.INJURY_PROCESSED_DIR`。这两个目录都由 `common.settings.DEFAULT_INJURY_VARIANT` 决定，默认是 `combined`。
 
  processed `.pt` 会同时保存两种波形源：
 
@@ -205,8 +218,7 @@ lambda_feat = lambda_feat_max * 4 * alpha * (1 - alpha)
 
 - `*/InjuryMetrics/accu_head`、`accu_chest`、`accu_neck`：先分别用 `AIS_cal_head`、`AIS_cal_chest`、`AIS_cal_neck` 将 HIC、Dmax、Nij 换算为 AIS 等级，再计算分类准确率。
 - `*/InjuryMetrics/accu_mais`：六分类 MAIS 准确率，MAIS 由头、胸、颈三处 AIS 的最大值得到。
-- `*/InjuryMetrics/accu_mais_3c`：三分类 MAIS 准确率，代码来源是 `get_mais_3c_metrics(...)`。
-- `*/InjuryMetrics/g_mean_head`、`g_mean_chest`、`g_mean_neck`、`g_mean_mais`、`g_mean_mais_3c`：对应 AIS/MAIS 分类的 multiclass geometric mean，用于在类别不均衡时观察各类别召回率的综合表现。
+- `*/InjuryMetrics/accu_mais_3c`：三分类 MAIS 准确率，代码来源是 `convert_mais_to_3c(...)` 与 `accuracy_score(...)`。
 - `*/InjuryMetrics/mae_hic`、`mae_dmax`、`mae_nij`：HIC、Dmax、Nij 的平均绝对误差。
 - `*/InjuryMetrics/rmse_hic`、`rmse_dmax`、`rmse_nij`：HIC、Dmax、Nij 的均方根误差。
 - `*/InjuryMetrics/r2_hic`、`r2_dmax`、`r2_nij`：HIC、Dmax、Nij 的决定系数。

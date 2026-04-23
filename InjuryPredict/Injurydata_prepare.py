@@ -28,7 +28,9 @@ from torch.utils.data import Dataset, Subset
 import matplotlib.pyplot as plt
 
 from common.settings import (
+    DEFAULT_INJURY_VARIANT,
     FEATURE_ORDER,
+    INJURY_SPLIT_VARIANTS,
     NORMALIZATION_CONFIG_PATH,
     RAW_DATA,
     WAVEFORM_LENGTH,
@@ -55,9 +57,9 @@ def main(argv=None):
     )
     p.add_argument(
         "--split-variant",
-        choices=["combined", "driver", "passenger"],
-        default="combined",
-        help="选择使用哪一套 injury 划分结果；默认使用 combined。",
+        choices=INJURY_SPLIT_VARIANTS,
+        default=DEFAULT_INJURY_VARIANT,
+        help="选择使用哪一套 injury 划分结果；默认跟随 common.settings.DEFAULT_INJURY_VARIANT。",
     )
     # 以下路径参数均支持绝对路径或相对路径。
     p.add_argument(
@@ -448,7 +450,7 @@ def build_and_save_splits(
     
     # 7) 计算并保存统计信息 + 绘图
     summary = _compute_and_save_statistics(dataset, train_idx, val_idx, test_idx, paths["figs"])
-    default_entry_reads_this_dir = out_dir.resolve() == get_injury_processed_dir("combined").resolve()
+    default_entry_reads_this_dir = out_dir.resolve() == get_injury_processed_dir(DEFAULT_INJURY_VARIANT).resolve()
     summary.update(
         {
             "raw_packed_path": str(raw_packed.resolve()),

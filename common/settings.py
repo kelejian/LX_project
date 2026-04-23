@@ -6,6 +6,10 @@ from typing import Iterable, Optional
 设计原则：
 1. 集中维护跨子项目共享的特征顺序、目录结构和命名规则，避免路径硬编码分散到各脚本。
 2. 路径对象统一返回 `pathlib.Path`，由调用方决定是否转换为绝对路径字符串。
+
+路径命名约定：
+- `*_ROOT_DIR` 表示“容器目录”，其下通常还有 combined / driver / passenger 等子目录。
+- 不带 `ROOT` 的 `*_DIR` 表示当前默认入口，供未显式传入目录的训练、评估或读取函数使用。
 """
 
 
@@ -95,6 +99,7 @@ NORMALIZATION_CONFIG_PATH = DATA_DIR / "normalization_config.json"
 
 # split 目录固定为：data/split_indices/injury/<variant>/ 和 data/split_indices/pulse/。
 SPLIT_ROOT_DIR = DATA_DIR / "split_indices"
+# injury split 的容器目录，本身不直接存放 injury_train_indices.csv。
 INJURY_SPLIT_ROOT_DIR = SPLIT_ROOT_DIR / "injury"
 PULSE_SPLIT_DIR = SPLIT_ROOT_DIR / "pulse"
 
@@ -104,8 +109,20 @@ INJURY_SPLIT_VARIANTS = ("combined", "driver", "passenger")
 # 当前项目只承认这三种数据划分名称。
 SPLIT_PARTITIONS = ("train", "val", "test")
 
-# `combined` 是 InjuryPredict 与 ARS_optim 的默认工作视角。
-INJURY_SPLIT_DIR = INJURY_SPLIT_ROOT_DIR / "combined"
+# 当前默认 injury 视角。做主副驾消融时，优先只改这里：
+# - combined: 主副驾合训 / 合并评估入口
+# - driver: 仅主驾训练评估入口
+# - passenger: 仅副驾训练评估入口
+DEFAULT_INJURY_VARIANT = "combined"
+if DEFAULT_INJURY_VARIANT not in INJURY_SPLIT_VARIANTS:
+    raise ValueError(
+        f"DEFAULT_INJURY_VARIANT={DEFAULT_INJURY_VARIANT!r} is invalid, "
+        f"expected one of {INJURY_SPLIT_VARIANTS}"
+    )
+
+# 当前默认 injury split 目录，只包含一套视角下的 train/val/test 索引文件。
+# 需要非默认 split 时，推荐显式调用 get_injury_split_dir("driver"/"passenger"/"combined")。
+INJURY_SPLIT_DIR = INJURY_SPLIT_ROOT_DIR / DEFAULT_INJURY_VARIANT
 
 
 def _validate_split_name(split_name: str) -> str:
@@ -127,7 +144,7 @@ def _validate_injury_split_variant(variant: str) -> str:
 
 
 def get_injury_split_dir(
-    variant: str = "combined",
+    variant: str = DEFAULT_INJURY_VARIANT,
     split_root: Optional[Path] = None,
 ) -> Path:
     """返回 injury 任务某一套划分结果所在目录。
@@ -153,6 +170,8 @@ def get_pulse_split_dir(split_root: Optional[Path] = None) -> Path:
 def _default_split_dir_from_prefix(prefix: str) -> Path:
     prefix = str(prefix)
     if prefix == "injury":
+        # get_split_indices_path("injury", ...) 的无参默认入口。
+        # 非默认视角请传入 split_dir=get_injury_split_dir(<variant>)，避免隐式读取错目录。
         return INJURY_SPLIT_DIR
     if prefix == "pulse":
         return PULSE_SPLIT_DIR
@@ -201,15 +220,16 @@ def get_split_case_ids_path(
 # InjuryPredict 处理后数据目录
 # ================================================================
 
-# InjuryPredict 的 `.pt` 子集文件统一写在 data/processed/injury/<variant>/ 下。
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
+# InjuryPredict processed 数据的容器目录，本身不直接存放 train_dataset.pt。
 INJURY_PROCESSED_ROOT_DIR = PROCESSED_DATA_DIR / "injury"
-# InjuryPredict 的所有训练评估脚本，在没有显式传入 processed_dir 时，都会默认从 INJURY_PROCESSED_DIR 这里读取 `.pt` 子集文件。
-INJURY_PROCESSED_DIR = INJURY_PROCESSED_ROOT_DIR / "combined" 
+# InjuryPredict 的所有训练评估脚本，在没有显式传入 processed_dir 时，都会默认从这里读取 `.pt` 子集文件。
+# 它与 DEFAULT_INJURY_VARIANT 同步，避免 split 默认视角和 processed 默认视角不一致。
+INJURY_PROCESSED_DIR = INJURY_PROCESSED_ROOT_DIR / DEFAULT_INJURY_VARIANT
 
 
 def get_injury_processed_dir(
-    variant: str = "combined",
+    variant: str = DEFAULT_INJURY_VARIANT,
     processed_root: Optional[Path] = None,
 ) -> Path:
     """返回 InjuryPredict 在指定视角下的处理后数据目录。
@@ -232,6 +252,9 @@ def get_injury_processed_dataset_path(
     processed_dir: Optional[Path] = None,
 ) -> Path:
     """返回 InjuryPredict 某个 split 对应的 `.pt` 文件路径。
+
+    训练和评估入口通常不传 `processed_dir`，此时使用当前默认的
+    `INJURY_PROCESSED_DIR`；需要临时读取其他视角时再显式传入目录。
 
     命名约定：
     - train_dataset.pt
@@ -263,15 +286,11 @@ def ensure_dirs(paths: Optional[Iterable[Path]] = None) -> None:
         SPLIT_ROOT_DIR,
         INJURY_SPLIT_ROOT_DIR,
         PULSE_SPLIT_DIR,
-        get_injury_split_dir("combined"),
-        get_injury_split_dir("driver"),
-        get_injury_split_dir("passenger"),
         PROCESSED_DATA_DIR,
         INJURY_PROCESSED_ROOT_DIR,
-        get_injury_processed_dir("combined"),
-        get_injury_processed_dir("driver"),
-        get_injury_processed_dir("passenger"),
     ]
+    required_dirs.extend(get_injury_split_dir(variant) for variant in INJURY_SPLIT_VARIANTS)
+    required_dirs.extend(get_injury_processed_dir(variant) for variant in INJURY_SPLIT_VARIANTS)
     if paths:
         required_dirs.extend(Path(path) for path in paths)
 

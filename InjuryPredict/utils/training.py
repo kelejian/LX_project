@@ -12,13 +12,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from imblearn.metrics import geometric_mean_score
 from sklearn.metrics import accuracy_score, mean_absolute_error, r2_score, root_mean_squared_error
 from torch.utils.data import ConcatDataset, Subset
 
 from common.metrics.injury_risk import AIS_cal_head, AIS_cal_chest, AIS_cal_neck
 from InjuryPredict.utils.loss import FeatureConsistencyLoss, OutputConsistencyLoss
-from InjuryPredict.utils.tools import get_mais_3c_metrics, get_parameter_groups
+from InjuryPredict.utils.tools import convert_mais_to_3c, get_parameter_groups
 
 
 BATCH_KEYS = (
@@ -42,11 +41,6 @@ INJURY_METRIC_KEYS = (
     "accu_neck",
     "accu_mais",
     "accu_mais_3c",
-    "g_mean_head",
-    "g_mean_chest",
-    "g_mean_neck",
-    "g_mean_mais",
-    "g_mean_mais_3c",
     "mae_hic",
     "mae_dmax",
     "mae_nij",
@@ -285,20 +279,15 @@ def _collect_common_outputs(
     true_ais_neck = np.concatenate(all_true_ais_neck)
     true_mais = np.concatenate(all_true_mais)
     mais_pred = np.maximum.reduce([ais_head_pred, ais_chest_pred, ais_neck_pred])
-    mais_metrics_3c = get_mais_3c_metrics(true_mais, mais_pred)
-    ais_labels = list(range(6))
+    true_mais_3c = convert_mais_to_3c(true_mais)
+    pred_mais_3c = convert_mais_to_3c(mais_pred)
 
     return {
         'accu_head': accuracy_score(true_ais_head, ais_head_pred) * 100,
         'accu_chest': accuracy_score(true_ais_chest, ais_chest_pred) * 100,
         'accu_neck': accuracy_score(true_ais_neck, ais_neck_pred) * 100,
         'accu_mais': accuracy_score(true_mais, mais_pred) * 100,
-        'accu_mais_3c': mais_metrics_3c['accuracy'],
-        'g_mean_head': geometric_mean_score(true_ais_head, ais_head_pred, labels=ais_labels, average='multiclass'),
-        'g_mean_chest': geometric_mean_score(true_ais_chest, ais_chest_pred, labels=ais_labels, average='multiclass'),
-        'g_mean_neck': geometric_mean_score(true_ais_neck, ais_neck_pred, labels=ais_labels, average='multiclass'),
-        'g_mean_mais': geometric_mean_score(true_mais, mais_pred, labels=ais_labels, average='multiclass'),
-        'g_mean_mais_3c': mais_metrics_3c['g_mean'],
+        'accu_mais_3c': accuracy_score(true_mais_3c, pred_mais_3c) * 100,
         'mae_hic': mean_absolute_error(true_hic, pred_hic),
         'rmse_hic': root_mean_squared_error(true_hic, pred_hic),
         'mae_dmax': mean_absolute_error(true_dmax, pred_dmax),
