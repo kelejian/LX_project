@@ -124,6 +124,9 @@ def get_curriculum_state(epoch_idx: int, phase_epochs: Dict[str, int], curriculu
     """根据 0-based epoch 生成当前课程阶段与损失调度系数。"""
     warmup = phase_epochs["warmup"]
     transition = phase_epochs["transition"]
+    output_consistency = dict(curriculum_params.get("output_consistency", {}))
+    feature_consistency = dict(curriculum_params.get("feature_consistency", {}))
+    feature_consistency_enabled = bool(feature_consistency.get("enabled", True))
 
     # α=0 表示完全使用真值波形分支损失，α=1 表示完全使用预测波形分支损失，过渡阶段平滑调整两者权重以缓冲域切换冲击。
     if epoch_idx < warmup:
@@ -145,7 +148,9 @@ def get_curriculum_state(epoch_idx: int, phase_epochs: Dict[str, int], curriculu
         "phase": phase,
         "alpha": float(alpha),
         "lambda_out": float(curriculum_params.get("lambda_out_max", 0.0)) * bell,
-        "lambda_feat": float(curriculum_params.get("lambda_feat_max", 0.0)) * bell,
+        "lambda_feat": (float(curriculum_params.get("lambda_feat_max", 0.0)) * bell) if feature_consistency_enabled else 0.0,
+        "output_consistency": output_consistency,
+        "feature_consistency": feature_consistency,
     }
 
 
@@ -328,7 +333,11 @@ def run_one_epoch(
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
     output_consistency_loss = OutputConsistencyLoss()
-    feature_consistency_loss = FeatureConsistencyLoss()
+    output_consistency_params = (curriculum_state or {}).get("output_consistency", {})
+    feature_consistency_params = (curriculum_state or {}).get("feature_consistency", {})
+    feature_consistency_loss = FeatureConsistencyLoss(
+        normalize=feature_consistency_params.get("normalize", None),
+    )
 
     loss_batch = []
     component_values: Dict[str, list] = {}
@@ -365,8 +374,15 @@ def run_one_epoch(
                     # 训练流程负责选择“只对齐波形编码器输出”这一结构边界，loss.py 中的损失项只接收已选好的张量。
                     feat_gt_wave = enc_gt[:, :wave_dim] # [B, F] -> [B, wave_feature_dim]
                     feat_pred_wave = enc_pred[:, :wave_dim] # [B, F] -> [B, wave_feature_dim]
-                    out_cons_loss = output_consistency_loss(pred_gt.detach(), pred_pred, output_consistency_weights)
-                    feat_cons_loss = feature_consistency_loss(feat_gt_wave, feat_pred_wave)
+                    output_reference = pred_gt.detach() if output_consistency_params.get("stop_gradient", True) else pred_gt
+                    out_cons_loss = output_consistency_loss(output_reference, pred_pred, output_consistency_weights)
+                    feature_enabled = bool(feature_consistency_params.get("enabled", True))
+                    if feature_enabled:
+                        # 根据 feature_consistency_params 决定 feat_gt_wave 是否参与反向传播；如果 stop_gradient=True 则 detach 后的 feat_gt_wave 不会计算梯度，反之则参与梯度计算。
+                        feature_reference = feat_gt_wave.detach() if feature_consistency_params.get("stop_gradient", False) else feat_gt_wave
+                        feat_cons_loss = feature_consistency_loss(feature_reference, feat_pred_wave)
+                    else:
+                        feat_cons_loss = pred_pred.new_tensor(0.0)
                     # transition 阶段的总损失由两路主任务损失和两个一致性正则组成，其中 out_cons_loss 与 feat_cons_loss 记录的是尚未乘 lambda 的原始正则值。
                     loss = (
                         (1.0 - alpha) * main_gt_loss
@@ -453,6 +469,7 @@ def recalibrate_batchnorm(model: nn.Module, loader, device: torch.device) -> int
     """
     original_modes = {module: module.training for module in model.modules()}
     original_requires_grad = [param.requires_grad for param in model.parameters()]
+    bn_momentums = {}
 
     # 禁止所有参数梯度，并配合 torch.no_grad()，确保重校准不会产生反向传播或优化器更新。
     for param in model.parameters():
@@ -460,6 +477,10 @@ def recalibrate_batchnorm(model: nn.Module, loader, device: torch.device) -> int
     model.eval()
     for module in model.modules():
         if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            # 重置后使用 cumulative moving average，避免默认 momentum=0.1 使统计量偏向遍历末尾的 batch。
+            module.reset_running_stats()
+            bn_momentums[module] = module.momentum
+            module.momentum = None
             # 只有 BatchNorm 需要 train 模式来更新 running statistics；Dropout 等随机层仍保持 eval，避免引入额外随机性。
             module.train()
         elif isinstance(module, nn.Dropout):
@@ -477,6 +498,8 @@ def recalibrate_batchnorm(model: nn.Module, loader, device: torch.device) -> int
             processed_batches += 1
 
     # 恢复调用前的训练/验证模式和参数 requires_grad 状态，避免重校准函数对外部训练流程产生副作用。
+    for module, momentum in bn_momentums.items():
+        module.momentum = momentum
     for module, was_training in original_modes.items():
         module.train(was_training)
     for param, requires_grad in zip(model.parameters(), original_requires_grad):

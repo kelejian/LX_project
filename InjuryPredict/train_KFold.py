@@ -29,9 +29,9 @@ from common.settings import INJURY_PROCESSED_DIR, get_injury_processed_dataset_p
 from InjuryPredict.utils import models
 from InjuryPredict.Injurydata_prepare import load_processed_subset
 from InjuryPredict.utils.loss import InjuryKendallMultiTaskLoss
-from InjuryPredict.utils.tools import build_metric_trackers, round_float_fields, convert_numpy_types
+from InjuryPredict.utils.tools import build_single_metric_trackers, round_float_fields, convert_numpy_types
 from InjuryPredict.utils.tools import get_regression_metrics, get_classification_metrics, get_mais_3c_metrics, MAIS_3C_DISPLAY_LABELS, plot_scatter, plot_confusion_matrix
-from InjuryPredict.config import RUNS_DIR, curriculum_params, training_params, loss_params, model_params, kfold_params
+from InjuryPredict.config import RUNS_DIR, curriculum_params, training_params, loss_params, model_params, model_selection_params, kfold_params
 from InjuryPredict.utils.training import (
     build_injury_optimizer,
     compute_output_consistency_weights,
@@ -204,17 +204,13 @@ if __name__ == "__main__":
 
     # K-Fold 设置
     K = int(kfold_params['K'])
-    val_metrics_to_track = kfold_params['val_metrics_to_track']
     
     # 构建指标跟踪器
-    # val_metrics_to_track 中的指标名必须能在 run_one_epoch(..., optimizer=None) 返回的 val_metrics 字典中找到。
+    # K-Fold 汇总逻辑以单指标 best 权重为统计单元，因此这里复用 model_selection_params 中的 single_metric_trackers。
     # metric_trackers 是所有 fold 共用的静态规则表。key 为 run_one_epoch 返回的验证指标名；value 包含 compare_indicator、initial_value、is_better、model_filename、display_name。
-    metric_trackers = build_metric_trackers(
-        val_metrics_to_track,
-        model_filename_fn=lambda metric_name: f"best_val_{metric_name}.pth",
-    )
+    metric_trackers = build_single_metric_trackers(model_selection_params.get("single_metric_trackers", []))
     if not metric_trackers:
-        raise ValueError("val_metrics_to_track 不能为空。")
+        raise ValueError("model_selection_params.single_metric_trackers 不能为空。")
     tracked_metric_names = [tracker['display_name'] for tracker in metric_trackers.values()]
     print(f"将跟踪以下验证指标: {tracked_metric_names}")
     if metric_selection_start_epoch > 1:
@@ -314,16 +310,16 @@ if __name__ == "__main__":
             "pulse_prediction": getattr(full_processed_dataset, "pulse_prediction_meta", None),
             "total_samples_for_kfold": len(combined_indices),
             "k_value": K,
-            "val_metrics_to_track": val_metrics_to_track  # 记录所有跟踪的指标
+            "single_metric_trackers": model_selection_params.get("single_metric_trackers", []),
         },
         "hyperparameters": { # 记录使用的超参数
              "training": {
                 **training_params,
                 "Patience": Patience,
-                "val_metrics_to_track": val_metrics_to_track,
             },
             "loss": loss_params,
             "curriculum": curriculum_params,
+            "model_selection_params": model_selection_params,
             "lr_scheduler": {
                 "type": "CosineAnnealingLR",
                 "T_max": Epochs,
@@ -437,7 +433,7 @@ if __name__ == "__main__":
             val_metrics = run_one_epoch(model, val_loader_k, criterion, device, optimizer=None)
             missing_metrics = [name for name in metric_trackers.keys() if name not in val_metrics]
             if missing_metrics:
-                raise KeyError(f"val_metrics_to_track 中存在无效指标: {missing_metrics}")
+                raise KeyError(f"model_selection_params.single_metric_trackers 中存在无效验证指标: {missing_metrics}")
 
             # 打印当前 Fold 的 Epoch 信息
             metric_strs = [

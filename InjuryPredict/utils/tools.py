@@ -20,12 +20,12 @@ def get_regression_metrics(y_true, y_pred):
     }
 
 
-def get_classification_metrics(y_true, y_pred, labels, context_hint: str = "the data"):
+def get_classification_metrics(y_true, y_pred, labels, context_hint: str = "the data", warn_missing_labels: bool = True):
     """计算并返回一组分类指标。"""
     present_labels = set(np.unique(np.concatenate([y_true, y_pred])))
     missing_labels = set(labels) - present_labels
 
-    if missing_labels:
+    if warn_missing_labels and missing_labels:
         print(f"\n*Warning: Labels {missing_labels} are not present in {context_hint}\n")
 
     return {
@@ -45,11 +45,17 @@ def convert_mais_to_3c(y):
     return np.where(y <= 0, 0, np.where(y <= 2, 1, 2))
 
 
-def get_mais_3c_metrics(y_true, y_pred, context_hint: str = "the data"):
+def get_mais_3c_metrics(y_true, y_pred, context_hint: str = "the data", warn_missing_labels: bool = True):
     """基于 MAIS 原始分级计算三分类指标。"""
     y_true_3c = convert_mais_to_3c(y_true)
     y_pred_3c = convert_mais_to_3c(y_pred)
-    metrics = get_classification_metrics(y_true_3c, y_pred_3c, MAIS_3C_LABELS, context_hint=context_hint)
+    metrics = get_classification_metrics(
+        y_true_3c,
+        y_pred_3c,
+        MAIS_3C_LABELS,
+        context_hint=context_hint,
+        warn_missing_labels=warn_missing_labels,
+    )
     metrics['mapped_y_true'] = y_true_3c
     metrics['mapped_y_pred'] = y_pred_3c
     return metrics
@@ -109,61 +115,135 @@ def plot_confusion_matrix(cm, labels, title, save_path):
     plt.close()
 
 
-def get_compare_func(func_indicator):
-    """根据配置中的比较指示器返回比较函数、初始值和判优函数。"""
-    if func_indicator == max or (isinstance(func_indicator, str) and func_indicator.lower() == 'max'):
+def get_compare_func(compare_mode: str):
+    """根据 'max' 或 'min' 返回比较函数、初始值和判优函数。"""
+    if compare_mode == 'max':
         return max, float('-inf'), lambda curr, best: curr > best # lambda curr, best: curr > best 是一个匿名函数，用于比较当前值和最佳值，返回 True 如果当前值更优（更大），否则返回 False。
-    return min, float('inf'), lambda curr, best: curr < best
+    if compare_mode == 'min':
+        return min, float('inf'), lambda curr, best: curr < best
+    raise ValueError(f"无效的比较方式: {compare_mode}.")
 
 
-def build_metric_trackers(metrics_to_track, model_filename_fn=None):
+def normalize_val_metric_name(metric_name: str) -> str:
+    """将配置层指标名规范化为 run_one_epoch 返回的验证指标 key。"""
+    metric_key = str(metric_name).strip()
+    metric_key = metric_key[4:] if metric_key.startswith('val_') else metric_key
+    if metric_key not in AVAILABLE_VAL_METRIC_NAMES:
+        raise ValueError(
+            f"无效的验证指标名: {metric_name}. "
+            f"可选项: {list(AVAILABLE_VAL_METRIC_NAMES)}"
+        )
+    return metric_key
+
+
+def normalize_compare_mode(compare_indicator: str) -> str:
+    """将配置中的字符串比较方式统一为 'max' / 'min'。"""
+    if isinstance(compare_indicator, str):
+        compare_mode = compare_indicator.lower().strip()
+        if compare_mode in ('max', 'min'):
+            return compare_mode
+    raise ValueError(f"无效的比较方式: {compare_indicator}. 仅支持 'max' 或 'min'.")
+
+
+def _is_metric_value_better(current_value: float, best_value: float, compare_mode: str, min_delta: float = 0.0) -> bool:
+    """按方向和最小改进幅度判断单个指标是否明确优于历史最优值。"""
+    current_value = float(current_value)
+    best_value = float(best_value)
+    min_delta = float(min_delta)
+    if compare_mode == 'max':
+        return current_value - best_value > min_delta
+    if compare_mode == 'min':
+        return best_value - current_value > min_delta
+    raise ValueError(f"无效的比较方式: {compare_mode}.")
+
+
+def build_single_metric_trackers(metric_configs, model_filename_fn=None):
     """
-    根据配置构建验证指标的静态跟踪规则表。
+    构建单指标验证集选模规则。
 
-    返回字典的 key 是去掉可选 `val_` 前缀后的指标名，必须对应 run_one_epoch 返回字典中的验证阶段 key；value 只保存判优方向、初始值、判优函数和权重文件名，不保存训练过程中不断变化的 best value。
-
-    value 字段含义:
-        compare_indicator: 字符串 'max' 或 'min'，表示该指标越大越优或越小越优。
-        initial_value: 动态状态初始化时使用的哨兵值，'max' 对应 -inf，'min' 对应 +inf。
-        is_better: 判优函数，输入 (current_value, best_value)，返回当前值是否优于历史最优值。
-        model_filename: 当前指标刷新最优值时保存的权重文件名。
-        display_name: 日志打印使用的验证指标显示名，格式为 val/<metric_key>。
+    metric_configs 中的每个条目必须包含 name 与 mode；filename 可选，未提供时按指标名生成默认权重文件名。
     """
     if model_filename_fn is None:
         model_filename_fn = lambda metric_name: f"best_val_{metric_name}.pth"
 
     trackers = {}
-    for metric_name, compare_indicator in metrics_to_track:
-        raw_metric_name = str(metric_name).strip()
-        # 配置层允许写 "val_xxx" 以强调验证集语义；训练循环读取 val_metrics 时使用去前缀后的真实 key。
-        metric_key = raw_metric_name[4:] if raw_metric_name.startswith('val_') else raw_metric_name
-        if metric_key not in AVAILABLE_VAL_METRIC_NAMES:
-            raise ValueError(
-                f"无效的验证指标名: {metric_name}. "
-                f"可选项: {list(AVAILABLE_VAL_METRIC_NAMES)}"
-            )
+    for item in metric_configs:
+        if not isinstance(item, dict):
+            raise TypeError("single_metric_trackers 的每个条目必须是包含 name/mode/filename 的字典。")
+        raw_metric_name = item["name"]
+        compare_indicator = item["mode"]
+        explicit_filename = item.get("filename")
 
-        if compare_indicator in (max, min):
-            compare_mode = 'max' if compare_indicator == max else 'min'
-        elif isinstance(compare_indicator, str):
-            compare_mode = compare_indicator.lower().strip()
-        else:
-            raise ValueError(f"无效的比较方式: {compare_indicator}. 仅支持 'max' 或 'min'.")
-
-        if compare_mode not in ('max', 'min'):
-            raise ValueError(f"无效的比较方式: {compare_indicator}. 仅支持 'max' 或 'min'.")
-
-        _, initial_value, is_better = get_compare_func(compare_indicator)
-        # tracker 是“静态规则”：训练循环会据此初始化 metric_states，并在每个 epoch 后更新动态最优值。
+        metric_key = normalize_val_metric_name(raw_metric_name)
+        compare_mode = normalize_compare_mode(compare_indicator)
+        _, initial_value, is_better = get_compare_func(compare_mode)
         trackers[metric_key] = {
+            'kind': 'single',
+            'metric_key': metric_key,
             'compare_indicator': compare_mode,
             'initial_value': initial_value,
             'is_better': is_better,
-            'model_filename': model_filename_fn(metric_key),
+            'model_filename': explicit_filename or model_filename_fn(metric_key),
             'display_name': f"val/{metric_key}",
         }
     return trackers
 
+
+def build_composite_metric_trackers(composite_configs):
+    """根据优先级列表构建复合验证集选模规则。"""
+    trackers = {}
+    for item in composite_configs:
+        tracker_name = str(item["name"]).strip()
+        if not tracker_name:
+            raise ValueError("复合选模规则的 name 不能为空。")
+        if tracker_name in trackers:
+            raise ValueError(f"复合选模规则名称重复: {tracker_name}")
+
+        priority = []
+        for rule in item.get("priority", []):
+            priority.append({
+                "metric_key": normalize_val_metric_name(rule["metric"]),
+                "compare_indicator": normalize_compare_mode(rule["mode"]),
+                "min_delta": float(rule.get("min_delta", 0.0)),
+            })
+        if not priority:
+            raise ValueError(f"复合选模规则 {tracker_name} 必须包含至少一个 priority 条目。")
+
+        trackers[tracker_name] = {
+            'kind': 'composite',
+            'name': tracker_name,
+            'priority': priority,
+            'model_filename': item.get("filename", f"best_val_{tracker_name}.pth"),
+            'display_name': f"val/{tracker_name}",
+        }
+    return trackers
+
+
+def is_composite_better(current_metrics: dict, best_metrics: dict | None, priority: list) -> bool:
+    """
+    按固定优先级列表判断当前验证指标是否优于历史最优快照。
+
+    每一级指标只有超过 min_delta 时才产生明确优劣；若该级无明确差异，则继续比较下一优先级。
+    """
+    if best_metrics is None:
+        return True
+
+    for rule in priority:
+        metric_key = rule["metric_key"]
+        compare_mode = rule["compare_indicator"]
+        min_delta = float(rule.get("min_delta", 0.0))
+        if metric_key not in current_metrics:
+            raise KeyError(f"当前验证指标缺少复合选模所需字段: {metric_key}")
+        if metric_key not in best_metrics:
+            raise KeyError(f"历史最优指标快照缺少复合选模所需字段: {metric_key}")
+
+        current_value = float(current_metrics[metric_key])
+        best_value = float(best_metrics[metric_key])
+        if _is_metric_value_better(current_value, best_value, compare_mode, min_delta):
+            return True
+        if _is_metric_value_better(best_value, current_value, compare_mode, min_delta):
+            return False
+    return False
 
 def get_parameter_groups(model, weight_decay=1e-2, head_decay_ratio=0.1, head_keywords=('head',), verbose=True):
     """

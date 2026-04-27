@@ -2,9 +2,6 @@
 ARS_codetask_prompt.md
 Injprompt.md
 data/
-data_*/
-data_PS/
-data_DS/
 # data/processed/
 # data/inference_outputs/
 # data/raw_packed/

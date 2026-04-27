@@ -110,8 +110,8 @@ def parse_args():
         type=str,
         help="evaluation_results.csv 路径；绝对路径或相对路径均可",
     )
-    parser.add_argument("--case_ids", nargs="*", default=None, help="显式指定需要绘图的 case_id 列表")
-    parser.add_argument("--topn_joint_risk", type=int, default=0, help="按 JointRisk 降幅选择前 N 个 case 绘图")
+    parser.add_argument("--case_ids", nargs="*", default=None, help="显式指定需要绘图的 case_id 列表, e.g. --case_ids 1 2 3")
+    parser.add_argument("--topn_joint_risk", type=int, default=0, help="按 JointRisk 降幅选择前 N 个 case 绘图, e.g. --topn_joint_risk 10；当值 <= 0 时不启用该选项")
     parser.add_argument("--dpi", type=int, default=180, help="输出图片 DPI")
     return parser.parse_args()
 

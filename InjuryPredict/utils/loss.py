@@ -202,7 +202,7 @@ class InjuryKendallMultiTaskLoss(nn.Module):
             task_losses["dmax_loss"],
             task_losses["nij_loss"],
         ]) # [标量, 标量, 标量] -> [3]
-        precision = torch.exp(-self.log_vars) # (3,)，Kendall 的自适应系数: 方差越小，精度越高/该任务损失权重越大
+        precision = torch.exp(-self.log_vars) # (3,)，Kendall 的自适应系数: 方差越小，精度越高/该任务损失权重越大，即 precision 越大
         return torch.sum(self.task_priors * (0.5 * precision * raw_losses + 0.5 * self.log_vars)) # 标量
 
     def forward(self, pred, true, ot=None, return_components=False):
@@ -258,8 +258,9 @@ class OutputConsistencyLoss(nn.Module):
     输入应由训练流程显式提供：
     - `reference_pred`: 参考输出，通常为真值波形分支预测且已在调用侧执行 stop-gradient。
     - `target_pred`: 需要被约束的目标输出，通常为预测波形分支预测。
-    - `output_weights`: 三个损伤输出的尺度归一化权重，形状可广播到 `(B, 3)`。
+    - `output_weights`: 三个损伤输出的全局尺度归一化权重，通常由训练集标签标准差的倒数给出，形状可广播到 `(B, 3)`。
 
+    `output_weights` 用于消除 HIC、Dmax、Nij 物理量纲和数值尺度差异，避免 HIC 等大数值任务在输出一致性正则中天然占优。
     该类不直接读取模型结构或切片特征，避免损失定义与 InjuryPredict 的内部表示耦合。
     """
 
@@ -280,8 +281,27 @@ class FeatureConsistencyLoss(nn.Module):
     两个波形源分支的波形编码器特征一致性损失。
 
     调用侧负责传入已经选定的特征张量，例如只传入 TCN 波形编码器输出，而不是融合后特征或解码器特征。
-    这样可以把“对齐哪一层”的模型结构决策保留在训练流程中，损失项本身只表达 L1 一致性度量。
+    这样可以把“对齐哪一层”的模型结构决策保留在训练流程中，损失项本身只表达受控的 L1 一致性度量。
+
+    normalize='sample_layernorm' 表示对每个样本的特征向量在特征维上做无可学习参数的标准化，再计算两路特征的 L1 距离。
+    该归一化只作用于特征一致性正则，不改变模型前向输出；其目的在于约束两种波形源的相对激活模式，而不是强制隐藏特征的绝对幅值完全相同。
+    这与 OutputConsistencyLoss 中按标签标准差构造的输出尺度归一化不同：前者是样本内隐藏特征归一化，后者是跨任务物理输出尺度归一化。
     """
+
+    def __init__(self, normalize: str | None = None, eps: float = 1e-6):
+        super().__init__()
+        self.normalize = "none" if normalize is None else str(normalize).lower().strip()
+        self.eps = float(eps)
+        if self.normalize not in ("none", "sample_layernorm"):
+            raise ValueError("FeatureConsistencyLoss.normalize 仅支持 None/'none' 或 'sample_layernorm'。")
+
+    def _normalize_feature(self, feature):
+        if self.normalize == "none":
+            return feature
+        # sample_layernorm 在每个样本内部沿特征维计算均值和标准差，因此不会引入跨样本统计量或可学习参数。
+        mean = feature.mean(dim=1, keepdim=True) # [B, F] -> [B, 1]
+        std = feature.std(dim=1, keepdim=True, unbiased=False).clamp_min(self.eps) # [B, F] -> [B, 1]
+        return (feature - mean) / std # [B, F] -> [B, F]
 
     def forward(self, reference_feature, target_feature):
         if reference_feature.shape != target_feature.shape:
@@ -290,6 +310,8 @@ class FeatureConsistencyLoss(nn.Module):
             )
         if reference_feature.ndim != 2:
             raise ValueError(f"特征一致性损失期望二维特征张量，实际为 {tuple(reference_feature.shape)}。")
+        reference_feature = self._normalize_feature(reference_feature)
+        target_feature = self._normalize_feature(target_feature)
         return torch.mean(torch.abs(reference_feature - target_feature))
 
 

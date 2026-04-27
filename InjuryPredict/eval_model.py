@@ -113,10 +113,11 @@ def evaluate_and_save_outputs(
     weight_label,
     total_params,
     trainset_size,
+    verbose=False,
 ):
     """计算指定样本集合的评估指标，并将报告与图表写入独立目录。"""
     if len(predictions) == 0:
-        print(f"跳过 {data_scope}: 样本数为 0。")
+        print(f"[{data_scope}] skipped: no samples.")
         return
 
     os.makedirs(output_dir, exist_ok=True)
@@ -132,38 +133,27 @@ def evaluate_and_save_outputs(
     AIS_head = AIS_cal_head(pred_hic)
     AIS_chest = AIS_cal_chest(pred_dmax, ot)
     AIS_neck = AIS_cal_neck(pred_nij)
-    print(f"[{data_scope}] processed {len(pred_hic)} samples for classification metrics.")
-    cls_metrics_head = get_classification_metrics(ground_truths['ais_head'], AIS_head, list(range(6)))
-    print(f"[{data_scope}] Head metrics: {cls_metrics_head['accuracy']:.2f}%")
-    cls_metrics_chest = get_classification_metrics(ground_truths['ais_chest'], AIS_chest, list(range(6)))
-    print(f"[{data_scope}] Chest metrics: {cls_metrics_chest['accuracy']:.2f}%")
-    cls_metrics_neck = get_classification_metrics(ground_truths['ais_neck'], AIS_neck, list(range(6)))
-    print(f"[{data_scope}] Neck metrics: {cls_metrics_neck['accuracy']:.2f}%")
+    cls_metrics_head = get_classification_metrics(ground_truths['ais_head'], AIS_head, list(range(6)), context_hint=data_scope, warn_missing_labels=verbose)
+    cls_metrics_chest = get_classification_metrics(ground_truths['ais_chest'], AIS_chest, list(range(6)), context_hint=data_scope, warn_missing_labels=verbose)
+    cls_metrics_neck = get_classification_metrics(ground_truths['ais_neck'], AIS_neck, list(range(6)), context_hint=data_scope, warn_missing_labels=verbose)
 
     mais_pred = np.maximum.reduce([AIS_head, AIS_chest, AIS_neck])
-    cls_metrics_mais = get_classification_metrics(ground_truths['mais'], mais_pred, list(range(6)))
-    cls_metrics_mais_3c = get_mais_3c_metrics(ground_truths['mais'], mais_pred)
+    cls_metrics_mais = get_classification_metrics(ground_truths['mais'], mais_pred, list(range(6)), context_hint=data_scope, warn_missing_labels=verbose)
+    cls_metrics_mais_3c = get_mais_3c_metrics(ground_truths['mais'], mais_pred, context_hint=data_scope, warn_missing_labels=verbose)
 
-    plot_scatter(true_hic, pred_hic, ground_truths['ais_head'], 'Head Injury Criterion (HIC)', 'HIC', os.path.join(output_dir, "scatter_plot_HIC.png"))
-    plot_scatter(true_dmax, pred_dmax, ground_truths['ais_chest'], 'Chest Displacement (Dmax)', 'Dmax (mm)', os.path.join(output_dir, "scatter_plot_Dmax.png"))
-    plot_scatter(true_nij, pred_nij, ground_truths['ais_neck'], 'Neck Injury Criterion (Nij)', 'Nij', os.path.join(output_dir, "scatter_plot_Nij.png"))
+    # 绘图时 HIC真值预测值截断到2000，胸压量均截断到70，Nij均截断到2.0
+    HIC_upper_func = lambda x: np.clip(x, 0, 2000)
+    Dmax_upper_func = lambda x: np.clip(x, 0, 70)
+    Nij_upper_func = lambda x: np.clip(x, 0, 2.0)
+    plot_scatter(HIC_upper_func(true_hic), HIC_upper_func(pred_hic), ground_truths['ais_head'], 'Head Injury Criterion (HIC)', 'HIC', os.path.join(output_dir, "scatter_plot_HIC.png"))
+    plot_scatter(Dmax_upper_func(true_dmax), Dmax_upper_func(pred_dmax), ground_truths['ais_chest'], 'Chest Displacement (Dmax)', 'Dmax (mm)', os.path.join(output_dir, "scatter_plot_Dmax.png"))
+    plot_scatter(Nij_upper_func(true_nij), Nij_upper_func(pred_nij), ground_truths['ais_neck'], 'Neck Injury Criterion (Nij)', 'Nij', os.path.join(output_dir, "scatter_plot_Nij.png"))
 
     plot_confusion_matrix(cls_metrics_head['conf_matrix'], list(range(6)), 'Confusion Matrix - AIS Head (6C)', os.path.join(output_dir, "cm_head_6c.png"))
     plot_confusion_matrix(cls_metrics_chest['conf_matrix'], list(range(6)), 'Confusion Matrix - AIS Chest (6C)', os.path.join(output_dir, "cm_chest_6c.png"))
     plot_confusion_matrix(cls_metrics_neck['conf_matrix'], list(range(6)), 'Confusion Matrix - AIS Neck (6C)', os.path.join(output_dir, "cm_neck_6c.png"))
     plot_confusion_matrix(cls_metrics_mais['conf_matrix'], list(range(6)), 'Confusion Matrix - MAIS (6C)', os.path.join(output_dir, "cm_mais_6c.png"))
     plot_confusion_matrix(cls_metrics_mais_3c['conf_matrix'], MAIS_3C_DISPLAY_LABELS, 'Confusion Matrix - MAIS (3C)', os.path.join(output_dir, "cm_mais_3c.png"))
-    print(f"[{data_scope}] All plots have been saved to {output_dir}")
-
-    print(f"\n--- Regression Metrics ({data_scope}) ---")
-    print(f"HIC - MAE: {reg_metrics_hic['mae']:.4f}, RMSE: {reg_metrics_hic['rmse']:.4f}, R²: {reg_metrics_hic['r2']:.4f}")
-    print(f"Dmax - MAE: {reg_metrics_dmax['mae']:.4f}, RMSE: {reg_metrics_dmax['rmse']:.4f}, R²: {reg_metrics_dmax['r2']:.4f}")
-    print(f"Nij - MAE: {reg_metrics_nij['mae']:.4f}, RMSE: {reg_metrics_nij['rmse']:.4f}, R²: {reg_metrics_nij['r2']:.4f}")
-    print(f"MAIS Accuracy (6C): {cls_metrics_mais['accuracy']:.2f}%")
-    print(f"MAIS Accuracy (3C): {cls_metrics_mais_3c['accuracy']:.2f}%")
-    print(f"Head AIS-6C Accuracy: {cls_metrics_head['accuracy']:.2f}%")
-    print(f"Chest AIS-6C Accuracy: {cls_metrics_chest['accuracy']:.2f}%")
-    print(f"Neck AIS-6C Accuracy: {cls_metrics_neck['accuracy']:.2f}%")
 
     markdown_content = f"""# Model Evaluation Report
 
@@ -204,7 +194,14 @@ def evaluate_and_save_outputs(
     with open(report_path, "w", encoding="utf-8") as md_file:
         md_file.write(markdown_content)
 
-    print(f"[{data_scope}] Comprehensive evaluation report saved to {report_path}")
+    print(
+        f"[{data_scope}] n={len(predictions)} | "
+        f"MAIS 6C={cls_metrics_mais['accuracy']:.2f}% | MAIS 3C={cls_metrics_mais_3c['accuracy']:.2f}% | "
+        f"HIC MAE/R2={reg_metrics_hic['mae']:.4f}/{reg_metrics_hic['r2']:.4f} | "
+        f"Dmax MAE/R2={reg_metrics_dmax['mae']:.4f}/{reg_metrics_dmax['r2']:.4f} | "
+        f"Nij MAE/R2={reg_metrics_nij['mae']:.4f}/{reg_metrics_nij['r2']:.4f} | "
+        f"report={report_path}"
+    )
 
 if __name__ == "__main__":
 
@@ -215,13 +212,16 @@ if __name__ == "__main__":
     parser.add_argument("--run_dir",
                         '-r',
                         type=str,
-                        default=r".\InjuryPredict\runs\InjuryPredictModel_04161405",
+                        default=r".\InjuryPredict\runs\InjuryPredictModel_05021735",
                         help="Directory of the training run to evaluate.")
     parser.add_argument("--weight_file",
                         '-w',
                         type=str,
-                        default="best_val_loss.pth",
+                        default="best_val_accu_mais.pth",
                         help="Name of the model weight file.")
+    parser.add_argument("--verbose",
+                        action="store_true",
+                        help="Print detailed classification warnings during evaluation.")
     args = parser.parse_args()
 
     record_path = os.path.join(args.run_dir, "TrainingRecord.json")
@@ -238,6 +238,7 @@ if __name__ == "__main__":
 
     model_params = training_record["hyperparameters"]["model"]
 
+    print(f"评估数据集来源路径: {INJURY_PROCESSED_DIR}")
     train_pt = get_injury_processed_dataset_path("train")
     val_pt = get_injury_processed_dataset_path("val")
     test_pt = get_injury_processed_dataset_path("test")
@@ -266,6 +267,7 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model has {total_params} parameters.")
 
+    print(f"***仅使用预测波形源进行评估，以匹配真实部署链路中 InjuryPredict 的实际输入***")
     # 每个权重文件使用独立评估目录；目录内再按数据范围拆分，避免完整集、主驾和副驾结果互相覆盖。
     evaluate_and_save_outputs(
         predictions,
@@ -276,6 +278,7 @@ if __name__ == "__main__":
         weight_label,
         total_params,
         len(train_dataset),
+        verbose=args.verbose,
     )
 
     is_combined_data_source = INJURY_PROCESSED_DIR.name == "combined"
@@ -296,4 +299,5 @@ if __name__ == "__main__":
                 weight_label,
                 total_params,
                 len(train_dataset),
+                verbose=args.verbose,
             )

@@ -3,9 +3,11 @@ import os
 os.environ['FOR_DISABLE_CONSOLE_CTRL_HANDLER'] = 'T' # 避免部分 Windows 控制台环境中的控制信号处理干扰训练进程。
 import warnings
 warnings.filterwarnings('ignore')
+import csv
 import json
 import time
 from datetime import datetime
+from numbers import Real
 
 import torch
 from torch.utils.data import DataLoader
@@ -20,15 +22,17 @@ from InjuryPredict.config import (
     RUNS_DIR,
     curriculum_params,
     loss_params,
+    model_selection_params,
     model_params,
     training_params,
-    val_metrics_to_track,
 )
 from InjuryPredict.utils import models
 from InjuryPredict.utils.loss import InjuryKendallMultiTaskLoss
 from InjuryPredict.utils.tools import (
-    build_metric_trackers,
+    build_composite_metric_trackers,
+    build_single_metric_trackers,
     convert_numpy_types,
+    is_composite_better,
     round_float_fields,
     round_to_significant,
 )
@@ -51,6 +55,66 @@ def _write_training_record(path: str, record: dict) -> None:
         json.dump(convert_numpy_types(record), file, indent=4, ensure_ascii=False)
 
 
+def _snapshot_metrics(metrics: dict) -> dict:
+    """复制当前验证指标快照，避免后续更新覆盖 best checkpoint 的判优依据。"""
+    return {
+        key: float(value)
+        for key, value in metrics.items()
+        if isinstance(value, Real)
+    }
+
+
+def _make_epoch_csv_row(epoch: int, train_metrics: dict, val_metrics: dict | None, curriculum_state: dict) -> dict:
+    """构造开发阶段可选的 epoch 级指标行；未启用验证时保留空值。"""
+    row = {
+        "epoch": int(epoch),
+        "phase": curriculum_state["phase"],
+        "alpha": float(curriculum_state["alpha"]),
+        "train_loss": float(train_metrics["loss"]),
+    }
+    for key in (
+        "loss",
+        "accu_mais_3c",
+        "accu_mais",
+        "accu_head",
+        "accu_chest",
+        "accu_neck",
+        "r2_hic",
+        "r2_dmax",
+        "r2_nij",
+    ):
+        row[f"val_{key}"] = "" if val_metrics is None else float(val_metrics[key])
+    return row
+
+
+def _append_epoch_metrics_csv(path: str, row: dict, fieldnames: list[str]) -> None:
+    """追加写入紧凑 epoch 指标表；该文件仅用于开发阶段离线分析。"""
+    file_exists = os.path.exists(path)
+    with open(path, "a", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _refresh_tracker_state(
+    state: dict,
+    model: torch.nn.Module,
+    epoch: int,
+    val_metrics: dict,
+    criterion: InjuryKendallMultiTaskLoss,
+    run_dir: str,
+) -> None:
+    """更新 tracker 的动态最优状态，并保存对应模型权重。"""
+    state["best_epoch"] = int(epoch)
+    state["best_metrics_snapshot"] = _snapshot_metrics(val_metrics)
+    state["criterion_weight_state"] = criterion.get_weight_state()
+    if state.get("kind") == "single":
+        metric_key = state["metric_key"]
+        state["best_value"] = float(val_metrics[metric_key])
+    torch.save(model.state_dict(), os.path.join(run_dir, state["model_filename"]))
+
+
 if __name__ == "__main__":
     set_random_seed()
     # 创建独立文件夹保存本次运行结果
@@ -68,6 +132,7 @@ if __name__ == "__main__":
     weight_decay = float(training_params['weight_decay'])
     early_stop_start_epochs = int(training_params['early_stop_start_epochs'])
     Patience = min(int(training_params['Patience']), Epochs)
+    write_epoch_metrics_csv = bool(training_params.get("write_epoch_metrics_csv", False))
     phase_epochs = validate_curriculum_params(Epochs, curriculum_params)
     # 加载数据集对象
     print(f".pt 数据文件路径: {INJURY_PROCESSED_DIR}/*.pt")
@@ -86,8 +151,10 @@ if __name__ == "__main__":
     print(f"训练集大小: {len(train_dataset)}")
     print(f"验证集大小: {len(val_dataset)}")
     train_loader = DataLoader(train_dataset, batch_size=Batch_size, shuffle=True, num_workers=0)
-    # BN 重校准只用训练集预测波形源顺序前向刷新 BatchNorm buffer；shuffle=False 便于复现实验。
-    bn_loader = DataLoader(train_dataset, batch_size=Batch_size, shuffle=False, num_workers=0)
+    # BN 重校准使用固定随机种子打散训练集，避免顺序样本结构使 BatchNorm 统计量偏向末尾 batch。
+    bn_generator = torch.Generator()
+    bn_generator.manual_seed(GLOBAL_SEED)
+    bn_loader = DataLoader(train_dataset, batch_size=Batch_size, shuffle=True, num_workers=0, generator=bn_generator)
     val_enabled = len(val_dataset) > 0
     val_loader = DataLoader(val_dataset, batch_size=Batch_size, shuffle=False, num_workers=0) if val_enabled else None
     if not val_enabled:
@@ -95,6 +162,7 @@ if __name__ == "__main__":
         print("警告: 验证集为空，本次训练将跳过验证、best_val_* 权重保存和 early stop。")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # OutputConsistencyLoss 使用的归一化参数来自训练集的真实损伤标签
     output_consistency_weights = compute_output_consistency_weights(train_dataset, device)
 
     model = models.InjuryPredictModel(
@@ -119,32 +187,56 @@ if __name__ == "__main__":
     metric_selection_start_epoch = get_metric_selection_start_epoch(phase_epochs)
     early_stop_anchor_epoch = get_early_stop_anchor_epoch(early_stop_start_epochs, phase_epochs)
 
-    # metric_trackers 是由 val_metrics_to_track 生成的静态规则表。key 为 run_one_epoch 返回的验证指标名；value 包含 compare_indicator、initial_value、is_better、model_filename、display_name。
+    # single_metric_trackers 保留单指标 best 权重，composite_metric_trackers 用配置化优先级列表表达复合选模规则。
+    single_metric_trackers = {}
+    composite_metric_trackers = {}
     metric_trackers = {}
-    # metric_states 是单次训练的动态状态表。key 与 metric_trackers 一致；value 包含当前 best_value、1-based best_epoch、判优函数 is_better 和对应 model_filename；无验证集时保持为空。
+    required_val_metric_names = set()
+    primary_tracker_name = None
+    # metric_states 是单次训练的动态状态表；无验证集时保持为空。
     metric_states = {}
     if val_enabled:
-        # val_metrics_to_track 中的指标名必须能在 run_one_epoch(..., optimizer=None) 返回的 val_metrics 字典中找到。
-        metric_trackers = build_metric_trackers(
-            val_metrics_to_track,
-            model_filename_fn=lambda metric_name: f"best_val_{metric_name}.pth",
-        )
+        single_metric_configs = model_selection_params.get("single_metric_trackers", [])
+        single_metric_trackers = build_single_metric_trackers(single_metric_configs)
+        composite_metric_trackers = build_composite_metric_trackers(model_selection_params.get("composite_trackers", []))
+        duplicated_tracker_names = set(single_metric_trackers) & set(composite_metric_trackers)
+        if duplicated_tracker_names:
+            raise ValueError(f"单指标与复合选模 tracker 名称重复: {sorted(duplicated_tracker_names)}")
+        metric_trackers = {**single_metric_trackers, **composite_metric_trackers}
         if not metric_trackers:
-            raise ValueError("val_metrics_to_track 不能为空。")
+            raise ValueError("至少需要配置一个验证集选模 tracker。")
+        for tracker in single_metric_trackers.values():
+            required_val_metric_names.add(tracker["metric_key"])
+        for tracker in composite_metric_trackers.values():
+            required_val_metric_names.update(rule["metric_key"] for rule in tracker["priority"])
+        primary_tracker_name = model_selection_params.get("primary_tracker")
+        if primary_tracker_name not in metric_trackers:
+            raise ValueError(f"model_selection_params.primary_tracker={primary_tracker_name} 不在已配置的 tracker 中。")
         print(f"将跟踪以下验证指标: {[tracker['display_name'] for tracker in metric_trackers.values()]}")
+        print(f"早停主 tracker: {metric_trackers[primary_tracker_name]['display_name']}")
         if metric_selection_start_epoch > 1:
             print(f"最佳模型权重将只从 Phase III 开始保存，首个候选 epoch={metric_selection_start_epoch}。")
         print(f"早停 patience 将从 epoch={early_stop_anchor_epoch} 之后开始重新计数。")
-        # 每个 metric_state 从对应 tracker 复制判优函数和文件名，并额外持有当前 run 内的动态最优值；best_epoch=0 表示该指标尚未产生可保存的最优模型。
-        metric_states = {
-            metric_name: {
-                'best_value': tracker_info['initial_value'],
-                'best_epoch': 0,
-                'is_better': tracker_info['is_better'],
-                'model_filename': tracker_info['model_filename'],
+        for tracker_name, tracker_info in single_metric_trackers.items():
+            metric_states[tracker_name] = {
+                "kind": "single",
+                "metric_key": tracker_info["metric_key"],
+                "best_value": tracker_info["initial_value"],
+                "best_epoch": 0,
+                "is_better": tracker_info["is_better"],
+                "model_filename": tracker_info["model_filename"],
+                "best_metrics_snapshot": None,
+                "criterion_weight_state": None,
             }
-            for metric_name, tracker_info in metric_trackers.items()
-        }
+        for tracker_name, tracker_info in composite_metric_trackers.items():
+            metric_states[tracker_name] = {
+                "kind": "composite",
+                "priority": tracker_info["priority"],
+                "best_epoch": 0,
+                "model_filename": tracker_info["model_filename"],
+                "best_metrics_snapshot": None,
+                "criterion_weight_state": None,
+            }
 
     record_path = os.path.join(run_dir, "TrainingRecord.json")
     initial_record = {
@@ -152,9 +244,8 @@ if __name__ == "__main__":
         "Trainset_size": len(train_dataset),
         "Valset_size": len(val_dataset),
         "validation_enabled": val_enabled,
-        "INJURY_PROCESSED_DIR": str(INJURY_PROCESSED_DIR),
+        "INJURY_PROCESSED_DIR": str(INJURY_PROCESSED_DIR.resolve()),
         "data_interface": {
-            "processed_dir": str(INJURY_PROCESSED_DIR.resolve()),
             "waveform_fields": {
                 "x_acc_gt": "共享归一化空间中的真值 XY 波形。",
                 "x_acc_pred": "冻结 PulsePredict 输出的共享归一化 XY 预测波形，验证与部署默认使用该字段。",
@@ -168,10 +259,10 @@ if __name__ == "__main__":
         "hyperparameters": {
             "training": {
                 **training_params,
-                "val_metrics_to_track": val_metrics_to_track if val_enabled else [],
             },
             "loss": loss_params,
             "curriculum": curriculum_params,
+            "model_selection_params": model_selection_params if val_enabled else {},
             "lr_scheduler": {
                 "type": "CosineAnnealingLR",
                 "T_max": Epochs,
@@ -182,6 +273,7 @@ if __name__ == "__main__":
                 "phase3_only_best_model": metric_selection_start_epoch > 1,
                 "best_model_start_epoch": metric_selection_start_epoch,
                 "early_stop_anchor_epoch": early_stop_anchor_epoch,
+                "primary_tracker": primary_tracker_name,
             },
             "model": {
                 **model_params,
@@ -193,6 +285,23 @@ if __name__ == "__main__":
     }
     _write_training_record(record_path, initial_record)
     print(f"初始配置已保存至: {record_path}")
+
+    epoch_metrics_csv_path = os.path.join(run_dir, "epoch_metrics.csv")
+    epoch_metrics_fieldnames = [
+        "epoch",
+        "phase",
+        "alpha",
+        "train_loss",
+        "val_loss",
+        "val_accu_mais_3c",
+        "val_accu_mais",
+        "val_accu_head",
+        "val_accu_chest",
+        "val_accu_neck",
+        "val_r2_hic",
+        "val_r2_dmax",
+        "val_r2_nij",
+    ]
 
     train_metrics = None
     val_metrics = None
@@ -215,9 +324,9 @@ if __name__ == "__main__":
         if val_enabled:
             # 验证阶段不参与课程调度，固定使用预测波形源计算 Kendall 主任务损失，以保证各阶段 val/loss 可直接比较。
             val_metrics = run_one_epoch(model, val_loader, criterion, device, optimizer=None)
-            missing_metrics = [name for name in metric_trackers.keys() if name not in val_metrics]
+            missing_metrics = [name for name in required_val_metric_names if name not in val_metrics]
             if missing_metrics:
-                raise KeyError(f"val_metrics_to_track 中存在无效指标: {missing_metrics}")
+                raise KeyError(f"模型选择规则中存在无效验证指标: {missing_metrics}")
 
         log_injury_tensorboard_metrics(
             writer,
@@ -231,6 +340,12 @@ if __name__ == "__main__":
             # Val/Loss/total_loss 表示预测波形源上的主任务损失，不包含课程学习的一致性正则项。
             log_injury_tensorboard_metrics(writer, "Val", val_metrics, epoch)
         scheduler.step()
+        if write_epoch_metrics_csv:
+            _append_epoch_metrics_csv(
+                epoch_metrics_csv_path,
+                _make_epoch_csv_row(epoch + 1, train_metrics, val_metrics, curriculum_state),
+                epoch_metrics_fieldnames,
+            )
 
         print(
             f"Epoch {epoch + 1}/{Epochs} | Phase: {curriculum_state['phase']} "
@@ -252,19 +367,27 @@ if __name__ == "__main__":
         if val_enabled:
             current_epoch = epoch + 1
             if current_epoch >= metric_selection_start_epoch:
-                for metric_name, state in metric_states.items():
-                    current_value = val_metrics[metric_name]
-                    # metric_name 是 val_metrics 字典中的真实 key；metric_states[metric_name] 保存当前 run 中该指标已达到的最优值和对应 epoch。
-                    if state['is_better'](current_value, state['best_value']):
-                        state['best_value'] = current_value
-                        state['best_epoch'] = current_epoch
-                        torch.save(model.state_dict(), os.path.join(run_dir, state['model_filename']))
-                        print(f"Best {metric_trackers[metric_name]['display_name']} model saved: {current_value:.4g} at epoch {current_epoch}")
+                for tracker_name, state in metric_states.items():
+                    if state["kind"] == "single":
+                        metric_key = state["metric_key"]
+                        current_value = val_metrics[metric_key]
+                        is_better = state["is_better"](current_value, state["best_value"])
+                    else:
+                        is_better = is_composite_better(
+                            val_metrics,
+                            state["best_metrics_snapshot"],
+                            state["priority"],
+                        )
+                    if is_better:
+                        _refresh_tracker_state(state, model, current_epoch, val_metrics, criterion, run_dir)
+                        display_name = metric_trackers[tracker_name]["display_name"]
+                        print(f"Best {display_name} model saved at epoch {current_epoch}: {state['model_filename']}")
 
-        if val_enabled and should_stop_early(metric_states, epoch + 1, Patience, early_stop_anchor_epoch):
+        primary_metric_states = {primary_tracker_name: metric_states[primary_tracker_name]} if val_enabled else {}
+        if val_enabled and should_stop_early(primary_metric_states, epoch + 1, Patience, early_stop_anchor_epoch):
             print(f"Early Stop at epoch: {epoch + 1}!")
-            for metric_name, state in metric_states.items():
-                print(f"Best {metric_trackers[metric_name]['display_name']}: {state['best_value']:.4g} (at epoch {state['best_epoch']})")
+            state = metric_states[primary_tracker_name]
+            print(f"Best {metric_trackers[primary_tracker_name]['display_name']} at epoch {state['best_epoch']}")
             break
 
         print(f"            | Time: {time.time() - epoch_start_time:.2f}s")
@@ -291,15 +414,24 @@ if __name__ == "__main__":
 
     writer.close()
 
-    # best_metrics_by_tracker 是写入 TrainingRecord.json 的结果摘要。key 与 metric_trackers 一致；value 只记录最终 best_value、best_epoch 和 model_file，不再参与训练过程更新。
-    best_metrics_by_tracker = {
-        metric_name: {
-            "best_value": round_to_significant(float(state['best_value']), 4),
-            "best_epoch": int(state['best_epoch']),
-            "model_file": state['model_filename'],
+    # best_metrics_by_tracker 写入各 tracker 的最终最优快照；复合 tracker 记录完整验证指标快照，而不是压缩为单个标量。best_metrics_snapshot：某个 tracker 刷新最优时，同一个 epoch 的完整验证集指标快照
+    best_metrics_by_tracker = {}
+    for tracker_name, state in metric_states.items():
+        entry = {
+            "tracker_kind": state["kind"],
+            "best_epoch": int(state["best_epoch"]),
+            "model_file": state["model_filename"],
+            "best_metrics_snapshot": round_float_fields(state["best_metrics_snapshot"], digits=4)
+            if state["best_metrics_snapshot"] is not None else None,
+            "criterion_weight_state": round_float_fields(state["criterion_weight_state"], digits=4)
+            if state["criterion_weight_state"] is not None else None,
         }
-        for metric_name, state in metric_states.items()
-    }
+        if state["kind"] == "single":
+            entry["best_value"] = round_to_significant(float(state["best_value"]), 4)
+            entry["metric_key"] = state["metric_key"]
+        else:
+            entry["priority"] = metric_trackers[tracker_name]["priority"]
+        best_metrics_by_tracker[tracker_name] = entry
 
     metrics_source = val_metrics if val_enabled else train_metrics
     last_epoch_metrics = round_float_fields({
@@ -323,6 +455,7 @@ if __name__ == "__main__":
         "final_epoch": epoch + 1,
         "validation_enabled": val_enabled,
         "best_metrics_by_tracker": best_metrics_by_tracker,
+        "primary_tracker": primary_tracker_name,
         "last_epoch_metrics": last_epoch_metrics,
         "last_epoch_metrics_source": "val" if val_enabled else "train",
         "kendall_weight_state_final": criterion.get_weight_state(),

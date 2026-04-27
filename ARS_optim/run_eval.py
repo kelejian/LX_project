@@ -354,7 +354,7 @@ def _prepare_eval_inputs(
     - `context` 缺失或不合法时跳过该行。
     - `baseline` trainable control 只有整组合法才采用，否则整行回退为 default。
 
-    默认 split 评估直接使用数据集已有参数，只检查缺失值，不再重复做输入合法性过滤。
+    默认 split 评估使用数据集已有参数，但仍按当前约束配置过滤不合法样本。
 
     返回值依次为：
     - `context_output_df`: 结果表中保留的 context 视图, 包含原始输入里的非法行
@@ -393,8 +393,9 @@ def _prepare_eval_inputs(
             raise ValueError(f"默认 split 评估样本缺失 trainable control 列: {missing_trainable}")
 
     if not strict_provided_validation:
-        # 默认 split 来自已处理好的合法数据，这里只检查缺失值。
-        context_eval_df = context_df_raw.astype(np.float32)
+        # 默认 split 不做数值修补；若历史数据与当前约束配置不一致，则跳过不合法行，避免优化器在不可修复的 context 上报错。
+        context_output_df = context_df_raw.astype(np.float32)
+        context_eval_df = context_output_df.copy()
         baseline_eval_df = baseline_df_raw.astype(np.float32)
         missing_context_rows = context_eval_df[context_names].isna().any(axis=1).to_numpy()
         missing_trainable_rows = baseline_eval_df[trainable_names].isna().any(axis=1).to_numpy()
@@ -404,15 +405,52 @@ def _prepare_eval_inputs(
                 "默认 split 评估样本存在缺失值，不符合评估前提。行号: "
                 f"{_format_row_list(bad_rows)}"
             )
-        valid_mask = np.ones(len(df_input), dtype=bool)
+
+        context_tensor = torch.tensor(context_eval_df[context_names].values, dtype=torch.float32, device=device)
+        baseline_tensor = torch.tensor(baseline_eval_df[trainable_names].values, dtype=torch.float32, device=device)
+        context_valid = (
+            constraint_engine.validate_context_input(context_tensor)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(bool)
+        )
+        baseline_full = constraint_engine.compose_full_features(context_tensor, baseline_tensor)
+        baseline_valid = (
+            constraint_engine.validate_full_input(baseline_full)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(bool)
+        )
+        valid_mask = context_valid & baseline_valid
+        skipped_rows = np.flatnonzero(~valid_mask).astype(int).tolist()
+        invalid_context_rows = np.flatnonzero(~context_valid)
+        invalid_baseline_rows = np.flatnonzero(context_valid & ~baseline_valid)
+        if invalid_context_rows.size > 0:
+            logger.warning(
+                "默认 split 中共有 %d 个 case 的 context 不满足当前约束，将跳过。行号: %s",
+                invalid_context_rows.size,
+                _format_row_list(invalid_context_rows),
+            )
+        if invalid_baseline_rows.size > 0:
+            logger.warning(
+                "默认 split 中共有 %d 个 case 的 baseline trainable control 与当前 context 不兼容，将跳过。行号: %s",
+                invalid_baseline_rows.size,
+                _format_row_list(invalid_baseline_rows),
+            )
+        if skipped_rows:
+            context_eval_df.loc[skipped_rows, context_names] = np.nan
+            baseline_eval_df.loc[skipped_rows, trainable_names] = np.nan
+
         return (
-            context_eval_df,
+            context_output_df,
             context_eval_df,
             baseline_eval_df,
             missing_context,
             missing_trainable,
             valid_mask,
-            [],
+            sorted(set(skipped_rows)),
             [],
             [],
         )
@@ -1175,7 +1213,7 @@ def _build_evaluation_record(
         "top_cases_by_reported_joint_risk_reduction": top_cases,
         "trace_outputs": trace_outputs,
         "runtime": {
-            "total_time_cost_sec": float(stage_outputs["total_time_cost"]),
+            "total_time_cost_sec": float(stage_outputs["total_time_cost"]), # 单位: 秒
             "avg_time_cost_sec": float(stage_outputs["total_time_cost"] / max(1, evaluated_case_count)),
             "opt2_convergence": convergence_summary,
         },

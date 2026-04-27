@@ -26,10 +26,10 @@ device: "cuda"
 # ARS_optim 不重新训练 PulsePredict / InjuryPredict，而是直接加载这两个已训练好的子模型作为代理链路。
 surrogate:
   # PulsePredict 最优权重路径；可写绝对路径，也可写相对 PULSE_PREDICT_DIR 的相对路径。
-  pulse_ckpt_rel_path: "saved/models/HybridPulseCNN/0328_002509/model_best.pth"
+  pulse_ckpt_rel_path: "saved/models/HybridPulseCNN/0502_123240/model_best.pth"
 
   # InjuryPredict 最优权重路径；可写绝对路径，也可写相对 INJURY_PREDICT_DIR 的相对路径。具体值由你后续自行维护，因此当前只保留字段，不在代码里做自动兜底。
-  injury_ckpt_rel_path: "runs/InjuryPredictModel_03280055/best_val_loss.pth"
+  injury_ckpt_rel_path: "runs/InjuryPredictModel_05021735/best_val_accu_mais.pth"
 
 
 # ============================================================
@@ -62,7 +62,7 @@ strategy_net:
   train:
     # 自监督训练采用无限数据流，不按 epoch 组织，而是按最大迭代数停止。
     batch_size: 1024
-    max_iterations: 10000
+    max_iterations: 5000
 
     # AdamW 基础学习率与权重衰减。
     lr: 3.0e-4
@@ -133,7 +133,7 @@ optimization:
   direct_inference: true
 
   # 局部精调总步数；当 refine_steps=0 时，不生成 Opt2。
-  refine_steps: 500
+  refine_steps: 100
 
   # Adam 在无量纲潜变量 z 上的初始学习率；真实每维参数在物理空间中的单步更新量 = 调度后的学习率 × Adam 自适应因子 × 参数量程。
   lr: 1.0e-3
@@ -180,7 +180,7 @@ optimization:
     method: "knn"
 
     # 分布偏离项总权重。
-    weight: 0.001
+    weight: 1e-5
 
     # 参考特征空间。context 只看 context 分布，context_control 看 [context | trainable_control] 联合分布。
     feature_space: "context_control"
@@ -220,4 +220,4 @@ evaluation:
 
   # 可选的策略权重路径；只有在 direct_inference=true 时才会使用，若命令行显式传入 --strategy_ckpt，则命令行优先。
   # strategy_checkpoint 既可写绝对路径，也可写相对 `ARS_optim` 目录的相对路径
-  strategy_checkpoint: "saved_models/strategy_net_0328_124457/checkpoints/val_best_model.pth"
+  strategy_checkpoint: "saved_models/strategy_net_0615_160019/checkpoints/val_best_model.pth"

@@ -124,6 +124,8 @@ python -m ARS_optim.run_eval --input_csv your_cases.csv
 - 如果提供 `--input_csv`，则按输入文件中的 `context` 与可选 baseline control 做评估
 - 如果不提供 `--input_csv`，则优先使用 `injury test split`
 - 若 test split 不可用，则自动回退到 `injury val split`
+- 默认 split 模式下，`Base` 使用 `raw_data_packed.npz` 中对应 split 样本的原始参数；其中当前 `trainable control` 列作为 `Base_*` 控制量，不会替换为 `param_space.yaml` 中的 `default`
+- `Base` 阶段只表示“原始控制参数下的代理模型预测结果”，不表示真实损伤标签，也不参与任何参数优化
 - `input_csv` 模式下，baseline trainable control 只有整组合法才采用；否则整组回退为 `param_space.yaml` 中的 `default`
 - 若 baseline 回退为 `default` 后，和当前 `context` 联合起来仍不合法，则该 `case` 会直接跳过，并在结果记录中写明原因
 - 若启用 `direct_inference`，先生成 `Opt1`
@@ -155,19 +157,23 @@ ARS_optim/saved_eval/<run_dir>/
 这些列分别用于表示：
 
 - `Base_*`
-  baseline 输入下的预测结果
+  baseline 口径下的列；其中 `Base_BTF / Base_LLATTF / Base_AFT` 是原始或回退后的 baseline 控制量，`Base_HIC / Base_Dmax / Base_Nij / Base_JointRisk` 等是代理模型预测指标
 - `Opt1_*`
   策略网络直推结果
 - `Opt2_*`
   局部精调结果
 - `Reduction_*`
-  相对 `Base` 的下降幅度
+  代理模型预测口径下相对 `Base` 的下降幅度，定义为 `Base_* - Opt*_*`
 - `True_*`
   测试集真值或输入侧提供的对照值
 - `True_vs_*`
   真值与各阶段预测结果的差值
 - `Opt2_ConvergenceStep`
   局部精调的收敛步数
+
+`evaluation_record.yaml` 中的 `summary_metrics` 和 `top_cases_by_reported_joint_risk_reduction`
+均基于 `evaluation_results.csv` 中的 `Reduction_*` 列统计，因此反映的是代理模型预测口径下的相对降损效果。
+`True_*` 与 `True_vs_*` 只用于事后对照真实标签和模型预测偏差，不参与优化目标，也不参与上述降损汇总。
 
 ## 8. 画图脚本
 

@@ -642,7 +642,7 @@ def main():
     parser.add_argument(
         "--distribution",
         type=str,
-        default=r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0408_del.csv",
+        default=r"E:\WPS Office\1628575652\WPS企业云盘\清华大学\我的企业文档\课题组相关\理想项目\仿真数据库相关\distribution\distribution_0424_del.csv",
         help="distribution 源文件路径，支持 .csv / .npz；绝对路径或相对路径均可",
     )
     parser.add_argument(

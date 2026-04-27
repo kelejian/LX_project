@@ -29,11 +29,11 @@ from InjuryPredict.utils.tools import get_mais_3c_metrics
 # --- 1. 配置区：请在此处设置您的路径 ---
 
 # 1.1) 要评估的模型所在的运行目录
-RUN_DIR = Path(RUNS_DIR) / "InjuryPredictModel_04161405"
+RUN_DIR = Path(RUNS_DIR) / "InjuryPredictModel_04241327"
 
 # 1.2) 要加载的模型权重文件名（相对于 RUN_DIR）
 FOLD = Path("") # 可以指定K折中的某一折，例如 Path("Fold_1")，如果没有K折划分则保持 Path("")
-WEIGHT_FILE = FOLD / Path("final_model.pth")
+WEIGHT_FILE = FOLD / Path("best_val_loss.pth")
 
 # --- 结束配置 ---
 
@@ -81,6 +81,7 @@ def load_model_and_data(run_dir, weight_file):
     model_params = training_record["hyperparameters"]["model"]
     
     # 2. 加载数据集 .pt 文件
+    print(f"评估数据集来源路径: {INJURY_PROCESSED_DIR}")
     train_pt_path = get_injury_processed_dataset_path("train").as_posix()
     val_pt_path = get_injury_processed_dataset_path("val").as_posix()
     test_pt_path = get_injury_processed_dataset_path("test").as_posix()
@@ -136,7 +137,7 @@ def run_inference(model, dataset, device):
     
     all_preds_list = []
     
-    print("开始在完整数据集上运行模型推理...")
+    print("开始在完整数据集上运行模型推理（仅使用预测波形源）...")
     with torch.no_grad():
         for batch in data_loader:
             # 从底层 Dataset 的 __getitem__ 解包
